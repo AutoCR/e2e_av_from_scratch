@@ -182,6 +182,12 @@ class TransfuserBackbone(nn.Module):
 
             image_features, lidar_features = self.fuse_features(image_features, lidar_features, i)
 
+        # transformer_decoder_join = True
+        # detect_boxes = True
+        # use_bev_semantic = True
+        # use_semantic = False
+        # use_depth = False
+        # add_features = True
         if self.config.detect_boxes or self.config.use_bev_semantic:
             x4 = lidar_features
 
