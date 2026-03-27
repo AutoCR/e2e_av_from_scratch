@@ -12,12 +12,15 @@ from shapely.geometry import LineString, Polygon
 
 from navsim.common.dataloader import SceneLoader
 from navsim.common.enums import BoundingBoxIndex
+from navsim.agents.transfuser.transfuser_config import TransfuserConfig
+from navsim.agents.transfuser.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
 from nuplan.common.actor_state.oriented_box import OrientedBox
 from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.common.maps.abstract_map import SemanticMapLayer
 from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
 from nuplan.database.utils.pointclouds.lidar import LidarPointCloud
+from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -319,3 +322,42 @@ class Dataset(torch.utils.data.Dataset):
             bev_map[mask] = label
 
         return torch.from_numpy(bev_map)
+
+
+class DatasetV2(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        scene_loader: SceneLoader,
+        max_len=None,
+        random_sample=False,
+        config: TransfuserConfig = None,
+        trajectory_sampling: TrajectorySampling = None,
+    ):
+        self.scene_loader = scene_loader
+        self.config = config or TransfuserConfig()
+        self.trajectory_sampling = trajectory_sampling or TrajectorySampling(time_horizon=4, interval_length=0.5)
+
+        if random_sample:
+            if max_len is None:
+                max_len = len(scene_loader.tokens)
+            max_len = min(max_len, len(scene_loader.tokens))
+            self.tokens = np.random.choice(scene_loader.tokens, size=max_len, replace=False).tolist()
+        else:
+            max_len = min(max_len, len(scene_loader.tokens)) if max_len is not None else len(scene_loader.tokens)
+            self.tokens = scene_loader.tokens[:max_len]
+
+        self.max_len = len(self.tokens)
+        self.feature_builder = TransfuserFeatureBuilder(self.config)
+        self.target_builder = TransfuserTargetBuilder(self.trajectory_sampling, self.config)
+
+    def __len__(self):
+        return self.max_len
+
+    def __getitem__(self, idx):
+        token = self.tokens[idx]
+        scene = self.scene_loader.get_scene_from_token(token)
+        agent_input = scene.get_agent_input()
+
+        features = self.feature_builder.compute_features(agent_input)
+        targets = self.target_builder.compute_targets(scene)
+        return features, targets
