@@ -106,7 +106,7 @@ class Dataset(torch.utils.data.Dataset):
             "agent_labels": self._build_agent_labels(current_frame),
             "bev_semantic_map": self._build_bev_semantic_map(current_frame),
         }
-        return features, targets
+        return token, features, targets
 
     def _sensor_root(self) -> Path:
         return Path(self.scene_loader._original_sensor_path)

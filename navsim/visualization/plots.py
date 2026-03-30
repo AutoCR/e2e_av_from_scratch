@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm import tqdm
 
-from navsim.agents.abstract_agent import AbstractAgent
+# from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import Scene
 from navsim.visualization.bev import add_configured_bev_on_ax, add_trajectory_to_bev_ax
 from navsim.visualization.camera import add_annotations_to_camera_ax, add_camera_ax, add_lidar_to_camera_ax
@@ -71,26 +71,26 @@ def plot_bev_frame(scene: Scene, frame_idx: int) -> Tuple[plt.Figure, plt.Axes]:
     return fig, ax
 
 
-def plot_bev_with_agent(scene: Scene, agent: AbstractAgent) -> Tuple[plt.Figure, plt.Axes]:
-    """
-    Plots agent and human trajectory in birds-eye-view visualization
-    :param scene: navsim scene dataclass
-    :param agent: navsim agent
-    :return: figure and ax object of matplotlib
-    """
+# def plot_bev_with_agent(scene: Scene, agent: AbstractAgent) -> Tuple[plt.Figure, plt.Axes]:
+#     """
+#     Plots agent and human trajectory in birds-eye-view visualization
+#     :param scene: navsim scene dataclass
+#     :param agent: navsim agent
+#     :return: figure and ax object of matplotlib
+#     """
 
-    human_trajectory = scene.get_future_trajectory()
-    agent_trajectory = agent.compute_trajectory(scene.get_agent_input())
+#     human_trajectory = scene.get_future_trajectory()
+#     agent_trajectory = agent.compute_trajectory(scene.get_agent_input())
 
-    frame_idx = scene.scene_metadata.num_history_frames - 1
-    fig, ax = plt.subplots(1, 1, figsize=BEV_PLOT_CONFIG["figure_size"])
-    add_configured_bev_on_ax(ax, scene.map_api, scene.frames[frame_idx])
-    add_trajectory_to_bev_ax(ax, human_trajectory, TRAJECTORY_CONFIG["human"])
-    add_trajectory_to_bev_ax(ax, agent_trajectory, TRAJECTORY_CONFIG["agent"])
-    configure_bev_ax(ax)
-    configure_ax(ax)
+#     frame_idx = scene.scene_metadata.num_history_frames - 1
+#     fig, ax = plt.subplots(1, 1, figsize=BEV_PLOT_CONFIG["figure_size"])
+#     add_configured_bev_on_ax(ax, scene.map_api, scene.frames[frame_idx])
+#     add_trajectory_to_bev_ax(ax, human_trajectory, TRAJECTORY_CONFIG["human"])
+#     add_trajectory_to_bev_ax(ax, agent_trajectory, TRAJECTORY_CONFIG["agent"])
+#     configure_bev_ax(ax)
+#     configure_ax(ax)
 
-    return fig, ax
+#     return fig, ax
 
 
 def plot_cameras_frame(scene: Scene, frame_idx: int) -> Tuple[plt.Figure, Any]:
