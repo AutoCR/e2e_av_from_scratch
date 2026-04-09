@@ -1423,17 +1423,18 @@ cfg = {
   }
 }
 
-inputs = {
-    'neighbor_agents_past': torch.randn(8, cfg['agent_num'], cfg['time_len'], 11),
-    'static_objects': torch.randn(8, cfg['static_objects_num'], 10),
-    'lanes': torch.randn(8, cfg['lane_num'], cfg['lane_len'], 12),
-    'ego_current_state':torch.randn(8, 10),
-    'route_lanes': torch.randn(8, cfg['route_num'], cfg['lane_len'], 12),
-    'sampled_trajectories': torch.randn(8, (1 + cfg['predicted_neighbor_num']), 1 + cfg['future_len'], 4),
-    'diffusion_time': torch.randn(8),
-}
+if __name__ == '__main__':
+    inputs = {
+        'neighbor_agents_past': torch.randn(8, cfg['agent_num'], cfg['time_len'], 11),
+        'static_objects': torch.randn(8, cfg['static_objects_num'], 10),
+        'lanes': torch.randn(8, cfg['lane_num'], cfg['lane_len'], 12),
+        'ego_current_state':torch.randn(8, 10),
+        'route_lanes': torch.randn(8, cfg['route_num'], cfg['lane_len'], 12),
+        'sampled_trajectories': torch.randn(8, (1 + cfg['predicted_neighbor_num']), 1 + cfg['future_len'], 4),
+        'diffusion_time': torch.randn(8),
+    }
 
-model = DiffusionPlanner(cfg)
+    model = DiffusionPlanner(cfg)
 
-op = model(inputs)
-print(op)
+    op = model(inputs)
+    print(op)
