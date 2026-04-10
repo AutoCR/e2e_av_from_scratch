@@ -27,9 +27,26 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
         max_len=None,
         random_sample=False,
         trajectory_num_poses=None,
-        max_ped_bike = 5,
-        cfg : dict = {},
+        max_ped_bike=5,
+        cfg: dict = None,
     ):
+        if cfg is None:
+            raise ValueError("`cfg` must be provided for DiffusionPlannerDataset.")
+
+        required_cfg_keys = [
+            "agent_num",
+            "predicted_neighbor_num",
+            "static_objects_num",
+            "lane_num",
+            "route_num",
+            "lane_len",
+            "time_len",
+            "future_len",
+        ]
+        missing_cfg_keys = [key for key in required_cfg_keys if key not in cfg]
+        if missing_cfg_keys:
+            raise KeyError(f"Missing required cfg keys for DiffusionPlannerDataset: {missing_cfg_keys}")
+
         self.scene_loader = scene_loader
         self.trajectory_num_poses = trajectory_num_poses
 
@@ -51,8 +68,11 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
         self.lane_num = cfg['lane_num']
         self.route_num = cfg['route_num']
         self.lane_len = cfg['lane_len']
+        self.time_len = cfg['time_len']
+        self.future_len = cfg['future_len']
         self.max_ped_bike = max_ped_bike
         self.map_radius = 100.0
+        self.model_interval = 0.1
 
         self.bev_pixel_width = 256
         self.bev_pixel_height = 128
@@ -124,6 +144,16 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
         yaw = Quaternion(*frame_dict["ego2global_rotation"]).yaw_pitch_roll[0]
         return np.array([translation[0], translation[1], yaw], dtype=np.float64)
 
+    def _relative_times(self, frame_list_slice, reference_timestamp: int) -> np.ndarray:
+        timestamps = np.asarray([frame["timestamp"] for frame in frame_list_slice], dtype=np.int64)
+        return (timestamps - reference_timestamp).astype(np.float64) * 1e-6
+
+    def _history_target_times(self) -> np.ndarray:
+        return np.linspace(-(self.time_len - 1) * self.model_interval, 0.0, self.time_len, dtype=np.float64)
+
+    def _future_target_times(self) -> np.ndarray:
+        return np.linspace(self.model_interval, self.future_len * self.model_interval, self.future_len, dtype=np.float64)
+
     def _rotation_matrix(self, angle: float) -> np.ndarray:
         return np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]], dtype=np.float64)
 
@@ -147,15 +177,75 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
     def _local_to_global_vec(self, frame_pose: np.ndarray, local_vec: np.ndarray) -> np.ndarray:
         return self._rotation_matrix(frame_pose[2]) @ local_vec
 
+    def _interp_feature(self, sample_times: np.ndarray, sample_values: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+        sample_times = np.asarray(sample_times, dtype=np.float64)
+        sample_values = np.asarray(sample_values, dtype=np.float64)
+        if sample_values.ndim == 1:
+            sample_values = sample_values[:, None]
+
+        result = np.zeros((len(target_times), sample_values.shape[-1]), dtype=np.float64)
+        for dim in range(sample_values.shape[-1]):
+            result[:, dim] = np.interp(
+                target_times,
+                sample_times,
+                sample_values[:, dim],
+                left=sample_values[0, dim],
+                right=sample_values[-1, dim],
+            )
+        return result
+
+    def _interp_heading(self, sample_times: np.ndarray, headings: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+        headings = np.asarray(headings, dtype=np.float64)
+        headings_unwrapped = np.unwrap(headings)
+        interp = np.interp(
+            target_times,
+            sample_times,
+            headings_unwrapped,
+            left=headings_unwrapped[0],
+            right=headings_unwrapped[-1],
+        )
+        return np.arctan2(np.sin(interp), np.cos(interp))
+
+    def _fill_history_states(self, values: np.ndarray, valid_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        filled = values.copy()
+        valid = valid_mask.copy()
+        if not valid.any():
+            return filled, valid
+
+        last_valid_idx = None
+        for idx in range(len(valid) - 1, -1, -1):
+            if valid[idx]:
+                last_valid_idx = idx
+            elif last_valid_idx is not None:
+                filled[idx] = filled[last_valid_idx]
+                valid[idx] = True
+        return filled, valid
+
+    def _history_time_grid(self, frame_list) -> tuple[np.ndarray, np.ndarray]:
+        history_frames = frame_list[: self.current_index + 1]
+        reference_timestamp = frame_list[self.current_index]["timestamp"]
+        return self._relative_times(history_frames, reference_timestamp), self._history_target_times()
+
+    def _future_time_grid(self, frame_list) -> tuple[np.ndarray, np.ndarray]:
+        current_frame = frame_list[self.current_index]
+        future_frames = frame_list[self.current_index + 1 :]
+        reference_timestamp = current_frame["timestamp"]
+        future_times = self._relative_times([current_frame] + future_frames, reference_timestamp)
+        return future_times, self._future_target_times()
+
     def _build_future_trajectory(self, frame_list) -> torch.Tensor:
         current_pose = self._frame_pose(frame_list[self.current_index])
         future_frames = frame_list[self.current_index + 1 :]
+        if len(future_frames) == 0:
+            return torch.zeros((self.future_len, 3), dtype=torch.float32)
 
-        if self.trajectory_num_poses is not None:
-            future_frames = future_frames[: self.trajectory_num_poses]
+        coarse_times, target_times = self._future_time_grid(frame_list)
+        coarse_poses = np.stack([current_pose] + [self._frame_pose(frame_dict) for frame_dict in future_frames], axis=0)
+        coarse_relative = self._to_relative_poses(current_pose, coarse_poses)
 
-        future_global_poses = np.stack([self._frame_pose(frame_dict) for frame_dict in future_frames], axis=0)
-        future_relative_poses = self._to_relative_poses(current_pose, future_global_poses).astype(np.float32)
+        xy = self._interp_feature(coarse_times, coarse_relative[:, :2], target_times)
+        heading = self._interp_heading(coarse_times, coarse_relative[:, 2], target_times)
+        future_relative_poses = np.concatenate([xy, heading[:, None]], axis=-1).astype(np.float32)
         return torch.from_numpy(future_relative_poses)
 
     def _iter_annotations(self, frame_dict):
@@ -225,22 +315,20 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
     def _build_ego_current_state(self, frame_list) -> torch.Tensor:
         current_pose = self._frame_pose(frame_list[self.current_index])
         current_frame = frame_list[self.current_index]
-        prev_frame = frame_list[max(self.current_index - 1, 0)]
-
         current_dynamic = np.asarray(current_frame["ego_dynamic_state"], dtype=np.float64)
-        prev_dynamic = np.asarray(prev_frame["ego_dynamic_state"], dtype=np.float64)
-        prev_pose = self._frame_pose(prev_frame)
+        current_velocity = self._global_to_local_vec(
+            current_pose, self._local_to_global_vec(current_pose, current_dynamic[:2])
+        )
+        current_accel = self._global_to_local_vec(
+            current_pose, self._local_to_global_vec(current_pose, current_dynamic[2:4])
+        )
 
-        current_velocity = self._global_to_local_vec(current_pose, self._local_to_global_vec(current_pose, current_dynamic[:2]))
-        current_accel = self._global_to_local_vec(current_pose, self._local_to_global_vec(current_pose, current_dynamic[2:4]))
-        prev_heading_in_current = normalize_angle(prev_pose[2] - current_pose[2])
+        history_times, target_times = self._history_time_grid(frame_list)
+        history_poses = np.stack([self._frame_pose(frame_dict) for frame_dict in frame_list[: self.current_index + 1]], axis=0)
+        history_relative = self._to_relative_poses(current_pose, history_poses)
+        interp_heading = self._interp_heading(history_times, history_relative[:, 2], target_times)
+        yaw_rate = 0.0 if len(interp_heading) < 2 else normalize_angle(interp_heading[-1] - interp_heading[-2]) / self.model_interval
 
-        if self.current_index > 0:
-            dt = max((current_frame["timestamp"] - prev_frame["timestamp"]) * 1e-6, 1e-3)
-        else:
-            dt = 0.5
-
-        yaw_rate = normalize_angle(0.0 - prev_heading_in_current) / dt
         if abs(current_velocity[0]) < 0.2:
             steering_angle = 0.0
             yaw_rate = 0.0
@@ -265,7 +353,9 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
         current_pose = self._frame_pose(frame_list[self.current_index])
         history_frames = frame_list[: self.current_index + 1]
         token_to_index = {track_token: idx for idx, track_token in enumerate(selected_neighbor_tokens)}
-        neighbors = np.zeros((self.agent_num, len(history_frames), 11), dtype=np.float32)
+        coarse_neighbors = np.zeros((self.agent_num, len(history_frames), 8), dtype=np.float64)
+        coarse_valid = np.zeros((self.agent_num, len(history_frames)), dtype=bool)
+        type_features = np.zeros((self.agent_num, 3), dtype=np.float32)
 
         for t, frame_dict in enumerate(history_frames):
             frame_pose = self._frame_pose(frame_dict)
@@ -278,39 +368,87 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
                 xy_local, heading_local, velocity_local = self._convert_box_to_current_frame(
                     box, velocity, frame_pose, current_pose
                 )
-                neighbors[agent_idx, t, 0:2] = xy_local.astype(np.float32)
-                neighbors[agent_idx, t, 2] = np.cos(heading_local)
-                neighbors[agent_idx, t, 3] = np.sin(heading_local)
-                neighbors[agent_idx, t, 4:6] = velocity_local.astype(np.float32)
-                neighbors[agent_idx, t, 6] = float(box[BoundingBoxIndex.WIDTH])
-                neighbors[agent_idx, t, 7] = float(box[BoundingBoxIndex.LENGTH])
-                neighbors[agent_idx, t, 8:11] = self._agent_type_one_hot(tracked_type)
+                coarse_neighbors[agent_idx, t, 0:2] = xy_local
+                coarse_neighbors[agent_idx, t, 2] = heading_local
+                coarse_neighbors[agent_idx, t, 3:5] = velocity_local
+                coarse_neighbors[agent_idx, t, 5] = float(box[BoundingBoxIndex.WIDTH])
+                coarse_neighbors[agent_idx, t, 6] = float(box[BoundingBoxIndex.LENGTH])
+                coarse_neighbors[agent_idx, t, 7] = 1.0
+                coarse_valid[agent_idx, t] = True
+                type_features[agent_idx] = self._agent_type_one_hot(tracked_type)
+
+        history_times, target_times = self._history_time_grid(frame_list)
+        neighbors = np.zeros((self.agent_num, self.time_len, 11), dtype=np.float32)
+        for agent_idx in range(self.agent_num):
+            filled_values, filled_valid = self._fill_history_states(coarse_neighbors[agent_idx], coarse_valid[agent_idx])
+            if not filled_valid.any():
+                continue
+
+            interp_xy = self._interp_feature(history_times, filled_values[:, 0:2], target_times)
+            interp_heading = self._interp_heading(history_times, filled_values[:, 2], target_times)
+            interp_velocity = self._interp_feature(history_times, filled_values[:, 3:5], target_times)
+            interp_size = self._interp_feature(history_times, filled_values[:, 5:7], target_times)
+            interp_valid = self._interp_feature(history_times, filled_values[:, 7], target_times)[:, 0]
+
+            neighbors[agent_idx, :, 0:2] = interp_xy.astype(np.float32)
+            neighbors[agent_idx, :, 2] = np.cos(interp_heading).astype(np.float32)
+            neighbors[agent_idx, :, 3] = np.sin(interp_heading).astype(np.float32)
+            neighbors[agent_idx, :, 4:6] = interp_velocity.astype(np.float32)
+            neighbors[agent_idx, :, 6:8] = interp_size.astype(np.float32)
+            neighbors[agent_idx, :, 8:11] = type_features[agent_idx]
+            neighbors[agent_idx, interp_valid <= 0.0] = 0.0
 
         return torch.from_numpy(neighbors)
 
     def _build_neighbors_future_with_mask(self, frame_list, selected_neighbor_tokens):
         current_pose = self._frame_pose(frame_list[self.current_index])
         future_frames = frame_list[self.current_index + 1 :]
-        if self.trajectory_num_poses is not None:
-            future_frames = future_frames[: self.trajectory_num_poses]
-
-        neighbors_future = np.zeros((self.predicted_neighbor_num, len(future_frames), 4), dtype=np.float32)
-        neighbor_future_mask = np.ones((self.predicted_neighbor_num, len(future_frames)), dtype=bool)
+        coarse_times, target_times = self._future_time_grid(frame_list)
+        neighbors_future = np.zeros((self.predicted_neighbor_num, self.future_len, 4), dtype=np.float32)
+        neighbor_future_mask = np.ones((self.predicted_neighbor_num, self.future_len), dtype=bool)
         token_to_index = {
             track_token: idx for idx, track_token in enumerate(selected_neighbor_tokens[: self.predicted_neighbor_num])
         }
+        coarse_future = np.zeros((self.predicted_neighbor_num, len(coarse_times), 3), dtype=np.float64)
+        coarse_valid = np.zeros((self.predicted_neighbor_num, len(coarse_times)), dtype=bool)
 
-        for t, frame_dict in enumerate(future_frames):
+        current_frame = frame_list[self.current_index]
+        for box, name, velocity, track_token in self._iter_annotations(current_frame):
+            if track_token not in token_to_index or name not in self.dynamic_tracked_object_types:
+                continue
+            agent_idx = token_to_index[track_token]
+            xy_local, heading_local, _ = self._convert_box_to_current_frame(box, velocity, current_pose, current_pose)
+            coarse_future[agent_idx, 0, 0:2] = xy_local
+            coarse_future[agent_idx, 0, 2] = heading_local
+            coarse_valid[agent_idx, 0] = True
+
+        for t, frame_dict in enumerate(future_frames, start=1):
             frame_pose = self._frame_pose(frame_dict)
             for box, name, velocity, track_token in self._iter_annotations(frame_dict):
                 if track_token not in token_to_index or name not in self.dynamic_tracked_object_types:
                     continue
                 agent_idx = token_to_index[track_token]
                 xy_local, heading_local, _ = self._convert_box_to_current_frame(box, velocity, frame_pose, current_pose)
-                neighbors_future[agent_idx, t, 0:2] = xy_local.astype(np.float32)
-                neighbors_future[agent_idx, t, 2] = np.cos(heading_local)
-                neighbors_future[agent_idx, t, 3] = np.sin(heading_local)
-                neighbor_future_mask[agent_idx, t] = False
+                coarse_future[agent_idx, t, 0:2] = xy_local
+                coarse_future[agent_idx, t, 2] = heading_local
+                coarse_valid[agent_idx, t] = True
+
+        for agent_idx in range(self.predicted_neighbor_num):
+            valid_indices = np.where(coarse_valid[agent_idx])[0]
+            if len(valid_indices) < 2:
+                continue
+
+            sample_times = coarse_times[valid_indices]
+            target_valid = (target_times >= sample_times[0]) & (target_times <= sample_times[-1])
+            if not np.any(target_valid):
+                continue
+
+            interp_xy = self._interp_feature(sample_times, coarse_future[agent_idx, valid_indices, 0:2], target_times[target_valid])
+            interp_heading = self._interp_heading(sample_times, coarse_future[agent_idx, valid_indices, 2], target_times[target_valid])
+            neighbors_future[agent_idx, target_valid, 0:2] = interp_xy.astype(np.float32)
+            neighbors_future[agent_idx, target_valid, 2] = np.cos(interp_heading).astype(np.float32)
+            neighbors_future[agent_idx, target_valid, 3] = np.sin(interp_heading).astype(np.float32)
+            neighbor_future_mask[agent_idx, target_valid] = False
 
         return torch.from_numpy(neighbors_future), torch.from_numpy(neighbor_future_mask)
 
@@ -325,15 +463,20 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
     def _build_ego_future(self, frame_list) -> torch.Tensor:
         current_pose = self._frame_pose(frame_list[self.current_index])
         future_frames = frame_list[self.current_index + 1 :]
-        if self.trajectory_num_poses is not None:
-            future_frames = future_frames[: self.trajectory_num_poses]
+        if len(future_frames) == 0:
+            return torch.zeros((self.future_len, 4), dtype=torch.float32)
 
-        ego_future = np.zeros((len(future_frames), 4), dtype=np.float32)
-        for i, frame_dict in enumerate(future_frames):
-            future_pose = self._to_relative_poses(current_pose, self._frame_pose(frame_dict)[None])[0]
-            ego_future[i, 0:2] = future_pose[:2].astype(np.float32)
-            ego_future[i, 2] = np.cos(future_pose[2])
-            ego_future[i, 3] = np.sin(future_pose[2])
+        coarse_times, target_times = self._future_time_grid(frame_list)
+        coarse_poses = np.stack([current_pose] + [self._frame_pose(frame_dict) for frame_dict in future_frames], axis=0)
+        coarse_relative = self._to_relative_poses(current_pose, coarse_poses)
+
+        interp_xy = self._interp_feature(coarse_times, coarse_relative[:, :2], target_times)
+        interp_heading = self._interp_heading(coarse_times, coarse_relative[:, 2], target_times)
+
+        ego_future = np.zeros((self.future_len, 4), dtype=np.float32)
+        ego_future[:, 0:2] = interp_xy.astype(np.float32)
+        ego_future[:, 2] = np.cos(interp_heading).astype(np.float32)
+        ego_future[:, 3] = np.sin(interp_heading).astype(np.float32)
         return torch.from_numpy(ego_future)
 
     def _build_static_objects(self, frame_list) -> torch.Tensor:

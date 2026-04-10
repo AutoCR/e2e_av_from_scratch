@@ -137,14 +137,14 @@ class Encoder(nn.Module):
         neighbors = inputs['neighbor_agents_past']
         static = inputs['static_objects']
         lanes = inputs['lanes']
-        # lanes_speed_limit = inputs['lanes_speed_limit']
-        # lanes_has_speed_limit = inputs['lanes_has_speed_limit']
+        lanes_speed_limit = inputs['lanes_speed_limit']
+        lanes_has_speed_limit = inputs['lanes_has_speed_limit']
 
         B = neighbors.shape[0]
 
         encoding_neighbors, neighbors_mask, neighbors_pos = self.neighbor_encoder(neighbors)
         encoding_static, static_mask, static_pos = self.static_encoder(static)
-        encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(lanes)
+        encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(lanes, lanes_speed_limit, lanes_has_speed_limit)
 
         encoding_input = torch.cat([encoding_neighbors, encoding_static, encoding_lanes], dim = 1)
 
@@ -354,6 +354,8 @@ class LaneFusionEncoder(nn.Module):
         self._lane_len = lane_len
         self._channel = channels_mlp_dim
 
+        self.speed_limit_emb = nn.Linear(1, channels_mlp_dim)
+        self.unknown_speed_emb = nn.Embedding(1, channels_mlp_dim)
         self.traffic_emb = nn.Linear(4, channels_mlp_dim)
 
         self.channel_pre_project = Mlp(
@@ -389,7 +391,7 @@ class LaneFusionEncoder(nn.Module):
             drop=drop_path_rate,
         )
 
-    def forward(self, x):
+    def forward(self, x, speed_limit, has_speed_limit):
         """
         x: B, P, V, D (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4))
         speed_limit: B, P, 1
@@ -422,11 +424,29 @@ class LaneFusionEncoder(nn.Module):
             x = block(x)
 
         x = torch.mean(x, dim=1)
+
+        speed_limit = speed_limit.view(B * P, 1)
+        has_speed_limit = has_speed_limit.view(B * P, 1)
         traffic = traffic.view(B * P, -1)
+
+        has_speed_limit = has_speed_limit[valid_indices].squeeze(-1)
+        speed_limit = speed_limit[valid_indices].squeeze(-1)
+        speed_limit_embedding = torch.zeros((speed_limit.shape[0], self._channel), device=x.device)
+
+        if has_speed_limit.sum() > 0:
+            speed_limit_with_limit = self.speed_limit_emb(speed_limit[has_speed_limit].unsqueeze(-1))
+            speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
+
+        if (~has_speed_limit.sum()) > 0:
+            speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
+                (~has_speed_limit).sum().item(), -1
+            )
+            speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
+
         traffic = traffic[valid_indices]
         traffic_light_embedding = self.traffic_emb(traffic)
 
-        x = x + traffic_light_embedding
+        x = x + speed_limit_embedding + traffic_light_embedding
         x = self.emb_project(self.norm(x))
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
@@ -727,7 +747,7 @@ class RouteEncoder(nn.Module):
         super().__init__()
 
         self.channel = channels_mlp_dim
-        self.channel_pre_projection = Mlp(
+        self.channel_pre_project = Mlp(
             in_features=4,
             hidden_features=channels_mlp_dim,
             out_features=channels_mlp_dim,
@@ -768,7 +788,7 @@ class RouteEncoder(nn.Module):
         valid_indices = ~mask_b.view(-1)
         x = x[valid_indices]
 
-        x = self.channel_pre_projection(x)
+        x = self.channel_pre_project(x)
         x = x.permute(0, 2, 1)
         x = self.token_pre_project(x)
         x = x.permute(0, 2, 1)
