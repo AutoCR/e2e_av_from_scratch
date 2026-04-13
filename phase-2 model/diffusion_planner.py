@@ -929,7 +929,7 @@ class DiTBlock(nn.Module):
         x = x + gate_msa.unsqueeze(1) * self.attn(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask)[0]
 
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_msa.unsqueeze(1) * self.mlp1(modulated_x)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
         x = self.cross_attn(self.norm3(x), cross_c, cross_c)[0]
         x = self.mlp2(self.norm4(x))
