@@ -1,23 +1,64 @@
 import os
+import pickle
+from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
+import pyogrio
 import torch
 from pyquaternion import Quaternion
 from shapely import affinity
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
-from navsim.agents.transfuser.transfuser_config import TransfuserConfig
-from navsim.agents.transfuser.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
-from navsim.common.dataloader import SceneLoader
 from navsim.common.enums import BoundingBoxIndex
-from navsim.planning.simulation.planner.pdm_planner.utils.pdm_geometry_utils import normalize_angle
-from nuplan.common.actor_state.oriented_box import OrientedBox
-from nuplan.common.actor_state.state_representation import StateSE2
-from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
-from nuplan.common.maps.abstract_map import SemanticMapLayer
-from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
-from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+
+try:
+    from navsim.common.dataloader import SceneLoader
+    from navsim.planning.simulation.planner.pdm_planner.utils.pdm_geometry_utils import normalize_angle
+    from nuplan.common.actor_state.oriented_box import OrientedBox
+    from nuplan.common.actor_state.state_representation import StateSE2
+    from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
+    from nuplan.common.maps.abstract_map import SemanticMapLayer
+    from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
+except ModuleNotFoundError:
+    SceneLoader = Any
+
+    def normalize_angle(angle: float) -> float:
+        return float(np.arctan2(np.sin(angle), np.cos(angle)))
+
+    class StateSE2:
+        def __init__(self, x: float, y: float, heading: float):
+            self.x = x
+            self.y = y
+            self.heading = heading
+
+        @property
+        def point(self):
+            return None
+
+    class _TrackedObjectType:
+        VEHICLE = "vehicle"
+        PEDESTRIAN = "pedestrian"
+        BICYCLE = "bicycle"
+        TRAFFIC_CONE = "traffic_cone"
+        BARRIER = "barrier"
+        CZONE_SIGN = "czone_sign"
+        GENERIC_OBJECT = "generic_object"
+        EGO = "ego"
+
+    class _SemanticMapLayer:
+        LANE = "LANE"
+        LANE_CONNECTOR = "LANE_CONNECTOR"
+        INTERSECTION = "INTERSECTION"
+        WALKWAYS = "WALKWAYS"
+
+    TrackedObjectType = _TrackedObjectType
+    SemanticMapLayer = _SemanticMapLayer
+    OrientedBox = None
+
+    def get_maps_api(*args, **kwargs):
+        raise ModuleNotFoundError("nuplan-devkit is required for DiffusionPlannerDataset.")
 
 
 class DiffusionPlannerDataset(torch.utils.data.Dataset):
@@ -704,3 +745,367 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
             bev_map[mask] = label
 
         return torch.from_numpy(bev_map)
+
+
+class _NuplanMapStore:
+    def __init__(self, maps_root: Path):
+        self.maps_root = Path(maps_root)
+        self._cache: dict[str, dict[str, Any]] = {}
+
+    def _map_gpkg_path(self, map_name: str) -> Path:
+        map_dir = self.maps_root / map_name
+        if not map_dir.exists():
+            raise FileNotFoundError(f"Map directory not found for {map_name}: {map_dir}")
+
+        versions = sorted(path for path in map_dir.iterdir() if path.is_dir())
+        if not versions:
+            raise FileNotFoundError(f"No map version folder found under {map_dir}")
+
+        gpkg_path = versions[0] / "map.gpkg"
+        if not gpkg_path.exists():
+            raise FileNotFoundError(f"Map geopackage not found: {gpkg_path}")
+        return gpkg_path
+
+    def _read_layer(self, gpkg_path: Path, layer: str, crs) -> Any:
+        gdf = pyogrio.read_dataframe(gpkg_path, layer=layer, fid_as_index=True)
+        if gdf.crs != crs:
+            gdf = gdf.to_crs(crs)
+        return gdf
+
+    def _load_map(self, map_name: str) -> dict[str, Any]:
+        if map_name in self._cache:
+            return self._cache[map_name]
+
+        gpkg_path = self._map_gpkg_path(map_name)
+        baseline_paths = pyogrio.read_dataframe(gpkg_path, layer="baseline_paths", fid_as_index=True)
+        projected_crs = baseline_paths.estimate_utm_crs()
+        baseline_paths = baseline_paths.to_crs(projected_crs)
+        boundaries = self._read_layer(gpkg_path, "boundaries", projected_crs)
+        lanes = self._read_layer(gpkg_path, "lanes_polygons", projected_crs)
+        lane_connectors = self._read_layer(gpkg_path, "lane_connectors", projected_crs)
+        lane_group_connectors = self._read_layer(gpkg_path, "lane_group_connectors", projected_crs)
+
+        lane_baselines = baseline_paths[baseline_paths["lane_fid"].notna()].copy()
+        lane_baselines["lane_fid"] = lane_baselines["lane_fid"].astype(np.int64)
+        lane_baselines = lane_baselines.drop_duplicates(subset=["lane_fid"]).set_index("lane_fid", drop=False)
+
+        connector_baselines = baseline_paths[baseline_paths["lane_connector_fid"].notna()].copy()
+        connector_baselines["lane_connector_fid"] = connector_baselines["lane_connector_fid"].astype(np.int64)
+        connector_baselines = connector_baselines.drop_duplicates(subset=["lane_connector_fid"]).set_index(
+            "lane_connector_fid", drop=False
+        )
+
+        map_data = {
+            "boundaries": boundaries,
+            "lanes": lanes,
+            "lane_connectors": lane_connectors,
+            "lane_group_connectors": lane_group_connectors,
+            "lane_baselines": lane_baselines,
+            "connector_baselines": connector_baselines,
+        }
+        self._cache[map_name] = map_data
+        return map_data
+
+    def query_lane_records(self, map_name: str, origin_xy: np.ndarray, radius: float) -> list[dict[str, Any]]:
+        map_data = self._load_map(map_name)
+        query_geom = Point(float(origin_xy[0]), float(origin_xy[1]))
+        minx, miny, maxx, maxy = query_geom.buffer(radius).bounds
+
+        lane_candidates = map_data["lane_baselines"].cx[minx:maxx, miny:maxy]
+        connector_candidates = map_data["connector_baselines"].cx[minx:maxx, miny:maxy]
+
+        records: list[dict[str, Any]] = []
+        for lane_fid, baseline in lane_candidates.iterrows():
+            if lane_fid not in map_data["lanes"].index:
+                continue
+            lane = map_data["lanes"].loc[lane_fid]
+            left_fid = int(lane["left_boundary_fid"])
+            right_fid = int(lane["right_boundary_fid"])
+            if left_fid not in map_data["boundaries"].index or right_fid not in map_data["boundaries"].index:
+                continue
+
+            roadblock_id = str(int(lane["lane_group_fid"]))
+            speed_limit = float(lane["speed_limit_mps"]) if not np.isnan(lane["speed_limit_mps"]) else 0.0
+            records.append(
+                {
+                    "lane_id": int(lane_fid),
+                    "is_connector": False,
+                    "roadblock_id": roadblock_id,
+                    "baseline": baseline.geometry,
+                    "left_boundary": map_data["boundaries"].loc[left_fid].geometry,
+                    "right_boundary": map_data["boundaries"].loc[right_fid].geometry,
+                    "speed_limit": speed_limit,
+                    "has_speed_limit": not np.isnan(lane["speed_limit_mps"]),
+                    "distance": float(baseline.geometry.distance(query_geom)),
+                }
+            )
+
+        for connector_fid, baseline in connector_candidates.iterrows():
+            if connector_fid not in map_data["lane_connectors"].index:
+                continue
+
+            lane_connector = map_data["lane_connectors"].loc[connector_fid]
+            lane_group_connector_fid = int(lane_connector["lane_group_connector_fid"])
+            if lane_group_connector_fid not in map_data["lane_group_connectors"].index:
+                continue
+
+            lane_group_connector = map_data["lane_group_connectors"].loc[lane_group_connector_fid]
+            left_fid = int(lane_group_connector["left_boundary_fid"])
+            right_fid = int(lane_group_connector["right_boundary_fid"])
+            if left_fid not in map_data["boundaries"].index or right_fid not in map_data["boundaries"].index:
+                continue
+
+            speed_limit_value = lane_connector["speed_limit_mps"]
+            roadblock_id = str(lane_group_connector_fid)
+            records.append(
+                {
+                    "lane_id": int(connector_fid),
+                    "is_connector": True,
+                    "roadblock_id": roadblock_id,
+                    "baseline": baseline.geometry,
+                    "left_boundary": map_data["boundaries"].loc[left_fid].geometry,
+                    "right_boundary": map_data["boundaries"].loc[right_fid].geometry,
+                    "speed_limit": float(speed_limit_value) if not np.isnan(speed_limit_value) else 0.0,
+                    "has_speed_limit": not np.isnan(speed_limit_value),
+                    "distance": float(baseline.geometry.distance(query_geom)),
+                }
+            )
+
+        return records
+
+
+class DiffusionPlannerNuplanDataset(DiffusionPlannerDataset):
+    def __init__(
+        self,
+        data_path,
+        cfg: dict,
+        maps_root=None,
+        max_len=None,
+        random_sample=False,
+        log_names=None,
+        tokens=None,
+        num_history_frames=4,
+        num_future_frames=10,
+        frame_interval=None,
+        max_ped_bike=5,
+    ):
+        if cfg is None:
+            raise ValueError("`cfg` must be provided for DiffusionPlannerNuplanDataset.")
+
+        required_cfg_keys = [
+            "agent_num",
+            "predicted_neighbor_num",
+            "static_objects_num",
+            "lane_num",
+            "route_num",
+            "lane_len",
+            "time_len",
+            "future_len",
+        ]
+        missing_cfg_keys = [key for key in required_cfg_keys if key not in cfg]
+        if missing_cfg_keys:
+            raise KeyError(f"Missing required cfg keys for DiffusionPlannerNuplanDataset: {missing_cfg_keys}")
+
+        self.data_path = Path(data_path)
+        self.maps_root = Path(maps_root) if maps_root is not None else Path(os.environ["NUPLAN_MAPS_ROOT"])
+        self.map_store = _NuplanMapStore(self.maps_root)
+
+        self.num_history_frames = num_history_frames
+        self.num_future_frames = num_future_frames
+        self.frame_interval = frame_interval or (num_history_frames + num_future_frames)
+        self.current_index = num_history_frames - 1
+
+        self.scene_frames_dicts = self._load_scene_frames(tokens=tokens, log_names=log_names)
+        all_tokens = list(self.scene_frames_dicts.keys())
+        if random_sample:
+            max_len = len(all_tokens) if max_len is None else min(max_len, len(all_tokens))
+            self.tokens = np.random.choice(all_tokens, size=max_len, replace=False).tolist()
+        else:
+            max_len = len(all_tokens) if max_len is None else min(max_len, len(all_tokens))
+            self.tokens = all_tokens[:max_len]
+        self.max_len = len(self.tokens)
+
+        self.agent_num = cfg["agent_num"]
+        self.predicted_neighbor_num = cfg["predicted_neighbor_num"]
+        self.static_objects_num = cfg["static_objects_num"]
+        self.lane_num = cfg["lane_num"]
+        self.route_num = cfg["route_num"]
+        self.lane_len = cfg["lane_len"]
+        self.time_len = cfg["time_len"]
+        self.future_len = cfg["future_len"]
+        self.max_ped_bike = max_ped_bike
+        self.map_radius = 100.0
+        self.model_interval = 0.1
+
+        self.dynamic_tracked_object_types = {
+            "vehicle": TrackedObjectType.VEHICLE,
+            "pedestrian": TrackedObjectType.PEDESTRIAN,
+            "bicycle": TrackedObjectType.BICYCLE,
+        }
+        self.static_tracked_object_types = {
+            "traffic_cone": TrackedObjectType.TRAFFIC_CONE,
+            "barrier": TrackedObjectType.BARRIER,
+            "czone_sign": TrackedObjectType.CZONE_SIGN,
+            "generic_object": TrackedObjectType.GENERIC_OBJECT,
+        }
+
+    def __len__(self):
+        return self.max_len
+
+    def __getitem__(self, idx):
+        token = self.tokens[idx]
+        frame_list = self.scene_frames_dicts[token]
+        selected_neighbor_tokens = self._select_neighbor_tokens(frame_list)
+
+        features = self._build_diffusion_planner_inputs(frame_list, selected_neighbor_tokens)
+        targets = {
+            "ego_future_gt": self._build_ego_future(frame_list),
+            "neighbors_future_gt": self._build_neighbors_future(frame_list, selected_neighbor_tokens),
+            "neighbor_future_mask": self._build_neighbor_future_mask(frame_list, selected_neighbor_tokens),
+            "trajectory": self._build_future_trajectory(frame_list),
+        }
+        return token, features, targets
+
+    def _load_scene_frames(self, tokens=None, log_names=None) -> dict[str, list[dict[str, Any]]]:
+        windows: dict[str, list[dict[str, Any]]] = {}
+        log_files = sorted(self.data_path.glob("*.pkl"))
+        if log_names is not None:
+            allowed = {name.replace(".pkl", "") for name in log_names}
+            log_files = [log_file for log_file in log_files if log_file.stem in allowed]
+
+        token_filter = set(tokens) if tokens is not None else None
+        num_frames = self.num_history_frames + self.num_future_frames
+        for log_file in log_files:
+            with open(log_file, "rb") as fp:
+                scene_dict_list = pickle.load(fp)
+
+            for start_idx in range(0, len(scene_dict_list), self.frame_interval):
+                frame_list = scene_dict_list[start_idx : start_idx + num_frames]
+                if len(frame_list) < num_frames:
+                    continue
+                if len(frame_list[self.current_index]["roadblock_ids"]) == 0:
+                    continue
+
+                token = frame_list[self.current_index]["token"]
+                if token_filter is not None and token not in token_filter:
+                    continue
+                windows[token] = frame_list
+
+        return windows
+
+    def _sample_geometry(self, geometry, num_points: int) -> np.ndarray:
+        if geometry.is_empty:
+            return np.zeros((num_points, 2), dtype=np.float64)
+
+        if geometry.geom_type == "LineString":
+            line = geometry
+        else:
+            line = LineString(geometry.exterior.coords)
+
+        if line.length == 0:
+            point = np.asarray(line.coords[0], dtype=np.float64)
+            return np.repeat(point[None], num_points, axis=0)
+
+        distances = np.linspace(0.0, line.length, num_points, dtype=np.float64)
+        return np.asarray([line.interpolate(distance).coords[0] for distance in distances], dtype=np.float64)
+
+    def _encode_map_record(self, map_record: dict[str, Any], origin_pose: np.ndarray, traffic_lights) -> np.ndarray:
+        center = self._sample_geometry(map_record["baseline"], self.lane_len)
+        left = self._sample_geometry(map_record["left_boundary"], self.lane_len)
+        right = self._sample_geometry(map_record["right_boundary"], self.lane_len)
+
+        center = self._global_points_to_local(origin_pose, center)
+        left = self._global_points_to_local(origin_pose, left)
+        right = self._global_points_to_local(origin_pose, right)
+
+        if np.linalg.norm(left[-1] - center[0]) < np.linalg.norm(left[0] - center[0]):
+            left = left[::-1]
+        if np.linalg.norm(right[-1] - center[0]) < np.linalg.norm(right[0] - center[0]):
+            right = right[::-1]
+
+        direction = np.zeros_like(center)
+        direction[:-1] = center[1:] - center[:-1]
+
+        lane_feature = np.zeros((self.lane_len, 12), dtype=np.float32)
+        lane_feature[:, 0:2] = center.astype(np.float32)
+        lane_feature[:, 2:4] = direction.astype(np.float32)
+        lane_feature[:, 4:6] = (left - center).astype(np.float32)
+        lane_feature[:, 6:8] = (right - center).astype(np.float32)
+
+        if map_record["is_connector"]:
+            traffic_light_lookup = {str(connector_id): bool(is_red) for connector_id, is_red in traffic_lights}
+            state = traffic_light_lookup.get(str(map_record["lane_id"]))
+            if state is None:
+                lane_feature[:, 8:12] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            elif state:
+                lane_feature[:, 8:12] = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+            else:
+                lane_feature[:, 8:12] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            lane_feature[:, 8:12] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+        return lane_feature
+
+    def _build_lane_features(self, frame_list):
+        current_frame = frame_list[self.current_index]
+        current_pose = self._frame_pose(current_frame)
+        route_roadblock_ids = list(dict.fromkeys(str(roadblock_id) for roadblock_id in current_frame["roadblock_ids"]))
+        route_order = {roadblock_id: idx for idx, roadblock_id in enumerate(route_roadblock_ids)}
+
+        lane_records = self.map_store.query_lane_records(
+            current_frame["map_location"],
+            origin_xy=current_pose[:2],
+            radius=self.map_radius,
+        )
+
+        encoded_lanes = []
+        encoded_route_lanes = []
+        for map_record in lane_records:
+            lane_feature = self._encode_map_record(map_record, current_pose, current_frame["traffic_lights"])
+            record = (
+                map_record["distance"],
+                lane_feature,
+                float(map_record["speed_limit"]),
+                bool(map_record["has_speed_limit"]),
+            )
+            encoded_lanes.append(record)
+            if map_record["roadblock_id"] in route_order:
+                encoded_route_lanes.append(
+                    (
+                        route_order[map_record["roadblock_id"]],
+                        map_record["distance"],
+                        lane_feature,
+                        float(map_record["speed_limit"]),
+                        bool(map_record["has_speed_limit"]),
+                    )
+                )
+
+        encoded_lanes.sort(key=lambda item: item[0])
+        encoded_route_lanes.sort(key=lambda item: (item[0], item[1]))
+
+        lanes = np.zeros((self.lane_num, self.lane_len, 12), dtype=np.float32)
+        lanes_speed_limit = np.zeros((self.lane_num, 1), dtype=np.float32)
+        lanes_has_speed_limit = np.zeros((self.lane_num, 1), dtype=bool)
+        for idx, (_, lane_feature, speed_limit, has_speed_limit) in enumerate(encoded_lanes[: self.lane_num]):
+            lanes[idx] = lane_feature
+            lanes_speed_limit[idx, 0] = speed_limit
+            lanes_has_speed_limit[idx, 0] = has_speed_limit
+
+        route_lanes = np.zeros((self.route_num, self.lane_len, 12), dtype=np.float32)
+        route_lanes_speed_limit = np.zeros((self.route_num, 1), dtype=np.float32)
+        route_lanes_has_speed_limit = np.zeros((self.route_num, 1), dtype=bool)
+        for idx, (_, _, lane_feature, speed_limit, has_speed_limit) in enumerate(
+            encoded_route_lanes[: self.route_num]
+        ):
+            route_lanes[idx] = lane_feature
+            route_lanes_speed_limit[idx, 0] = speed_limit
+            route_lanes_has_speed_limit[idx, 0] = has_speed_limit
+
+        return {
+            "lanes": torch.from_numpy(lanes),
+            "lanes_speed_limit": torch.from_numpy(lanes_speed_limit),
+            "lanes_has_speed_limit": torch.from_numpy(lanes_has_speed_limit),
+            "route_lanes": torch.from_numpy(route_lanes),
+            "route_lanes_speed_limit": torch.from_numpy(route_lanes_speed_limit),
+            "route_lanes_has_speed_limit": torch.from_numpy(route_lanes_has_speed_limit),
+        }
