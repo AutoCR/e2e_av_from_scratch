@@ -437,7 +437,7 @@ class LaneFusionEncoder(nn.Module):
             speed_limit_with_limit = self.speed_limit_emb(speed_limit[has_speed_limit].unsqueeze(-1))
             speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
 
-        if (~has_speed_limit.sum()) > 0:
+        if (~has_speed_limit).sum() > 0:
             speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
                 (~has_speed_limit).sum().item(), -1
             )
@@ -600,7 +600,7 @@ class Decoder(nn.Module):
                 dpm_solver_params={
                     'correcting_xt_fn': initial_state_constraint,
                 },
-                model_wraper_params={
+                model_wrapper_params={
                     'classifier_fn': self._guidance_fn,
                     'classifier_kwargs': {
                         'model': self.dit,
@@ -610,7 +610,7 @@ class Decoder(nn.Module):
                             'neighbor_current_mask': neighbor_current_mask,
                         },
                         'inputs': inputs,
-                        'observeation_normalizer': self._observation_normalizer,
+                        'observation_normalizer': self._observation_normalizer,
                         'state_normalizer': self._state_normalizer,
                     },
                     'guidance_scale': 0.5,
@@ -703,7 +703,7 @@ def dpm_sampler(
         other_model_params: dict = {},
         diffusion_steps=10,
         noise_schedule_params: dict = {},
-        model_wraper_params: dict = {},
+        model_wrapper_params: dict = {},
         dpm_solver_params: dict = {},
         sample_params: dict = {},
 ):
@@ -715,7 +715,7 @@ def dpm_sampler(
             noise_schedule=noise_schedule,
             model_type=model.model_type,
             model_kwargs=other_model_params,
-            **model_wraper_params,
+            **model_wrapper_params,
         )
 
         dpm_solver = DPM_Solver(

@@ -604,8 +604,7 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
         current_frame = frame_list[self.current_index]
         current_pose = self._frame_pose(current_frame)
         map_api = self._map_api(current_frame["map_location"])
-        route_roadblock_ids = list(dict.fromkeys(current_frame["roadblock_ids"]))
-        route_order = {roadblock_id: idx for idx, roadblock_id in enumerate(route_roadblock_ids)}
+        route_roadblock_ids = list(dict.fromkeys(str(r) for r in current_frame["roadblock_ids"]))
 
         proximal = map_api.get_proximal_map_objects(
             point=StateSE2(*current_pose).point,
@@ -614,40 +613,46 @@ class DiffusionPlannerDataset(torch.utils.data.Dataset):
         )
 
         lane_records = []
-        route_lane_records = []
         for layer in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
             for map_object in proximal[layer]:
                 lane_feature = self._encode_lane(map_object, layer, current_pose, current_frame["traffic_lights"])
                 lane_distance = float(np.linalg.norm(lane_feature[:, :2], axis=-1).min())
                 speed_limit = float(map_object.speed_limit_mps) if map_object.speed_limit_mps is not None else 0.0
                 has_speed_limit = map_object.speed_limit_mps is not None
-                roadblock_id = map_object.get_roadblock_id()
-                lane_records.append((lane_distance, lane_feature, speed_limit, has_speed_limit))
-                if roadblock_id in route_order:
-                    route_lane_records.append(
-                        (route_order[roadblock_id], lane_distance, lane_feature, speed_limit, has_speed_limit)
-                    )
+                roadblock_id = str(map_object.get_roadblock_id())
+                lane_records.append((lane_distance, lane_feature, speed_limit, has_speed_limit, roadblock_id))
 
         lane_records.sort(key=lambda item: item[0])
-        route_lane_records.sort(key=lambda item: (item[0], item[1]))
+        lane_records = lane_records[: self.lane_num]
+
+        extracted_roadblocks = {record[4] for record in lane_records}
+        pruned_route_roadblocks: list[str] = []
+        route_started = False
+        for roadblock_id in route_roadblock_ids:
+            if roadblock_id in extracted_roadblocks:
+                pruned_route_roadblocks.append(roadblock_id)
+                route_started = True
+            elif route_started:
+                break
+        pruned_route_roadblocks_set = set(pruned_route_roadblocks)
 
         lanes = np.zeros((self.lane_num, self.lane_len, 12), dtype=np.float32)
         lanes_speed_limit = np.zeros((self.lane_num, 1), dtype=np.float32)
         lanes_has_speed_limit = np.zeros((self.lane_num, 1), dtype=bool)
-        for idx, (_, lane_feature, speed_limit, has_speed_limit) in enumerate(lane_records[: self.lane_num]):
-            lanes[idx] = lane_feature
-            lanes_speed_limit[idx, 0] = speed_limit
-            lanes_has_speed_limit[idx, 0] = has_speed_limit
-
         route_lanes = np.zeros((self.route_num, self.lane_len, 12), dtype=np.float32)
         route_lanes_speed_limit = np.zeros((self.route_num, 1), dtype=np.float32)
         route_lanes_has_speed_limit = np.zeros((self.route_num, 1), dtype=bool)
-        for idx, (_, _, lane_feature, speed_limit, has_speed_limit) in enumerate(
-            route_lane_records[: self.route_num]
-        ):
-            route_lanes[idx] = lane_feature
-            route_lanes_speed_limit[idx, 0] = speed_limit
-            route_lanes_has_speed_limit[idx, 0] = has_speed_limit
+
+        route_idx = 0
+        for idx, (_, lane_feature, speed_limit, has_speed_limit, roadblock_id) in enumerate(lane_records):
+            lanes[idx] = lane_feature
+            lanes_speed_limit[idx, 0] = speed_limit
+            lanes_has_speed_limit[idx, 0] = has_speed_limit
+            if roadblock_id in pruned_route_roadblocks_set and route_idx < self.route_num:
+                route_lanes[route_idx] = lane_feature
+                route_lanes_speed_limit[route_idx, 0] = speed_limit
+                route_lanes_has_speed_limit[route_idx, 0] = has_speed_limit
+                route_idx += 1
 
         return {
             "lanes": torch.from_numpy(lanes),
@@ -1050,56 +1055,54 @@ class DiffusionPlannerNuplanDataset(DiffusionPlannerDataset):
         current_frame = frame_list[self.current_index]
         current_pose = self._frame_pose(current_frame)
         route_roadblock_ids = list(dict.fromkeys(str(roadblock_id) for roadblock_id in current_frame["roadblock_ids"]))
-        route_order = {roadblock_id: idx for idx, roadblock_id in enumerate(route_roadblock_ids)}
 
         lane_records = self.map_store.query_lane_records(
             current_frame["map_location"],
             origin_xy=current_pose[:2],
             radius=self.map_radius,
         )
+        lane_records = sorted(lane_records, key=lambda r: r["distance"])[: self.lane_num]
 
         encoded_lanes = []
-        encoded_route_lanes = []
         for map_record in lane_records:
             lane_feature = self._encode_map_record(map_record, current_pose, current_frame["traffic_lights"])
-            record = (
-                map_record["distance"],
-                lane_feature,
-                float(map_record["speed_limit"]),
-                bool(map_record["has_speed_limit"]),
-            )
-            encoded_lanes.append(record)
-            if map_record["roadblock_id"] in route_order:
-                encoded_route_lanes.append(
-                    (
-                        route_order[map_record["roadblock_id"]],
-                        map_record["distance"],
-                        lane_feature,
-                        float(map_record["speed_limit"]),
-                        bool(map_record["has_speed_limit"]),
-                    )
+            encoded_lanes.append(
+                (
+                    lane_feature,
+                    float(map_record["speed_limit"]),
+                    bool(map_record["has_speed_limit"]),
+                    map_record["roadblock_id"],
                 )
+            )
 
-        encoded_lanes.sort(key=lambda item: item[0])
-        encoded_route_lanes.sort(key=lambda item: (item[0], item[1]))
+        extracted_roadblocks = {record[3] for record in encoded_lanes}
+        pruned_route_roadblocks: list[str] = []
+        route_started = False
+        for roadblock_id in route_roadblock_ids:
+            if roadblock_id in extracted_roadblocks:
+                pruned_route_roadblocks.append(roadblock_id)
+                route_started = True
+            elif route_started:
+                break
+        pruned_route_roadblocks_set = set(pruned_route_roadblocks)
 
         lanes = np.zeros((self.lane_num, self.lane_len, 12), dtype=np.float32)
         lanes_speed_limit = np.zeros((self.lane_num, 1), dtype=np.float32)
         lanes_has_speed_limit = np.zeros((self.lane_num, 1), dtype=bool)
-        for idx, (_, lane_feature, speed_limit, has_speed_limit) in enumerate(encoded_lanes[: self.lane_num]):
-            lanes[idx] = lane_feature
-            lanes_speed_limit[idx, 0] = speed_limit
-            lanes_has_speed_limit[idx, 0] = has_speed_limit
-
         route_lanes = np.zeros((self.route_num, self.lane_len, 12), dtype=np.float32)
         route_lanes_speed_limit = np.zeros((self.route_num, 1), dtype=np.float32)
         route_lanes_has_speed_limit = np.zeros((self.route_num, 1), dtype=bool)
-        for idx, (_, _, lane_feature, speed_limit, has_speed_limit) in enumerate(
-            encoded_route_lanes[: self.route_num]
-        ):
-            route_lanes[idx] = lane_feature
-            route_lanes_speed_limit[idx, 0] = speed_limit
-            route_lanes_has_speed_limit[idx, 0] = has_speed_limit
+
+        route_idx = 0
+        for idx, (lane_feature, speed_limit, has_speed_limit, roadblock_id) in enumerate(encoded_lanes):
+            lanes[idx] = lane_feature
+            lanes_speed_limit[idx, 0] = speed_limit
+            lanes_has_speed_limit[idx, 0] = has_speed_limit
+            if roadblock_id in pruned_route_roadblocks_set and route_idx < self.route_num:
+                route_lanes[route_idx] = lane_feature
+                route_lanes_speed_limit[route_idx, 0] = speed_limit
+                route_lanes_has_speed_limit[route_idx, 0] = has_speed_limit
+                route_idx += 1
 
         return {
             "lanes": torch.from_numpy(lanes),
