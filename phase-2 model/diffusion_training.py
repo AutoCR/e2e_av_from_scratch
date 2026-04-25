@@ -1,8 +1,8 @@
 import os
 print(os.getcwd())
-os.environ["NUPLAN_MAPS_ROOT"] = os.path.expandvars("$HOME/Code/navsim/dataset/maps")
-os.environ["OPENSCENE_DATA_ROOT"] = os.path.expandvars("$HOME/Code/navsim/dataset")
-os.environ["NAVSIM_EXP_ROOT"] = os.path.expandvars("$HOME/Code/e2e_av_from_scratch/exp")
+os.environ["NUPLAN_MAPS_ROOT"] = os.path.expandvars("/prediction_database/nuplan/dataset/maps")
+os.environ["OPENSCENE_DATA_ROOT"] = os.path.expandvars("/prediction_database/navsim")
+os.environ["NAVSIM_EXP_ROOT"] = os.path.expandvars("/home/pnc/Code/e2e_av_from_scratch/exp")
 
 import csv
 import random
@@ -25,7 +25,7 @@ from diffusion_planner import StateNormalizer
 import torch
 from torch import optim
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, MultiplicativeLR
-from timm.utils import ModelEma
+from timm.utils.model_ema import ModelEma
 from diffusion_planner import ObservationNormalizer
 from tqdm import tqdm
 
