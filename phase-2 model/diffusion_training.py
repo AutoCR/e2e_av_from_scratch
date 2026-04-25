@@ -128,9 +128,9 @@ train_loader = build_loader(TRAINVAL_DATA_SPLIT, TRAIN_LOGS, batch_size=BATCH_SI
 val_loader = build_loader(TRAINVAL_DATA_SPLIT, VAL_LOGS, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = build_loader(TEST_DATA_SPLIT, None, batch_size=BATCH_SIZE, shuffle=False)
 
-model = DiffusionPlanner(cfg)
-optimizer = optim.AdamW([{'params': model.parameters(), 'lr': LEARNING_RATE}])
 device = 'cuda'
+model = DiffusionPlanner(cfg).to(device)
+optimizer = optim.AdamW([{'params': model.parameters(), 'lr': LEARNING_RATE}])
 
 scheduler_epochs = max(NUM_EPOCHS, WARM_UP_EPOCHS)
 scheduler = cosine_annealing_warmup_restarts(optimizer, scheduler_epochs, WARM_UP_EPOCHS)
@@ -158,10 +158,8 @@ def evaluate(eval_model: nn.Module, loader: DataLoader, desc: str = 'Eval') -> d
     n_batches = 0
     with tqdm(loader, desc=desc, unit='batch') as data_epoch:
         for token, features, targets in data_epoch:
-            for k, v in features.items():
-                v = v.to(device)
-            for k, v in targets.items():
-                v = v.to(device)
+            features = {k: v.to(device) for k, v in features.items()}
+            targets = {k: v.to(device) for k, v in targets.items()}
 
             ego_future = targets['ego_future_gt'].to(device)
             neighbors_future = targets['neighbors_future_gt'].to(device)
@@ -212,10 +210,8 @@ with iter_log_path.open('w', newline='') as iter_f, epoch_log_path.open('w', new
         epoch_neighbor_losses = []
         with tqdm(train_loader, desc=f'Epoch {epoch + 1}/{NUM_EPOCHS}', unit='batch') as data_epoch:
             for iter_idx, (token, features, targets) in enumerate(data_epoch):
-                for k, v in features.items():
-                    v = v.to(device)
-                for k, v in targets.items():
-                    v = v.to(device)
+                features = {k: v.to(device) for k, v in features.items()}
+                targets = {k: v.to(device) for k, v in targets.items()}
 
                 ego_future = targets['ego_future_gt'].to(device)
                 neighbors_future = targets['neighbors_future_gt'].to(device)
