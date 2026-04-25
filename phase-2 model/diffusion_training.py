@@ -6,7 +6,8 @@ os.environ["NAVSIM_EXP_ROOT"] = os.path.expandvars("/home/pnc/Code/e2e_av_from_s
 
 import csv
 import random
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -138,10 +139,12 @@ scheduler = cosine_annealing_warmup_restarts(optimizer, scheduler_epochs, WARM_U
 model_ema = ModelEma(model, decay=EMA_DECAY, device=device)
 
 observation_normalizer = ObservationNormalizer({
-    k: {kk: torch.tensor(vv, dtype=torch.float32) for kk, vv in v.items()}
+    k: {kk: torch.tensor(vv, dtype=torch.float32, device=device) for kk, vv in v.items()}
     for k, v in cfg['observation_normalizer'].items()
 })
 state_normalizer = StateNormalizer(**cfg['state_normalizer'])
+state_normalizer.mean = state_normalizer.mean.to(device)
+state_normalizer.std = state_normalizer.std.to(device)
 
 
 @torch.no_grad()
@@ -201,9 +204,11 @@ with iter_log_path.open('w', newline='') as iter_f, epoch_log_path.open('w', new
         'epoch', 'lr',
         'train_loss', 'train_ego_planning_loss', 'train_neighbor_prediction_loss',
         'val_loss', 'val_ego_planning_loss', 'val_neighbor_prediction_loss',
+        'epoch_time_sec',
     ])
 
     for epoch in range(0, NUM_EPOCHS):
+        epoch_start = time.monotonic()
         model.train()
         epoch_losses = []
         epoch_ego_losses = []
@@ -261,18 +266,21 @@ with iter_log_path.open('w', newline='') as iter_f, epoch_log_path.open('w', new
         # Val pass against EMA weights (what the raw repo actually evaluates).
         val_metrics = evaluate(model_ema.ema, val_loader, desc=f'Val {epoch + 1}/{NUM_EPOCHS}')
 
+        epoch_time_sec = time.monotonic() - epoch_start
         current_lr = optimizer.param_groups[0]['lr']
         epoch_writer.writerow([
             epoch + 1, current_lr,
             epoch_mean_loss, epoch_mean_ego, epoch_mean_neighbor,
             val_metrics['loss'], val_metrics['ego_planning_loss'], val_metrics['neighbor_prediction_loss'],
+            f"{epoch_time_sec:.3f}",
         ])
         epoch_f.flush()
 
         print(
             f"Epoch {epoch + 1} | train loss {epoch_mean_loss:.4f} | "
             f"val loss {val_metrics['loss']:.4f} "
-            f"(ego {val_metrics['ego_planning_loss']:.4f}, nbr {val_metrics['neighbor_prediction_loss']:.4f})"
+            f"(ego {val_metrics['ego_planning_loss']:.4f}, nbr {val_metrics['neighbor_prediction_loss']:.4f}) | "
+            f"time {timedelta(seconds=int(epoch_time_sec))}"
         )
 
         scheduler.step()
