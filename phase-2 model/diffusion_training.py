@@ -9,6 +9,8 @@ import random
 from datetime import datetime
 from pathlib import Path
 
+import yaml
+
 import hydra
 from hydra.utils import instantiate
 
@@ -79,12 +81,19 @@ def save_checkpoint(path: Path, epoch: int, model, ema, optimizer, scheduler, tr
         path,
     )
 
-# Splits — point val/test at held-out splits (e.g. "test", "trainval") when
-# running on the server. For local sanity checking they all default to "mini".
-TRAIN_SPLIT = "mini"
-VAL_SPLIT = "mini"
-TEST_SPLIT = "mini"
+# Data splits.
+#
+# Train/val come from the same `trainval/` blob, partitioned by log name using
+# default_train_val_test_log_split.yaml — same pattern as
+# navsim/planning/script/run_training_aug.py (build_datasets). Test uses the
+# dedicated `test/` data dir with no log-name override.
+TRAINVAL_DATA_SPLIT = "trainval"
+TEST_DATA_SPLIT = "test"
+LOG_SPLIT_YAML = Path(__file__).resolve().parents[1] / (
+    "navsim/planning/script/config/training/default_train_val_test_log_split.yaml"
+)
 FILTER = "all_scenes"
+
 if GlobalHydra.instance().is_initialized():
     GlobalHydra.instance().clear()
 hydra.initialize(config_path="../navsim/planning/script/config/common/train_test_split/scene_filter")
@@ -92,12 +101,19 @@ filter_cfg = hydra.compose(config_name=FILTER)
 print(filter_cfg)
 openscene_data_root = Path(os.getenv("OPENSCENE_DATA_ROOT"))
 
+log_split = yaml.safe_load(LOG_SPLIT_YAML.read_text())
+TRAIN_LOGS = log_split["train_logs"]
+VAL_LOGS = log_split["val_logs"]
+print(f"Log split: {len(TRAIN_LOGS)} train logs, {len(VAL_LOGS)} val logs")
 
-def build_loader(split: str, batch_size: int, shuffle: bool) -> DataLoader:
+
+def build_loader(data_split: str, log_names, batch_size: int, shuffle: bool) -> DataLoader:
     scene_filter: SceneFilter = instantiate(filter_cfg)
+    if log_names is not None:
+        scene_filter.log_names = list(log_names)
     scene_loader = SceneLoader(
-        openscene_data_root / f"navsim_logs/{split}",
-        openscene_data_root / f"sensor_blobs/{split}",
+        openscene_data_root / f"navsim_logs/{data_split}",
+        openscene_data_root / f"sensor_blobs/{data_split}",
         scene_filter,
         openscene_data_root / "warmup_two_stage/sensor_blobs",
         openscene_data_root / "warmup_two_stage/synthetic_scene_pickles",
@@ -107,9 +123,9 @@ def build_loader(split: str, batch_size: int, shuffle: bool) -> DataLoader:
     return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle)
 
 
-train_loader = build_loader(TRAIN_SPLIT, batch_size=1, shuffle=True)
-val_loader = build_loader(VAL_SPLIT, batch_size=1, shuffle=False)
-test_loader = build_loader(TEST_SPLIT, batch_size=1, shuffle=False)
+train_loader = build_loader(TRAINVAL_DATA_SPLIT, TRAIN_LOGS, batch_size=1, shuffle=True)
+val_loader = build_loader(TRAINVAL_DATA_SPLIT, VAL_LOGS, batch_size=1, shuffle=False)
+test_loader = build_loader(TEST_DATA_SPLIT, None, batch_size=1, shuffle=False)
 
 model = DiffusionPlanner(cfg)
 optimizer = optim.AdamW([{'params': model.parameters(), 'lr': LEARNING_RATE}])
