@@ -57,6 +57,7 @@ ALPHA_PLANNING_LOSS = 1.0
 EMA_DECAY = 0.999
 SAVE_EVERY_N_EPOCHS = 1  # raw repo default is 20
 LOG_EVERY_N_ITERS = 1
+BATCH_SIZE = 8
 
 set_seed(SEED)
 
@@ -119,17 +120,17 @@ def build_loader(data_split: str, log_names, batch_size: int, shuffle: bool) -> 
         openscene_data_root / "warmup_two_stage/synthetic_scene_pickles",
         sensor_config=SensorConfig.build_all_sensors(),
     )
-    dataset = DiffusionPlannerDataset(scene_loader=scene_loader, cfg=cfg, max_len=8)
+    dataset = DiffusionPlannerDataset(scene_loader=scene_loader, cfg=cfg)
     return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle)
 
 
-train_loader = build_loader(TRAINVAL_DATA_SPLIT, TRAIN_LOGS, batch_size=1, shuffle=True)
-val_loader = build_loader(TRAINVAL_DATA_SPLIT, VAL_LOGS, batch_size=1, shuffle=False)
-test_loader = build_loader(TEST_DATA_SPLIT, None, batch_size=1, shuffle=False)
+train_loader = build_loader(TRAINVAL_DATA_SPLIT, TRAIN_LOGS, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = build_loader(TRAINVAL_DATA_SPLIT, VAL_LOGS, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = build_loader(TEST_DATA_SPLIT, None, batch_size=BATCH_SIZE, shuffle=False)
 
 model = DiffusionPlanner(cfg)
 optimizer = optim.AdamW([{'params': model.parameters(), 'lr': LEARNING_RATE}])
-device = 'cpu'
+device = 'cuda'
 
 scheduler_epochs = max(NUM_EPOCHS, WARM_UP_EPOCHS)
 scheduler = cosine_annealing_warmup_restarts(optimizer, scheduler_epochs, WARM_UP_EPOCHS)
