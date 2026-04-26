@@ -1,8 +1,4 @@
 import os
-os.environ["NUPLAN_MAPS_ROOT"] = os.path.expandvars("/prediction_database/nuplan/dataset/maps")
-os.environ["OPENSCENE_DATA_ROOT"] = os.path.expandvars("/prediction_database/navsim")
-os.environ["NAVSIM_EXP_ROOT"] = os.path.expandvars("/home/pnc/Code/e2e_av_from_scratch/exp")
-
 import csv
 import random
 import time
@@ -76,7 +72,104 @@ ALPHA_PLANNING_LOSS = 1.0
 EMA_DECAY = 0.999
 SAVE_EVERY_N_EPOCHS = 1  # raw repo default is 20
 LOG_EVERY_N_ITERS = 1
-BATCH_SIZE = 8  # global batch size; per-GPU = BATCH_SIZE // world_size
+BATCH_SIZE = 128 * 8  # global batch size; per-GPU = BATCH_SIZE // world_size
+
+
+def build_loader(
+    data_split: str,
+    log_names,
+    batch_size: int,
+    shuffle: bool,
+    *,
+    filter_cfg,
+    openscene_data_root: Path,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+):
+    scene_filter: SceneFilter = instantiate(filter_cfg)
+    if log_names is not None:
+        scene_filter.log_names = list(log_names)
+    scene_loader = SceneLoader(
+        openscene_data_root / f"navsim_logs/{data_split}",
+        openscene_data_root / f"sensor_blobs/{data_split}",
+        scene_filter,
+        openscene_data_root / "warmup_two_stage/sensor_blobs",
+        openscene_data_root / "warmup_two_stage/synthetic_scene_pickles",
+        sensor_config=SensorConfig.build_all_sensors(),
+    )
+    dataset = DiffusionPlannerDataset(scene_loader=scene_loader, cfg=cfg)
+    per_gpu_batch = max(batch_size // world_size, 1)
+    if distributed:
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=True,
+        )
+        loader = DataLoader(
+            dataset, batch_size=per_gpu_batch, sampler=sampler,
+            num_workers=4, pin_memory=True, drop_last=True,
+        )
+        return loader, sampler
+    loader = DataLoader(
+        dataset, batch_size=per_gpu_batch, shuffle=shuffle,
+        num_workers=4, pin_memory=True,
+    )
+    return loader, None
+
+
+@torch.no_grad()
+def evaluate(
+    eval_model: nn.Module,
+    loader: DataLoader,
+    *,
+    device,
+    observation_normalizer,
+    state_normalizer,
+    distributed: bool,
+    is_main: bool,
+    desc: str = 'Eval',
+) -> dict:
+    """Run a forward-only diffusion-loss pass on `loader` and return mean losses.
+
+    Stays in train mode because the decoder only emits `'score'` under
+    `self.training` (diffusion_planner.py:563). `@torch.no_grad()` handles
+    autograd; train mode keeps the loss path alive.
+    """
+    eval_model.train()
+    totals = {'loss': 0.0, 'ego_planning_loss': 0.0, 'neighbor_prediction_loss': 0.0}
+    n_batches = 0
+    with tqdm(loader, desc=desc, unit='batch', disable=not is_main) as data_epoch:
+        for token, features, targets in data_epoch:
+            features = {k: v.to(device) for k, v in features.items()}
+            targets = {k: v.to(device) for k, v in targets.items()}
+
+            ego_future = targets['ego_future_gt'].to(device)
+            neighbors_future = targets['neighbors_future_gt'].to(device)
+            mask = targets['neighbor_future_mask']
+            neighbors_future[mask] = 0
+            inputs = observation_normalizer(features)
+
+            loss = {}
+            loss, _ = diffusion_loss_func(
+                eval_model,
+                inputs,
+                eval_model.sde.marginal_prob,
+                (ego_future, neighbors_future, mask),
+                state_normalizer,
+                loss,
+                cfg['diffusion_model_type'],
+            )
+            loss['loss'] = loss['neighbor_prediction_loss'] + ALPHA_PLANNING_LOSS * loss['ego_planning_loss']
+
+            totals['loss'] += loss['loss'].item()
+            totals['ego_planning_loss'] += loss['ego_planning_loss'].item()
+            totals['neighbor_prediction_loss'] += loss['neighbor_prediction_loss'].item()
+            n_batches += 1
+            data_epoch.set_postfix(loss=f"{totals['loss'] / max(n_batches, 1):.4f}")
+
+    local_means = {k: v / max(n_batches, 1) for k, v in totals.items()}
+    if distributed:
+        return {k: all_reduce_mean(v, device) for k, v in local_means.items()}
+    return local_means
 
 
 def save_checkpoint(path: Path, epoch: int, model_state_dict, ema, optimizer, scheduler, train_loss: float) -> None:
@@ -146,38 +239,16 @@ def main():
     if is_main:
         print(f"Log split: {len(train_logs)} train logs, {len(val_logs)} val logs")
 
-    def build_loader(data_split: str, log_names, batch_size: int, shuffle: bool):
-        scene_filter: SceneFilter = instantiate(filter_cfg)
-        if log_names is not None:
-            scene_filter.log_names = list(log_names)
-        scene_loader = SceneLoader(
-            openscene_data_root / f"navsim_logs/{data_split}",
-            openscene_data_root / f"sensor_blobs/{data_split}",
-            scene_filter,
-            openscene_data_root / "warmup_two_stage/sensor_blobs",
-            openscene_data_root / "warmup_two_stage/synthetic_scene_pickles",
-            sensor_config=SensorConfig.build_all_sensors(),
-        )
-        dataset = DiffusionPlannerDataset(scene_loader=scene_loader, cfg=cfg)
-        per_gpu_batch = max(batch_size // world_size, 1)
-        if distributed:
-            sampler = DistributedSampler(
-                dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=True,
-            )
-            loader = DataLoader(
-                dataset, batch_size=per_gpu_batch, sampler=sampler,
-                num_workers=4, pin_memory=True, drop_last=True,
-            )
-            return loader, sampler
-        loader = DataLoader(
-            dataset, batch_size=per_gpu_batch, shuffle=shuffle,
-            num_workers=4, pin_memory=True,
-        )
-        return loader, None
-
-    train_loader, train_sampler = build_loader(TRAINVAL_DATA_SPLIT, train_logs, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader, val_sampler = build_loader(TRAINVAL_DATA_SPLIT, val_logs, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader, test_sampler = build_loader(TEST_DATA_SPLIT, None, batch_size=BATCH_SIZE, shuffle=False)
+    loader_kwargs = dict(
+        filter_cfg=filter_cfg,
+        openscene_data_root=openscene_data_root,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+    )
+    train_loader, train_sampler = build_loader(TRAINVAL_DATA_SPLIT, train_logs, batch_size=BATCH_SIZE, shuffle=True, **loader_kwargs)
+    val_loader, _ = build_loader(TRAINVAL_DATA_SPLIT, val_logs, batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
+    test_loader, _ = build_loader(TEST_DATA_SPLIT, None, batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
 
     model = DiffusionPlanner(cfg).to(device)
     if distributed:
@@ -198,51 +269,6 @@ def main():
     state_normalizer = StateNormalizer(**cfg['state_normalizer'])
     state_normalizer.mean = state_normalizer.mean.to(device)
     state_normalizer.std = state_normalizer.std.to(device)
-
-    @torch.no_grad()
-    def evaluate(eval_model: nn.Module, loader: DataLoader, desc: str = 'Eval') -> dict:
-        """Run a forward-only diffusion-loss pass on `loader` and return mean losses.
-
-        Stays in train mode because the decoder only emits `'score'` under
-        `self.training` (diffusion_planner.py:563). `@torch.no_grad()` handles
-        autograd; train mode keeps the loss path alive.
-        """
-        eval_model.train()
-        totals = {'loss': 0.0, 'ego_planning_loss': 0.0, 'neighbor_prediction_loss': 0.0}
-        n_batches = 0
-        with tqdm(loader, desc=desc, unit='batch', disable=not is_main) as data_epoch:
-            for token, features, targets in data_epoch:
-                features = {k: v.to(device) for k, v in features.items()}
-                targets = {k: v.to(device) for k, v in targets.items()}
-
-                ego_future = targets['ego_future_gt'].to(device)
-                neighbors_future = targets['neighbors_future_gt'].to(device)
-                mask = targets['neighbor_future_mask']
-                neighbors_future[mask] = 0
-                inputs = observation_normalizer(features)
-
-                loss = {}
-                loss, _ = diffusion_loss_func(
-                    eval_model,
-                    inputs,
-                    eval_model.sde.marginal_prob,
-                    (ego_future, neighbors_future, mask),
-                    state_normalizer,
-                    loss,
-                    cfg['diffusion_model_type'],
-                )
-                loss['loss'] = loss['neighbor_prediction_loss'] + ALPHA_PLANNING_LOSS * loss['ego_planning_loss']
-
-                totals['loss'] += loss['loss'].item()
-                totals['ego_planning_loss'] += loss['ego_planning_loss'].item()
-                totals['neighbor_prediction_loss'] += loss['neighbor_prediction_loss'].item()
-                n_batches += 1
-                data_epoch.set_postfix(loss=f"{totals['loss'] / max(n_batches, 1):.4f}")
-
-        local_means = {k: v / max(n_batches, 1) for k, v in totals.items()}
-        if distributed:
-            return {k: all_reduce_mean(v, device) for k, v in local_means.items()}
-        return local_means
 
     # TODO: port StatePerturbation data augmentation (requires dataset to emit
     # heading-as-angle rather than cos/sin, or a rewrite of the augmenter).
@@ -328,7 +354,15 @@ def main():
                 epoch_mean_neighbor = all_reduce_mean(epoch_mean_neighbor, device)
 
             # Val pass against EMA weights (what the raw repo actually evaluates).
-            val_metrics = evaluate(model_ema.ema, val_loader, desc=f'Val {epoch + 1}/{NUM_EPOCHS}')
+            val_metrics = evaluate(
+                model_ema.ema, val_loader,
+                device=device,
+                observation_normalizer=observation_normalizer,
+                state_normalizer=state_normalizer,
+                distributed=distributed,
+                is_main=is_main,
+                desc=f'Val {epoch + 1}/{NUM_EPOCHS}',
+            )
 
             epoch_time_sec = time.monotonic() - epoch_start
             current_lr = optimizer.param_groups[0]['lr']
@@ -363,7 +397,15 @@ def main():
                 epoch_f.close()
 
     # Final test pass against EMA weights.
-    test_metrics = evaluate(model_ema.ema, test_loader, desc='Test')
+    test_metrics = evaluate(
+        model_ema.ema, test_loader,
+        device=device,
+        observation_normalizer=observation_normalizer,
+        state_normalizer=state_normalizer,
+        distributed=distributed,
+        is_main=is_main,
+        desc='Test',
+    )
     if is_main:
         print(f"Final test metrics (EMA): {test_metrics}")
         test_log_path = run_dir / "test_metrics.csv"
