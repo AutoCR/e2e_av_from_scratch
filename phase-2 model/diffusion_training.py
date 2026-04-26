@@ -135,6 +135,7 @@ def evaluate(
     autograd; train mode keeps the loss path alive.
     """
     eval_model.train()
+    raw_eval_model = eval_model.module if isinstance(eval_model, DDP) else eval_model
     totals = {'loss': 0.0, 'ego_planning_loss': 0.0, 'neighbor_prediction_loss': 0.0}
     n_batches = 0
     with tqdm(loader, desc=desc, unit='batch', disable=not is_main) as data_epoch:
@@ -152,7 +153,7 @@ def evaluate(
             loss, _ = diffusion_loss_func(
                 eval_model,
                 inputs,
-                eval_model.sde.marginal_prob,
+                raw_eval_model.sde.marginal_prob,
                 (ego_future, neighbors_future, mask),
                 state_normalizer,
                 loss,
