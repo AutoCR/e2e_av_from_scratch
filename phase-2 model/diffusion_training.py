@@ -1,5 +1,4 @@
 import os
-print(os.getcwd())
 os.environ["NUPLAN_MAPS_ROOT"] = os.path.expandvars("/prediction_database/nuplan/dataset/maps")
 os.environ["OPENSCENE_DATA_ROOT"] = os.path.expandvars("/prediction_database/navsim")
 os.environ["NAVSIM_EXP_ROOT"] = os.path.expandvars("/home/pnc/Code/e2e_av_from_scratch/exp")
@@ -20,12 +19,14 @@ from navsim.common.dataclasses import SceneFilter, SensorConfig
 from hydra.core.global_hydra import GlobalHydra
 import numpy as np
 import torch.nn as nn
-from typing import Any, Callable
 from diffusion_planner import StateNormalizer
 
 import torch
+import torch.distributed as dist
 from torch import optim
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, MultiplicativeLR
+from torch.utils.data import DistributedSampler
 from timm.utils.model_ema import ModelEma
 from diffusion_planner import ObservationNormalizer
 from tqdm import tqdm
@@ -50,6 +51,23 @@ def cosine_annealing_warmup_restarts(optimizer, epoch, warm_up_epoch, start_fact
     return SequentialLR(optimizer, schedulers=[warmup, fixed], milestones=[warm_up_epoch])
 
 
+def init_distributed():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        return rank, world_size, local_rank, True
+    return 0, 1, 0, False
+
+
+def all_reduce_mean(value: float, device) -> float:
+    t = torch.tensor([value], dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return (t / dist.get_world_size()).item()
+
+
 SEED = 3407
 NUM_EPOCHS = 1  # sanity-check; raw repo default is 500
 WARM_UP_EPOCHS = 5
@@ -58,23 +76,14 @@ ALPHA_PLANNING_LOSS = 1.0
 EMA_DECAY = 0.999
 SAVE_EVERY_N_EPOCHS = 1  # raw repo default is 20
 LOG_EVERY_N_ITERS = 1
-BATCH_SIZE = 8
-
-set_seed(SEED)
-
-exp_root = Path(os.getenv("NAVSIM_EXP_ROOT", Path(__file__).resolve().parent / "runs"))
-run_dir = exp_root / f"diffusion_planner/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-ckpt_dir = run_dir / "ckpt"
-ckpt_dir.mkdir(parents=True, exist_ok=True)
-iter_log_path = run_dir / "iter_loss.csv"
-print(f"Logging to {run_dir}")
+BATCH_SIZE = 8  # global batch size; per-GPU = BATCH_SIZE // world_size
 
 
-def save_checkpoint(path: Path, epoch: int, model, ema, optimizer, scheduler, train_loss: float) -> None:
+def save_checkpoint(path: Path, epoch: int, model_state_dict, ema, optimizer, scheduler, train_loss: float) -> None:
     torch.save(
         {
             'epoch': epoch + 1,
-            'model': model.state_dict(),
+            'model': model_state_dict,
             'ema_state_dict': ema.state_dict(),
             'optimizer': optimizer.state_dict(),
             'schedule': scheduler.state_dict(),
@@ -82,6 +91,7 @@ def save_checkpoint(path: Path, epoch: int, model, ema, optimizer, scheduler, tr
         },
         path,
     )
+
 
 # Data splits.
 #
@@ -96,125 +106,112 @@ LOG_SPLIT_YAML = Path(__file__).resolve().parents[1] / (
 )
 FILTER = "all_scenes"
 
-if GlobalHydra.instance().is_initialized():
-    GlobalHydra.instance().clear()
-hydra.initialize(config_path="../navsim/planning/script/config/common/train_test_split/scene_filter")
-filter_cfg = hydra.compose(config_name=FILTER)
-print(filter_cfg)
-openscene_data_root = Path(os.getenv("OPENSCENE_DATA_ROOT"))
 
-log_split = yaml.safe_load(LOG_SPLIT_YAML.read_text())
-TRAIN_LOGS = log_split["train_logs"]
-VAL_LOGS = log_split["val_logs"]
-print(f"Log split: {len(TRAIN_LOGS)} train logs, {len(VAL_LOGS)} val logs")
+def main():
+    rank, world_size, local_rank, distributed = init_distributed()
+    is_main = rank == 0
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
+    set_seed(SEED + rank)
 
-def build_loader(data_split: str, log_names, batch_size: int, shuffle: bool) -> DataLoader:
-    scene_filter: SceneFilter = instantiate(filter_cfg)
-    if log_names is not None:
-        scene_filter.log_names = list(log_names)
-    scene_loader = SceneLoader(
-        openscene_data_root / f"navsim_logs/{data_split}",
-        openscene_data_root / f"sensor_blobs/{data_split}",
-        scene_filter,
-        openscene_data_root / "warmup_two_stage/sensor_blobs",
-        openscene_data_root / "warmup_two_stage/synthetic_scene_pickles",
-        sensor_config=SensorConfig.build_all_sensors(),
-    )
-    dataset = DiffusionPlannerDataset(scene_loader=scene_loader, cfg=cfg)
-    return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle)
+    if is_main:
+        print(os.getcwd())
 
+    # run_dir must agree across ranks; rank 0 picks the timestamp and broadcasts.
+    exp_root = Path(os.getenv("NAVSIM_EXP_ROOT", Path(__file__).resolve().parent / "runs"))
+    if is_main:
+        run_dir = exp_root / f"diffusion_planner/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    else:
+        run_dir = None
+    if distributed:
+        obj_list = [run_dir]
+        dist.broadcast_object_list(obj_list, src=0)
+        run_dir = obj_list[0]
+    ckpt_dir = run_dir / "ckpt"
+    if is_main:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Logging to {run_dir}")
 
-train_loader = build_loader(TRAINVAL_DATA_SPLIT, TRAIN_LOGS, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = build_loader(TRAINVAL_DATA_SPLIT, VAL_LOGS, batch_size=BATCH_SIZE, shuffle=False)
-test_loader = build_loader(TEST_DATA_SPLIT, None, batch_size=BATCH_SIZE, shuffle=False)
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    hydra.initialize(config_path="../navsim/planning/script/config/common/train_test_split/scene_filter")
+    filter_cfg = hydra.compose(config_name=FILTER)
+    if is_main:
+        print(filter_cfg)
+    openscene_data_root = Path(os.getenv("OPENSCENE_DATA_ROOT"))
 
-device = 'cuda'
-model = DiffusionPlanner(cfg).to(device)
-optimizer = optim.AdamW([{'params': model.parameters(), 'lr': LEARNING_RATE}])
+    log_split = yaml.safe_load(LOG_SPLIT_YAML.read_text())
+    train_logs = log_split["train_logs"]
+    val_logs = log_split["val_logs"]
+    if is_main:
+        print(f"Log split: {len(train_logs)} train logs, {len(val_logs)} val logs")
 
-scheduler_epochs = max(NUM_EPOCHS, WARM_UP_EPOCHS)
-scheduler = cosine_annealing_warmup_restarts(optimizer, scheduler_epochs, WARM_UP_EPOCHS)
-
-model_ema = ModelEma(model, decay=EMA_DECAY, device=device)
-
-observation_normalizer = ObservationNormalizer({
-    k: {kk: torch.tensor(vv, dtype=torch.float32, device=device) for kk, vv in v.items()}
-    for k, v in cfg['observation_normalizer'].items()
-})
-state_normalizer = StateNormalizer(**cfg['state_normalizer'])
-state_normalizer.mean = state_normalizer.mean.to(device)
-state_normalizer.std = state_normalizer.std.to(device)
-
-
-@torch.no_grad()
-def evaluate(eval_model: nn.Module, loader: DataLoader, desc: str = 'Eval') -> dict:
-    """Run a forward-only diffusion-loss pass on `loader` and return mean losses.
-
-    Stays in train mode because the decoder only emits `'score'` under
-    `self.training` (diffusion_planner.py:563). `@torch.no_grad()` handles
-    autograd; train mode keeps the loss path alive. For an inference metric
-    (ADE/FDE via DPM sampling) write a separate function that runs under .eval().
-    """
-    eval_model.train()
-    totals = {'loss': 0.0, 'ego_planning_loss': 0.0, 'neighbor_prediction_loss': 0.0}
-    n_batches = 0
-    with tqdm(loader, desc=desc, unit='batch') as data_epoch:
-        for token, features, targets in data_epoch:
-            features = {k: v.to(device) for k, v in features.items()}
-            targets = {k: v.to(device) for k, v in targets.items()}
-
-            ego_future = targets['ego_future_gt'].to(device)
-            neighbors_future = targets['neighbors_future_gt'].to(device)
-            mask = targets['neighbor_future_mask']
-            neighbors_future[mask] = 0
-            inputs = observation_normalizer(features)
-
-            loss = {}
-            loss, _ = diffusion_loss_func(
-                eval_model,
-                inputs,
-                eval_model.sde.marginal_prob,
-                (ego_future, neighbors_future, mask),
-                state_normalizer,
-                loss,
-                cfg['diffusion_model_type'],
+    def build_loader(data_split: str, log_names, batch_size: int, shuffle: bool):
+        scene_filter: SceneFilter = instantiate(filter_cfg)
+        if log_names is not None:
+            scene_filter.log_names = list(log_names)
+        scene_loader = SceneLoader(
+            openscene_data_root / f"navsim_logs/{data_split}",
+            openscene_data_root / f"sensor_blobs/{data_split}",
+            scene_filter,
+            openscene_data_root / "warmup_two_stage/sensor_blobs",
+            openscene_data_root / "warmup_two_stage/synthetic_scene_pickles",
+            sensor_config=SensorConfig.build_all_sensors(),
+        )
+        dataset = DiffusionPlannerDataset(scene_loader=scene_loader, cfg=cfg)
+        per_gpu_batch = max(batch_size // world_size, 1)
+        if distributed:
+            sampler = DistributedSampler(
+                dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=True,
             )
-            loss['loss'] = loss['neighbor_prediction_loss'] + ALPHA_PLANNING_LOSS * loss['ego_planning_loss']
+            loader = DataLoader(
+                dataset, batch_size=per_gpu_batch, sampler=sampler,
+                num_workers=4, pin_memory=True, drop_last=True,
+            )
+            return loader, sampler
+        loader = DataLoader(
+            dataset, batch_size=per_gpu_batch, shuffle=shuffle,
+            num_workers=4, pin_memory=True,
+        )
+        return loader, None
 
-            totals['loss'] += loss['loss'].item()
-            totals['ego_planning_loss'] += loss['ego_planning_loss'].item()
-            totals['neighbor_prediction_loss'] += loss['neighbor_prediction_loss'].item()
-            n_batches += 1
-            data_epoch.set_postfix(loss=f"{totals['loss'] / max(n_batches, 1):.4f}")
+    train_loader, train_sampler = build_loader(TRAINVAL_DATA_SPLIT, train_logs, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader, val_sampler = build_loader(TRAINVAL_DATA_SPLIT, val_logs, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader, test_sampler = build_loader(TEST_DATA_SPLIT, None, batch_size=BATCH_SIZE, shuffle=False)
 
-    return {k: v / max(n_batches, 1) for k, v in totals.items()}
+    model = DiffusionPlanner(cfg).to(device)
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    raw_model = model.module if distributed else model
 
+    optimizer = optim.AdamW([{'params': model.parameters(), 'lr': LEARNING_RATE}])
 
-# TODO: port StatePerturbation data augmentation (requires dataset to emit
-# heading-as-angle rather than cos/sin, or a rewrite of the augmenter).
-epoch_log_path = run_dir / "epoch_loss.csv"
-global_step = 0
-epoch_mean_loss = float('nan')
-with iter_log_path.open('w', newline='') as iter_f, epoch_log_path.open('w', newline='') as epoch_f:
-    iter_writer = csv.writer(iter_f)
-    iter_writer.writerow(['step', 'epoch', 'iter', 'lr', 'loss', 'ego_planning_loss', 'neighbor_prediction_loss'])
-    epoch_writer = csv.writer(epoch_f)
-    epoch_writer.writerow([
-        'epoch', 'lr',
-        'train_loss', 'train_ego_planning_loss', 'train_neighbor_prediction_loss',
-        'val_loss', 'val_ego_planning_loss', 'val_neighbor_prediction_loss',
-        'epoch_time_sec',
-    ])
+    scheduler_epochs = max(NUM_EPOCHS, WARM_UP_EPOCHS)
+    scheduler = cosine_annealing_warmup_restarts(optimizer, scheduler_epochs, WARM_UP_EPOCHS)
 
-    for epoch in range(0, NUM_EPOCHS):
-        epoch_start = time.monotonic()
-        model.train()
-        epoch_losses = []
-        epoch_ego_losses = []
-        epoch_neighbor_losses = []
-        with tqdm(train_loader, desc=f'Epoch {epoch + 1}/{NUM_EPOCHS}', unit='batch') as data_epoch:
-            for iter_idx, (token, features, targets) in enumerate(data_epoch):
+    model_ema = ModelEma(model, decay=EMA_DECAY, device=device)
+
+    observation_normalizer = ObservationNormalizer({
+        k: {kk: torch.tensor(vv, dtype=torch.float32, device=device) for kk, vv in v.items()}
+        for k, v in cfg['observation_normalizer'].items()
+    })
+    state_normalizer = StateNormalizer(**cfg['state_normalizer'])
+    state_normalizer.mean = state_normalizer.mean.to(device)
+    state_normalizer.std = state_normalizer.std.to(device)
+
+    @torch.no_grad()
+    def evaluate(eval_model: nn.Module, loader: DataLoader, desc: str = 'Eval') -> dict:
+        """Run a forward-only diffusion-loss pass on `loader` and return mean losses.
+
+        Stays in train mode because the decoder only emits `'score'` under
+        `self.training` (diffusion_planner.py:563). `@torch.no_grad()` handles
+        autograd; train mode keeps the loss path alive.
+        """
+        eval_model.train()
+        totals = {'loss': 0.0, 'ego_planning_loss': 0.0, 'neighbor_prediction_loss': 0.0}
+        n_batches = 0
+        with tqdm(loader, desc=desc, unit='batch', disable=not is_main) as data_epoch:
+            for token, features, targets in data_epoch:
                 features = {k: v.to(device) for k, v in features.items()}
                 targets = {k: v.to(device) for k, v in targets.items()}
 
@@ -223,88 +220,167 @@ with iter_log_path.open('w', newline='') as iter_f, epoch_log_path.open('w', new
                 mask = targets['neighbor_future_mask']
                 neighbors_future[mask] = 0
                 inputs = observation_normalizer(features)
-                optimizer.zero_grad()
-                loss = {}
 
+                loss = {}
                 loss, _ = diffusion_loss_func(
-                    model,
+                    eval_model,
                     inputs,
-                    model.sde.marginal_prob,
+                    eval_model.sde.marginal_prob,
                     (ego_future, neighbors_future, mask),
                     state_normalizer,
                     loss,
-                    cfg['diffusion_model_type']
+                    cfg['diffusion_model_type'],
                 )
-
                 loss['loss'] = loss['neighbor_prediction_loss'] + ALPHA_PLANNING_LOSS * loss['ego_planning_loss']
 
-                total_loss = loss['loss'].item()
-                ego_loss = loss['ego_planning_loss'].item()
-                neighbor_loss = loss['neighbor_prediction_loss'].item()
-                epoch_losses.append(total_loss)
-                epoch_ego_losses.append(ego_loss)
-                epoch_neighbor_losses.append(neighbor_loss)
+                totals['loss'] += loss['loss'].item()
+                totals['ego_planning_loss'] += loss['ego_planning_loss'].item()
+                totals['neighbor_prediction_loss'] += loss['neighbor_prediction_loss'].item()
+                n_batches += 1
+                data_epoch.set_postfix(loss=f"{totals['loss'] / max(n_batches, 1):.4f}")
 
-                loss['loss'].backward()
+        local_means = {k: v / max(n_batches, 1) for k, v in totals.items()}
+        if distributed:
+            return {k: all_reduce_mean(v, device) for k, v in local_means.items()}
+        return local_means
 
-                nn.utils.clip_grad_norm_(model.parameters(), 5)
-                optimizer.step()
-                model_ema.update(model)
+    # TODO: port StatePerturbation data augmentation (requires dataset to emit
+    # heading-as-angle rather than cos/sin, or a rewrite of the augmenter).
+    iter_log_path = run_dir / "iter_loss.csv"
+    epoch_log_path = run_dir / "epoch_loss.csv"
+    global_step = 0
+    epoch_mean_loss = float('nan')
 
-                if global_step % LOG_EVERY_N_ITERS == 0:
-                    current_lr = optimizer.param_groups[0]['lr']
-                    iter_writer.writerow([global_step, epoch, iter_idx, current_lr, total_loss, ego_loss, neighbor_loss])
-                    iter_f.flush()
-
-                data_epoch.set_postfix(loss=f'{total_loss:.4f}', ego=f'{ego_loss:.4f}', nbr=f'{neighbor_loss:.4f}')
-                global_step += 1
-
-        epoch_mean_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
-        epoch_mean_ego = sum(epoch_ego_losses) / max(len(epoch_ego_losses), 1)
-        epoch_mean_neighbor = sum(epoch_neighbor_losses) / max(len(epoch_neighbor_losses), 1)
-
-        # Val pass against EMA weights (what the raw repo actually evaluates).
-        val_metrics = evaluate(model_ema.ema, val_loader, desc=f'Val {epoch + 1}/{NUM_EPOCHS}')
-
-        epoch_time_sec = time.monotonic() - epoch_start
-        current_lr = optimizer.param_groups[0]['lr']
+    iter_f = iter_log_path.open('w', newline='') if is_main else None
+    epoch_f = epoch_log_path.open('w', newline='') if is_main else None
+    iter_writer = csv.writer(iter_f) if is_main else None
+    epoch_writer = csv.writer(epoch_f) if is_main else None
+    if is_main:
+        iter_writer.writerow(['step', 'epoch', 'iter', 'lr', 'loss', 'ego_planning_loss', 'neighbor_prediction_loss'])
         epoch_writer.writerow([
-            epoch + 1, current_lr,
-            epoch_mean_loss, epoch_mean_ego, epoch_mean_neighbor,
-            val_metrics['loss'], val_metrics['ego_planning_loss'], val_metrics['neighbor_prediction_loss'],
-            f"{epoch_time_sec:.3f}",
+            'epoch', 'lr',
+            'train_loss', 'train_ego_planning_loss', 'train_neighbor_prediction_loss',
+            'val_loss', 'val_ego_planning_loss', 'val_neighbor_prediction_loss',
+            'epoch_time_sec',
         ])
-        epoch_f.flush()
 
-        print(
-            f"Epoch {epoch + 1} | train loss {epoch_mean_loss:.4f} | "
-            f"val loss {val_metrics['loss']:.4f} "
-            f"(ego {val_metrics['ego_planning_loss']:.4f}, nbr {val_metrics['neighbor_prediction_loss']:.4f}) | "
-            f"time {timedelta(seconds=int(epoch_time_sec))}"
-        )
+    try:
+        for epoch in range(0, NUM_EPOCHS):
+            if distributed and train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            epoch_start = time.monotonic()
+            model.train()
+            epoch_losses = []
+            epoch_ego_losses = []
+            epoch_neighbor_losses = []
+            with tqdm(train_loader, desc=f'Epoch {epoch + 1}/{NUM_EPOCHS}', unit='batch', disable=not is_main) as data_epoch:
+                for iter_idx, (token, features, targets) in enumerate(data_epoch):
+                    features = {k: v.to(device) for k, v in features.items()}
+                    targets = {k: v.to(device) for k, v in targets.items()}
 
-        scheduler.step()
+                    ego_future = targets['ego_future_gt'].to(device)
+                    neighbors_future = targets['neighbors_future_gt'].to(device)
+                    mask = targets['neighbor_future_mask']
+                    neighbors_future[mask] = 0
+                    inputs = observation_normalizer(features)
+                    optimizer.zero_grad()
+                    loss = {}
 
-        if (epoch + 1) % SAVE_EVERY_N_EPOCHS == 0:
-            ckpt_path = ckpt_dir / f"model_epoch_{epoch + 1}_trainloss_{epoch_mean_loss:.4f}.pth"
-            save_checkpoint(ckpt_path, epoch, model, model_ema.ema, optimizer, scheduler, epoch_mean_loss)
-            save_checkpoint(ckpt_dir / "latest.pth", epoch, model, model_ema.ema, optimizer, scheduler, epoch_mean_loss)
-            print(f"Saved checkpoint to {ckpt_path}")
+                    loss, _ = diffusion_loss_func(
+                        model,
+                        inputs,
+                        raw_model.sde.marginal_prob,
+                        (ego_future, neighbors_future, mask),
+                        state_normalizer,
+                        loss,
+                        cfg['diffusion_model_type']
+                    )
 
+                    loss['loss'] = loss['neighbor_prediction_loss'] + ALPHA_PLANNING_LOSS * loss['ego_planning_loss']
 
-# Final test pass against EMA weights.
-test_metrics = evaluate(model_ema.ema, test_loader, desc='Test')
-print(f"Final test metrics (EMA): {test_metrics}")
-test_log_path = run_dir / "test_metrics.csv"
-with test_log_path.open('w', newline='') as test_f:
-    test_writer = csv.writer(test_f)
-    test_writer.writerow(['loss', 'ego_planning_loss', 'neighbor_prediction_loss'])
-    test_writer.writerow([
-        test_metrics['loss'],
-        test_metrics['ego_planning_loss'],
-        test_metrics['neighbor_prediction_loss'],
-    ])
-print(f"Wrote test metrics to {test_log_path}")
+                    total_loss = loss['loss'].item()
+                    ego_loss = loss['ego_planning_loss'].item()
+                    neighbor_loss = loss['neighbor_prediction_loss'].item()
+                    epoch_losses.append(total_loss)
+                    epoch_ego_losses.append(ego_loss)
+                    epoch_neighbor_losses.append(neighbor_loss)
+
+                    loss['loss'].backward()
+
+                    nn.utils.clip_grad_norm_(model.parameters(), 5)
+                    optimizer.step()
+                    model_ema.update(model)
+
+                    if is_main and global_step % LOG_EVERY_N_ITERS == 0:
+                        current_lr = optimizer.param_groups[0]['lr']
+                        iter_writer.writerow([global_step, epoch, iter_idx, current_lr, total_loss, ego_loss, neighbor_loss])
+                        iter_f.flush()
+
+                    data_epoch.set_postfix(loss=f'{total_loss:.4f}', ego=f'{ego_loss:.4f}', nbr=f'{neighbor_loss:.4f}')
+                    global_step += 1
+
+            epoch_mean_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
+            epoch_mean_ego = sum(epoch_ego_losses) / max(len(epoch_ego_losses), 1)
+            epoch_mean_neighbor = sum(epoch_neighbor_losses) / max(len(epoch_neighbor_losses), 1)
+            if distributed:
+                epoch_mean_loss = all_reduce_mean(epoch_mean_loss, device)
+                epoch_mean_ego = all_reduce_mean(epoch_mean_ego, device)
+                epoch_mean_neighbor = all_reduce_mean(epoch_mean_neighbor, device)
+
+            # Val pass against EMA weights (what the raw repo actually evaluates).
+            val_metrics = evaluate(model_ema.ema, val_loader, desc=f'Val {epoch + 1}/{NUM_EPOCHS}')
+
+            epoch_time_sec = time.monotonic() - epoch_start
+            current_lr = optimizer.param_groups[0]['lr']
+            if is_main:
+                epoch_writer.writerow([
+                    epoch + 1, current_lr,
+                    epoch_mean_loss, epoch_mean_ego, epoch_mean_neighbor,
+                    val_metrics['loss'], val_metrics['ego_planning_loss'], val_metrics['neighbor_prediction_loss'],
+                    f"{epoch_time_sec:.3f}",
+                ])
+                epoch_f.flush()
+
+                print(
+                    f"Epoch {epoch + 1} | train loss {epoch_mean_loss:.4f} | "
+                    f"val loss {val_metrics['loss']:.4f} "
+                    f"(ego {val_metrics['ego_planning_loss']:.4f}, nbr {val_metrics['neighbor_prediction_loss']:.4f}) | "
+                    f"time {timedelta(seconds=int(epoch_time_sec))}"
+                )
+
+            scheduler.step()
+
+            if is_main and (epoch + 1) % SAVE_EVERY_N_EPOCHS == 0:
+                ckpt_path = ckpt_dir / f"model_epoch_{epoch + 1}_trainloss_{epoch_mean_loss:.4f}.pth"
+                save_checkpoint(ckpt_path, epoch, raw_model.state_dict(), model_ema.ema, optimizer, scheduler, epoch_mean_loss)
+                save_checkpoint(ckpt_dir / "latest.pth", epoch, raw_model.state_dict(), model_ema.ema, optimizer, scheduler, epoch_mean_loss)
+                print(f"Saved checkpoint to {ckpt_path}")
+    finally:
+        if is_main:
+            if iter_f is not None:
+                iter_f.close()
+            if epoch_f is not None:
+                epoch_f.close()
+
+    # Final test pass against EMA weights.
+    test_metrics = evaluate(model_ema.ema, test_loader, desc='Test')
+    if is_main:
+        print(f"Final test metrics (EMA): {test_metrics}")
+        test_log_path = run_dir / "test_metrics.csv"
+        with test_log_path.open('w', newline='') as test_f:
+            test_writer = csv.writer(test_f)
+            test_writer.writerow(['loss', 'ego_planning_loss', 'neighbor_prediction_loss'])
+            test_writer.writerow([
+                test_metrics['loss'],
+                test_metrics['ego_planning_loss'],
+                test_metrics['neighbor_prediction_loss'],
+            ])
+        print(f"Wrote test metrics to {test_log_path}")
+        plot_losses(run_dir, test_metrics)
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def plot_losses(run_dir: Path, test_metrics: dict) -> None:
@@ -372,5 +448,5 @@ def plot_losses(run_dir: Path, test_metrics: dict) -> None:
     print(f"Wrote loss plot to {out_path}")
 
 
-plot_losses(run_dir, test_metrics)
-
+if __name__ == '__main__':
+    main()
