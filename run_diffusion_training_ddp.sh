@@ -2,8 +2,9 @@
 # Launch phase-2 diffusion training with DDP on all visible GPUs.
 #
 # Usage:
-#   ./run_diffusion_training_ddp.sh              # uses all 8 GPUs
-#   NPROC_PER_NODE=4 ./run_diffusion_training_ddp.sh   # override GPU count
+#   ./run_diffusion_training_ddp.sh                                    # defaults: 8 GPUs, 128/GPU
+#   NPROC_PER_NODE=4 ./run_diffusion_training_ddp.sh                   # 4 GPUs
+#   BATCH_SIZE_PER_GPU=64 ./run_diffusion_training_ddp.sh              # smaller batch per GPU
 
 set -euo pipefail
 
@@ -16,6 +17,7 @@ export NAVSIM_EXP_ROOT="${NAVSIM_EXP_ROOT:-${SCRIPT_DIR}/exp}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-128}"
 
 cd "${SCRIPT_DIR}"
 

@@ -72,13 +72,13 @@ ALPHA_PLANNING_LOSS = 1.0
 EMA_DECAY = 0.999
 SAVE_EVERY_N_EPOCHS = 1  # raw repo default is 20
 LOG_EVERY_N_ITERS = 1
-BATCH_SIZE = 128 * 8  # global batch size; per-GPU = BATCH_SIZE // world_size
+BATCH_SIZE_PER_GPU = int(os.getenv("BATCH_SIZE_PER_GPU", "128"))  # per-GPU batch; global = this * world_size
 
 
 def build_loader(
     data_split: str,
     log_names,
-    batch_size: int,
+    batch_size_per_gpu: int,
     shuffle: bool,
     *,
     filter_cfg,
@@ -99,18 +99,17 @@ def build_loader(
         sensor_config=SensorConfig.build_all_sensors(),
     )
     dataset = DiffusionPlannerDataset(scene_loader=scene_loader, cfg=cfg)
-    per_gpu_batch = max(batch_size // world_size, 1)
     if distributed:
         sampler = DistributedSampler(
             dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=True,
         )
         loader = DataLoader(
-            dataset, batch_size=per_gpu_batch, sampler=sampler,
+            dataset, batch_size=batch_size_per_gpu, sampler=sampler,
             num_workers=4, pin_memory=True, drop_last=True,
         )
         return loader, sampler
     loader = DataLoader(
-        dataset, batch_size=per_gpu_batch, shuffle=shuffle,
+        dataset, batch_size=batch_size_per_gpu, shuffle=shuffle,
         num_workers=4, pin_memory=True,
     )
     return loader, None
@@ -247,9 +246,9 @@ def main():
         rank=rank,
         world_size=world_size,
     )
-    train_loader, train_sampler = build_loader(TRAINVAL_DATA_SPLIT, train_logs, batch_size=BATCH_SIZE, shuffle=True, **loader_kwargs)
-    val_loader, _ = build_loader(TRAINVAL_DATA_SPLIT, val_logs, batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
-    test_loader, _ = build_loader(TEST_DATA_SPLIT, None, batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
+    train_loader, train_sampler = build_loader(TRAINVAL_DATA_SPLIT, train_logs, batch_size_per_gpu=BATCH_SIZE_PER_GPU, shuffle=True, **loader_kwargs)
+    val_loader, _ = build_loader(TRAINVAL_DATA_SPLIT, val_logs, batch_size_per_gpu=BATCH_SIZE_PER_GPU, shuffle=False, **loader_kwargs)
+    test_loader, _ = build_loader(TEST_DATA_SPLIT, None, batch_size_per_gpu=BATCH_SIZE_PER_GPU, shuffle=False, **loader_kwargs)
 
     model = DiffusionPlanner(cfg).to(device)
     if distributed:
