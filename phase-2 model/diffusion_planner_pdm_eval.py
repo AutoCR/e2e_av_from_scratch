@@ -24,12 +24,55 @@ from navsim.common.dataloader import SceneLoader
 from navsim.evaluate.pdm_score import pdm_score
 from navsim.planning.metric_caching.metric_cache_processor import MetricCacheProcessor
 from navsim.planning.scenario_builder.navsim_scenario import NavSimScenario
-from navsim.planning.script.run_pdm_score import create_scene_aggregators, compute_final_scores
+from navsim.planning.simulation.planner.pdm_planner.scoring.scene_aggregator import SceneAggregator
+from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import WeightedMetricIndex
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 NAVSIM_CONFIG_DIR = Path(__file__).resolve().parents[1] / "navsim/planning/script/config/pdm_scoring"
+
+
+def create_scene_aggregators(all_mappings, full_score_df, proposal_sampling):
+    full_score_df["two_frame_extended_comfort"] = np.nan
+    full_score_df["weight"] = np.nan
+    full_score_df = full_score_df.set_index("token")
+
+    all_updates = []
+    for (now_frame, previous_frame), second_stage in all_mappings.items():
+        aggregator = SceneAggregator(
+            now_frame=now_frame,
+            previous_frame=previous_frame,
+            second_stage=second_stage,
+            score_df=full_score_df,
+            proposal_sampling=proposal_sampling,
+        )
+        all_updates.append(aggregator.aggregate_scores())
+
+    all_updates_df = pd.concat(all_updates, ignore_index=True).set_index("token")
+    full_score_df.update(all_updates_df)
+    full_score_df.reset_index(inplace=True)
+    full_score_df = full_score_df.drop(columns=["ego_simulated_states"])
+    return full_score_df
+
+
+def compute_final_scores(pdm_score_df):
+    df = pdm_score_df.reset_index()
+    assert not df["two_frame_extended_comfort"].isna().any(), \
+        "Found NaN in 'two_frame_extended_comfort'. Please check aggregator completeness."
+
+    two_frame_scores = df["two_frame_extended_comfort"].to_numpy()
+    weighted_metrics = np.stack(df["weighted_metrics"].to_numpy())
+    weighted_metrics_array = np.stack(df["weighted_metrics_array"].to_numpy())
+
+    weighted_metrics[:, WeightedMetricIndex.TWO_FRAME_EXTENDED_COMFORT] = two_frame_scores
+    weighted_sum = (weighted_metrics * weighted_metrics_array).sum(axis=1)
+    total_weight = weighted_metrics_array.sum(axis=1)
+    assert np.all(total_weight > 0), "Found total_weight == 0 during score computation."
+
+    df["score"] = df["multiplicative_metrics_prod"].to_numpy() * (weighted_sum / total_weight)
+    df.drop(columns=["weighted_metrics", "weighted_metrics_array", "multiplicative_metrics_prod"], inplace=True)
+    return df
 
 
 def load_pdm_cfg(split: str):
