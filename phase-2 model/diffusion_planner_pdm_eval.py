@@ -17,7 +17,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from diffusion_planner import DiffusionPlanner, ObservationNormalizer, cfg as MODEL_CFG
-from diffusion_planner_dataset import DiffusionPlannerDataset
+from diffusion_planner_eval_dataset import DiffusionPlannerEvalDataset
 
 from navsim.common.dataclasses import PDMResults, SensorConfig, Trajectory
 from navsim.common.dataloader import SceneLoader
@@ -99,17 +99,7 @@ def score_token(token, frame_type_hint, *, scene_loader, dataset, processor, mod
             )
         )
 
-        try:
-            frame_list = scene_loader.scene_frames_dicts[token]
-        except KeyError:
-            scene = scene_loader.get_scene_from_token(token)
-            frame_list = scene.frame_dicts if hasattr(scene, 'frame_dicts') else None
-            if frame_list is None:
-                logger.warning(f"Could not retrieve frame_list for token {token}")
-                result = pd.DataFrame([PDMResults.get_empty_results()])
-                result["valid"] = False
-                result["token"] = token
-                return result
+        frame_list = dataset.get_frame_list(token)
 
         neighbor_tokens = dataset._select_neighbor_tokens(frame_list)
         features = dataset._build_diffusion_planner_inputs(frame_list, neighbor_tokens)
@@ -211,7 +201,7 @@ def main():
     processor = MetricCacheProcessor(cache_path=None, force_feature_computation=True, proposal_sampling=simulator.proposal_sampling)
 
     logger.info(f"Building dataset")
-    dataset = DiffusionPlannerDataset(scene_loader=scene_loader, cfg=MODEL_CFG)
+    dataset = DiffusionPlannerEvalDataset(scene_loader=scene_loader, cfg=MODEL_CFG)
 
     logger.info(f"Building and loading model from {args.ckpt}")
     device = args.device
