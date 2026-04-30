@@ -65,12 +65,12 @@ def all_reduce_mean(value: float, device) -> float:
 
 
 SEED = 3407
-NUM_EPOCHS = 1  # sanity-check; raw repo default is 500
+NUM_EPOCHS = 500  # sanity-check; raw repo default is 500
 WARM_UP_EPOCHS = 5
 LEARNING_RATE = 5e-4
 ALPHA_PLANNING_LOSS = 1.0
 EMA_DECAY = 0.999
-SAVE_EVERY_N_EPOCHS = 1  # raw repo default is 20
+SAVE_EVERY_N_EPOCHS = 20  # raw repo default is 20
 LOG_EVERY_N_ITERS = 1
 BATCH_SIZE_PER_GPU = int(os.getenv("BATCH_SIZE_PER_GPU", "128"))  # per-GPU batch; global = this * world_size
 

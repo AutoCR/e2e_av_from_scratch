@@ -18,9 +18,9 @@ export NAVSIM_EXP_ROOT="${NAVSIM_EXP_ROOT:-${SCRIPT_DIR}/exp}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-CKPT="${CKPT:-${SCRIPT_DIR}/exp/diffusion_planner/2026-04-24_20-10-56/ckpt/latest.pth}"
+CKPT="${CKPT:-${SCRIPT_DIR}/exp/diffusion_planner/2026-04-26_14-52-13/ckpt/model_epoch_500_trainloss_0.0276.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-${NAVSIM_EXP_ROOT}/diffusion_pdm_eval}"
-SPLIT="${SPLIT:-navtest_two_stage}"
+SPLIT="${SPLIT:-navhard_two_stage}"
 
 cd "${SCRIPT_DIR}"
 
