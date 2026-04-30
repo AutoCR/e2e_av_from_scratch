@@ -177,6 +177,13 @@ def main():
         help="Device to use",
     )
     parser.add_argument("--limit", type=int, default=None, help="Limit number of tokens (for testing)")
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default="ema",
+        choices=["ema", "model"],
+        help="Which weights to load from a training snapshot (default: ema)",
+    )
     args = parser.parse_args()
 
     if "NUPLAN_MAPS_ROOT" not in os.environ:
@@ -209,7 +216,24 @@ def main():
     logger.info(f"Building and loading model from {args.ckpt}")
     device = args.device
     model = DiffusionPlanner(MODEL_CFG).to(device).eval()
-    state_dict = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location=device)
+
+    if isinstance(ckpt, dict) and ("ema_state_dict" in ckpt or "model" in ckpt):
+        if args.weights == "ema" and "ema_state_dict" in ckpt:
+            state_dict = ckpt["ema_state_dict"]
+            logger.info("Loading EMA weights from training snapshot")
+        elif "model" in ckpt:
+            state_dict = ckpt["model"]
+            logger.info("Loading raw model weights from training snapshot")
+        else:
+            raise KeyError(f"Could not find requested weights in checkpoint: keys={list(ckpt.keys())}")
+    else:
+        state_dict = ckpt
+
+    state_dict = {
+        (k[len("module."):] if k.startswith("module.") else k): v
+        for k, v in state_dict.items()
+    }
     model.load_state_dict(state_dict, strict=True)
 
     observation_normalizer = ObservationNormalizer(
