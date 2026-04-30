@@ -2,9 +2,9 @@
 # Run DiffusionPlanner two-stage PDM evaluation.
 #
 # Usage:
-#   ./run_diffusion_pdm_eval.sh --ckpt /path/to/ckpt.pt
-#   ./run_diffusion_pdm_eval.sh --ckpt /path/to/ckpt.pt --limit 10
-#   LIMIT=5 ./run_diffusion_pdm_eval.sh --ckpt /path/to/ckpt.pt
+#   ./run_diffusion_pdm_eval.sh                                # use default CKPT below
+#   CKPT=/path/to/ckpt.pth ./run_diffusion_pdm_eval.sh         # override checkpoint
+#   ./run_diffusion_pdm_eval.sh --limit 3                      # extra args forwarded
 #
 # Any extra args are forwarded to diffusion_planner_pdm_eval.py.
 
@@ -18,12 +18,14 @@ export NAVSIM_EXP_ROOT="${NAVSIM_EXP_ROOT:-${SCRIPT_DIR}/exp}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
+CKPT="${CKPT:-${SCRIPT_DIR}/exp/diffusion_planner/2026-04-24_20-10-56/ckpt/latest.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-${NAVSIM_EXP_ROOT}/diffusion_pdm_eval}"
 SPLIT="${SPLIT:-navtest_two_stage}"
 
 cd "${SCRIPT_DIR}"
 
 exec uv run python "phase-2 model/diffusion_planner_pdm_eval.py" \
+    --ckpt "${CKPT}" \
     --split "${SPLIT}" \
     --output-dir "${OUTPUT_DIR}" \
     "$@"
