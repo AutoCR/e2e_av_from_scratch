@@ -152,6 +152,7 @@ def score_token(token, frame_type_hint, *, scene_loader, dataset, processor, mod
         score_row["valid"] = False
 
     score_row["token"] = token
+    score_row["stage"] = frame_type_hint
     return score_row
 
 
@@ -306,13 +307,32 @@ def main():
         logger.warning("----------- Failed to calculate aggregation, skipping:")
         traceback.print_exc()
 
-    num_valid = pdm_score_df["valid"].sum()
+    num_valid = int(pdm_score_df["valid"].sum())
     num_failed = len(pdm_score_df) - num_valid
-    logger.info(f"Evaluation complete: {num_valid} valid, {num_failed} failed tokens")
 
+    def _fmt(series):
+        if len(series) == 0:
+            return "n/a"
+        return f"{series.mean():.4f}"
+
+    valid_df = pdm_score_df[pdm_score_df["valid"]]
     if "score" in pdm_score_df.columns:
-        final_score = pdm_score_df[pdm_score_df["valid"]]["score"].mean()
-        logger.info(f"Final PDM Score: {final_score:.4f}")
+        stage1 = _fmt(valid_df[valid_df["stage"] == "stage_one"]["score"])
+        stage2 = _fmt(valid_df[valid_df["stage"] == "stage_two"]["score"])
+        overall = _fmt(valid_df["score"])
+    else:
+        stage1 = stage2 = overall = "n/a"
+
+    logger.info("=" * 60)
+    logger.info("EPDMS summary")
+    logger.info("=" * 60)
+    logger.info(f"Valid tokens:               {num_valid}")
+    logger.info(f"Failed tokens:              {num_failed}")
+    logger.info("-" * 60)
+    logger.info(f"EPDMS (stage 1):            {stage1}")
+    logger.info(f"EPDMS (stage 2):            {stage2}")
+    logger.info(f"EPDMS (overall):            {overall}")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
