@@ -7,6 +7,6 @@ DATA_PATH=${DATA_PATH:-/Users/chenran/Code/navsim/dataset}
 OUT_DIR=${OUT_DIR:-data/kmeans}
 
 python tools/kmeans/kmeans_det.py --data_path "$DATA_PATH" --split "$SPLIT" --out_dir "$OUT_DIR"
-python tools/kmeans/kmeans_map.py --data_path "$DATA_PATH" --split "$SPLIT" --out_dir "$OUT_DIR"
+python tools/kmeans/kmeans_map.py --data_path "$DATA_PATH" --split "$SPLIT" --out_dir "$OUT_DIR" --maps_root "$DATA_PATH/maps"
 python tools/kmeans/kmeans_motion.py --data_path "$DATA_PATH" --split "$SPLIT" --out_dir "$OUT_DIR"
 python tools/kmeans/kmeans_plan.py --data_path "$DATA_PATH" --split "$SPLIT" --out_dir "$OUT_DIR"

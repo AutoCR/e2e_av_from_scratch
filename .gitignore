@@ -215,3 +215,5 @@ phase-2 model/_test_predictions_scene_loader_out
 exp/*
 
 sparsedrive_model/data/*
+
+vis/

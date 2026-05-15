@@ -92,6 +92,7 @@ decouple_attn_motion = True
 with_quality_estimation = True
 
 task_config = dict(with_det=True, with_map=True, with_motion_plan=False)
+kmeans_dir = "./sparsedrive_model/data/kmeans"
 
 
 def _attn_factory(dims):
@@ -150,7 +151,7 @@ def _make_det_head():
         instance_bank=InstanceBank(
             num_anchor=900,
             embed_dims=embed_dims,
-            anchor="data/kmeans/kmeans_det_900.npy",
+            anchor=f"{kmeans_dir}/kmeans_det_900.npy",
             anchor_handler=bank_kps,
             num_temp_instances=600 if temporal else -1,
             confidence_decay=0.6,
@@ -234,7 +235,7 @@ def _make_map_head():
         instance_bank=InstanceBank(
             num_anchor=100,
             embed_dims=embed_dims,
-            anchor="data/kmeans/kmeans_map_100.npy",
+            anchor=f"{kmeans_dir}/kmeans_map_100.npy",
             anchor_handler=bank_kps,
             num_temp_instances=num_map_temp_instances if temporal_map else -1,
             confidence_decay=0.6,
@@ -294,8 +295,8 @@ def _make_motion_plan_head():
         fut_mode=fut_mode,
         ego_fut_ts=ego_fut_ts,
         ego_fut_mode=ego_fut_mode,
-        motion_anchor=f"data/kmeans/kmeans_motion_{fut_mode}.npy",
-        plan_anchor=f"data/kmeans/kmeans_plan_{ego_fut_mode}.npy",
+        motion_anchor=f"{kmeans_dir}/kmeans_motion_{fut_mode}.npy",
+        plan_anchor=f"{kmeans_dir}/kmeans_plan_{ego_fut_mode}.npy",
         embed_dims=embed_dims,
         decouple_attn=decouple_attn_motion,
         instance_queue=InstanceQueue(
