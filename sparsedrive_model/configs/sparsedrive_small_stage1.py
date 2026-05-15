@@ -344,7 +344,7 @@ def _make_motion_plan_head():
 
 
 def build():
-    img_backbone = TimmResNet50(pretrained="ckpt/resnet50-19c8e357.pth", with_cp=True)
+    img_backbone = TimmResNet50(pretrained="model_weights/resnet50-19c8e357.pth", with_cp=True)
     img_neck = FPN(
         num_outs=num_levels,
         out_channels=embed_dims,

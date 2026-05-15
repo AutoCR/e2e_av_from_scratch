@@ -1,7 +1,11 @@
 import torch
 from torch.autograd.function import Function, once_differentiable
 
-from . import deformable_aggregation_ext
+try:
+    from . import deformable_aggregation_ext
+    _ext_available = True
+except ImportError:
+    _ext_available = False
 
 
 class DeformableAggregationFunction(Function):

@@ -1,6 +1,9 @@
 import torch
 
-from .deformable_aggregation import DeformableAggregationFunction
+from .deformable_aggregation import DeformableAggregationFunction, _ext_available
+
+if not _ext_available:
+    from .deformable_aggregation_pytorch import deformable_aggregation_pytorch
 
 
 def deformable_aggregation_function(
@@ -10,12 +13,20 @@ def deformable_aggregation_function(
     sampling_location,
     weights,
 ):
-    return DeformableAggregationFunction.apply(
-        feature_maps,
-        spatial_shape,
-        scale_start_index,
-        sampling_location,
-        weights,
+    if _ext_available:
+        return DeformableAggregationFunction.apply(
+            feature_maps,
+            spatial_shape,
+            scale_start_index,
+            sampling_location,
+            weights,
+        )
+    return deformable_aggregation_pytorch(
+        feature_maps.contiguous().float(),
+        spatial_shape.contiguous().int(),
+        scale_start_index.contiguous().int(),
+        sampling_location.contiguous().float(),
+        weights.contiguous().float(),
     )
 
 
