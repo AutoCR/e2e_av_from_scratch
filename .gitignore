@@ -213,3 +213,5 @@ model_weights/
 phase-2 model/_test_predictions_out
 phase-2 model/_test_predictions_scene_loader_out
 exp/*
+
+sparsedrive_model/data/*
