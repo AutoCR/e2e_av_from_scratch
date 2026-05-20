@@ -1,13 +1,9 @@
-from typing import List, Optional, Tuple, Union
-import warnings
+from typing import List, Optional, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 from .dist_utils import reduce_mean
-
-from .blocks import DeformableFeatureAggregation as DFG
 
 __all__ = ["Sparse4DHead"]
 
@@ -20,30 +16,29 @@ class Sparse4DHead(nn.Module):
         graph_model_factory,
         norm_layer_factory,
         ffn_factory,
-        deformable_model: nn.Module,
+        deformable_model,
         refine_layer_factory,
         num_decoder: int = 6,
         num_single_frame_decoder: int = -1,
-        temp_graph_model: nn.Module = None,
+        temp_graph_model=None,
+        decouple_attn: bool = True,
         loss_cls: nn.Module = None,
         loss_reg: nn.Module = None,
-        decoder = None,
-        sampler = None,
+        decoder=None,
+        sampler=None,
         gt_cls_key: str = "gt_labels_3d",
         gt_reg_key: str = "gt_bboxes_3d",
         gt_id_key: str = "instance_id",
         with_instance_id: bool = True,
-        task_prefix: str = 'det',
+        task_prefix: str = "det",
         reg_weights: List = None,
-        operation_order: Optional[List[str]] = None,
         cls_threshold_to_reg: float = -1,
         dn_loss_weight: float = 5.0,
-        decouple_attn: bool = True,
         **kwargs,
     ):
         super().__init__()
         self.num_decoder = num_decoder
-        self.num_single_frame_decoder = num_single_frame_decoder
+        self.decouple_attn = decouple_attn
         self.gt_cls_key = gt_cls_key
         self.gt_reg_key = gt_reg_key
         self.gt_id_key = gt_id_key
@@ -51,27 +46,11 @@ class Sparse4DHead(nn.Module):
         self.task_prefix = task_prefix
         self.cls_threshold_to_reg = cls_threshold_to_reg
         self.dn_loss_weight = dn_loss_weight
-        self.decouple_attn = decouple_attn
 
         if reg_weights is None:
             self.reg_weights = [1.0] * 10
         else:
             self.reg_weights = reg_weights
-
-        if operation_order is None:
-            operation_order = [
-                "temp_gnn",
-                "gnn",
-                "norm",
-                "deformable",
-                "norm",
-                "ffn",
-                "norm",
-                "refine",
-            ] * num_decoder
-            # delete the 'gnn' and 'norm' layers in the first transformer blocks
-            operation_order = operation_order[3:]
-        self.operation_order = operation_order
 
         self.instance_bank = instance_bank
         self.anchor_encoder = anchor_encoder
@@ -79,71 +58,280 @@ class Sparse4DHead(nn.Module):
         self.decoder = decoder
         self.loss_cls = loss_cls
         self.loss_reg = loss_reg
-        self.op_config_map = {
-            "temp_gnn": temp_graph_model if callable(temp_graph_model) else (lambda: temp_graph_model),
-            "gnn": graph_model_factory,
-            "norm": norm_layer_factory,
-            "ffn": ffn_factory,
-            "deformable": deformable_model if callable(deformable_model) else (lambda: deformable_model),
-            "refine": refine_layer_factory,
-        }
-        self.layers = nn.ModuleList(
-            [
-                self.op_config_map[op]() if op in self.op_config_map else None
-                for op in self.operation_order
-            ]
-        )
         self.embed_dims = self.instance_bank.embed_dims
-        if self.decouple_attn:
-            self.fc_before = nn.Linear(
-                self.embed_dims, self.embed_dims * 2, bias=False
-            )
-            self.fc_after = nn.Linear(
-                self.embed_dims * 2, self.embed_dims, bias=False
-            )
+
+        # Shared projection layers kept at head level to match original state_dict keys.
+        # When decouple_attn=False these are identity (no parameters).
+        if decouple_attn:
+            self.fc_before = nn.Linear(self.embed_dims, self.embed_dims * 2, bias=False)
+            self.fc_after = nn.Linear(self.embed_dims * 2, self.embed_dims, bias=False)
         else:
             self.fc_before = nn.Identity()
             self.fc_after = nn.Identity()
 
+        def _make(x):
+            return x() if callable(x) else x
+
+        sf_count = max(num_single_frame_decoder, 0)
+        temp_count = num_decoder - sf_count
+        self.num_single_frame_decoder = sf_count
+
+        # Determine whether SF steps include gnn+norm1 by inspecting the first op
+        # of the passed operation_order (absorbed from config kwargs).
+        # det_head uses _det_operation_order()[2:] → first op is "deformable" → no gnn.
+        # map_head uses _map_operation_order()   → first op is "gnn"        → has gnn.
+        operation_order = kwargs.get("operation_order", None)
+        if operation_order is not None and sf_count > 0:
+            self.include_sf_gnn = operation_order[0] == "gnn"
+        else:
+            self.include_sf_gnn = sf_count == 0  # irrelevant when no SF steps
+
+        # Single-frame decoder submodules.
+        if self.include_sf_gnn:
+            self.sf_gnns = nn.ModuleList([graph_model_factory() for _ in range(sf_count)])
+            self.sf_norm1s = nn.ModuleList([norm_layer_factory() for _ in range(sf_count)])
+        self.sf_deformables = nn.ModuleList([_make(deformable_model) for _ in range(sf_count)])
+        self.sf_ffns = nn.ModuleList([ffn_factory() for _ in range(sf_count)])
+        self.sf_norm2s = nn.ModuleList([norm_layer_factory() for _ in range(sf_count)])
+        self.sf_refines = nn.ModuleList([refine_layer_factory() for _ in range(sf_count)])
+
+        # Temporal decoder submodules.
+        self.temp_gnns = nn.ModuleList([_make(temp_graph_model) for _ in range(temp_count)])
+        self.temp_local_gnns = nn.ModuleList([graph_model_factory() for _ in range(temp_count)])
+        self.temp_norm1s = nn.ModuleList([norm_layer_factory() for _ in range(temp_count)])
+        self.temp_deformables = nn.ModuleList([_make(deformable_model) for _ in range(temp_count)])
+        self.temp_ffns = nn.ModuleList([ffn_factory() for _ in range(temp_count)])
+        self.temp_norm2s = nn.ModuleList([norm_layer_factory() for _ in range(temp_count)])
+        self.temp_refines = nn.ModuleList([refine_layer_factory() for _ in range(temp_count)])
+
     def init_weights(self):
-        for i, op in enumerate(self.operation_order):
-            if self.layers[i] is None:
-                continue
-            elif op != "refine":
-                for p in self.layers[i].parameters():
+        non_refine_lists = [
+            self.sf_deformables, self.sf_ffns, self.sf_norm2s,
+            self.temp_gnns, self.temp_local_gnns, self.temp_norm1s,
+            self.temp_deformables, self.temp_ffns, self.temp_norm2s,
+        ]
+        if self.include_sf_gnn:
+            non_refine_lists += [self.sf_gnns, self.sf_norm1s]
+        for module_list in non_refine_lists:
+            for module in module_list:
+                for p in module.parameters():
                     if p.dim() > 1:
                         nn.init.xavier_uniform_(p)
+        for p in self.fc_before.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        for p in self.fc_after.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
         for m in self.modules():
             if hasattr(m, "init_weight"):
                 m.init_weight()
 
-    def graph_model(
+    def single_frame_decoder_forward(
         self,
-        index,
-        query,
-        key=None,
-        value=None,
-        query_pos=None,
-        key_pos=None,
-        **kwargs,
+        i,
+        instance_feature,
+        anchor,
+        anchor_embed,
+        feature_maps,
+        metas,
+        attn_mask,
+        time_interval,
+    ):
+        if self.include_sf_gnn:
+            if self.decouple_attn:
+                query = torch.cat([instance_feature, anchor_embed], dim=-1)
+                value = self.fc_before(instance_feature)
+                instance_feature = self.fc_after(
+                    self.sf_gnns[i](
+                        query, None, value,
+                        query_pos=None, key_pos=None,
+                        attn_mask=attn_mask,
+                    )
+                )
+            else:
+                instance_feature = self.sf_gnns[i](
+                    instance_feature, None, instance_feature,
+                    query_pos=anchor_embed,
+                    attn_mask=attn_mask,
+                )
+            instance_feature = self.sf_norm1s[i](instance_feature)
+        instance_feature = self.sf_deformables[i](
+            instance_feature, anchor, anchor_embed, feature_maps, metas
+        )
+        instance_feature = self.sf_ffns[i](instance_feature)
+        instance_feature = self.sf_norm2s[i](instance_feature)
+        anchor, cls, qt = self.sf_refines[i](
+            instance_feature,
+            anchor,
+            anchor_embed,
+            time_interval=time_interval,
+            return_cls=True,
+        )
+        return instance_feature, anchor, cls, qt
+
+    def temp_decoder_forward(
+        self,
+        i,
+        instance_feature,
+        anchor,
+        anchor_embed,
+        feature_maps,
+        metas,
+        temp_instance_feature,
+        temp_anchor_embed,
+        attn_mask,
+        time_interval,
     ):
         if self.decouple_attn:
-            query = torch.cat([query, query_pos], dim=-1)
-            if key is not None:
-                key = torch.cat([key, key_pos], dim=-1)
-            query_pos, key_pos = None, None
-        if value is not None:
-            value = self.fc_before(value)
-        return self.fc_after(
-            self.layers[index](
-                query,
-                key,
-                value,
-                query_pos=query_pos,
-                key_pos=key_pos,
-                **kwargs,
+            query = torch.cat([instance_feature, anchor_embed], dim=-1)
+            if temp_instance_feature is not None:
+                key = torch.cat([temp_instance_feature, temp_anchor_embed], dim=-1)
+                value = self.fc_before(temp_instance_feature)
+            else:
+                key = None
+                value = None
+            instance_feature = self.fc_after(
+                self.temp_gnns[i](
+                    query, key, value,
+                    query_pos=None, key_pos=None,
+                    attn_mask=attn_mask if temp_instance_feature is None else None,
+                )
             )
+        else:
+            instance_feature = self.temp_gnns[i](
+                instance_feature,
+                temp_instance_feature,
+                temp_instance_feature,
+                query_pos=anchor_embed,
+                key_pos=temp_anchor_embed,
+                attn_mask=attn_mask if temp_instance_feature is None else None,
+            )
+
+        if self.decouple_attn:
+            query = torch.cat([instance_feature, anchor_embed], dim=-1)
+            value = self.fc_before(instance_feature)
+            instance_feature = self.fc_after(
+                self.temp_local_gnns[i](
+                    query, None, value,
+                    query_pos=None, key_pos=None,
+                    attn_mask=attn_mask,
+                )
+            )
+        else:
+            instance_feature = self.temp_local_gnns[i](
+                instance_feature, None, instance_feature,
+                query_pos=anchor_embed,
+                attn_mask=attn_mask,
+            )
+        instance_feature = self.temp_norm1s[i](instance_feature)
+        instance_feature = self.temp_deformables[i](
+            instance_feature, anchor, anchor_embed, feature_maps, metas
         )
+        instance_feature = self.temp_ffns[i](instance_feature)
+        instance_feature = self.temp_norm2s[i](instance_feature)
+        anchor, cls, qt = self.temp_refines[i](
+            instance_feature,
+            anchor,
+            anchor_embed,
+            time_interval=time_interval,
+            return_cls=True,
+        )
+        return instance_feature, anchor, cls, qt
+
+    @classmethod
+    def convert_state_dict(cls, old_sd, operation_order):
+        """Convert an original SparseDrive state_dict (flat ``layers.N.*`` keys)
+        to the new flat ModuleList key structure.
+
+        ``fc_before.*`` and ``fc_after.*`` are kept at head level and require no remapping.
+
+        Args:
+            old_sd: state_dict from original SparseDrive Sparse4DHead.
+            operation_order: The ``operation_order`` list that was used by the
+                original model (e.g. from ``_det_operation_order()``).
+
+        Returns:
+            new_sd: dict with updated keys compatible with this model.
+        """
+        # Split operation_order into per-decoder-step chunks (split on "refine").
+        steps = []
+        current = []
+        for op in operation_order:
+            current.append(op)
+            if op == "refine":
+                steps.append(current)
+                current = []
+
+        # Map flat layer index → new key prefix.
+        flat_index_map = {}
+        sf_idx = 0
+        temp_idx = 0
+        flat_i = 0
+
+        for step_ops in steps:
+            is_temporal = "temp_gnn" in step_ops
+            prev_op = None
+            for op in step_ops:
+                if op == "norm":
+                    if prev_op in ("gnn", "temp_gnn"):
+                        if is_temporal:
+                            attr = f"temp_norm1s.{temp_idx}"
+                        else:
+                            attr = f"sf_norm1s.{sf_idx}"
+                    else:
+                        if is_temporal:
+                            attr = f"temp_norm2s.{temp_idx}"
+                        else:
+                            attr = f"sf_norm2s.{sf_idx}"
+                elif op == "temp_gnn":
+                    attr = f"temp_gnns.{temp_idx}"
+                elif op == "gnn":
+                    if is_temporal:
+                        attr = f"temp_local_gnns.{temp_idx}"
+                    else:
+                        attr = f"sf_gnns.{sf_idx}"
+                elif op == "deformable":
+                    if is_temporal:
+                        attr = f"temp_deformables.{temp_idx}"
+                    else:
+                        attr = f"sf_deformables.{sf_idx}"
+                elif op == "ffn":
+                    if is_temporal:
+                        attr = f"temp_ffns.{temp_idx}"
+                    else:
+                        attr = f"sf_ffns.{sf_idx}"
+                elif op == "refine":
+                    if is_temporal:
+                        attr = f"temp_refines.{temp_idx}"
+                    else:
+                        attr = f"sf_refines.{sf_idx}"
+                else:
+                    attr = None
+                if attr is not None:
+                    flat_index_map[flat_i] = attr
+                flat_i += 1
+                prev_op = op
+
+            if is_temporal:
+                temp_idx += 1
+            else:
+                sf_idx += 1
+
+        new_sd = {}
+        for key, value in old_sd.items():
+            if key.startswith("layers."):
+                parts = key.split(".", 2)
+                layer_idx = int(parts[1])
+                rest = parts[2] if len(parts) > 2 else ""
+                if layer_idx in flat_index_map:
+                    prefix = flat_index_map[layer_idx]
+                    new_key = f"{prefix}.{rest}" if rest else prefix
+                    new_sd[new_key] = value
+            else:
+                new_sd[key] = value
+
+        return new_sd
 
     def forward(
         self,
@@ -239,86 +427,72 @@ class Sparse4DHead(nn.Module):
         prediction = []
         classification = []
         quality = []
-        for i, op in enumerate(self.operation_order):
-            if self.layers[i] is None:
-                continue
-            elif op == "temp_gnn":
-                instance_feature = self.graph_model(
-                    i,
-                    instance_feature,
-                    temp_instance_feature,
-                    temp_instance_feature,
-                    query_pos=anchor_embed,
-                    key_pos=temp_anchor_embed,
-                    attn_mask=attn_mask
-                    if temp_instance_feature is None
-                    else None,
-                )
-            elif op == "gnn":
-                instance_feature = self.graph_model(
-                    i,
-                    instance_feature,
-                    value=instance_feature,
-                    query_pos=anchor_embed,
-                    attn_mask=attn_mask,
-                )
-            elif op == "norm" or op == "ffn":
-                instance_feature = self.layers[i](instance_feature)
-            elif op == "deformable":
-                instance_feature = self.layers[i](
-                    instance_feature,
-                    anchor,
-                    anchor_embed,
-                    feature_maps,
-                    metas,
-                )
-            elif op == "refine":
-                anchor, cls, qt = self.layers[i](
+        cls = None
+        for i in range(self.num_single_frame_decoder):
+            instance_feature, anchor, cls, qt = self.single_frame_decoder_forward(
+                i,
+                instance_feature,
+                anchor,
+                anchor_embed,
+                feature_maps,
+                metas,
+                attn_mask=attn_mask,
+                time_interval=time_interval,
+            )
+            prediction.append(anchor)
+            classification.append(cls)
+            quality.append(qt)
+            anchor_embed = self.anchor_encoder(anchor)
+
+        if self.num_single_frame_decoder > 0:
+            instance_feature, anchor = self.instance_bank.update(
+                instance_feature, anchor, cls
+            )
+            if (
+                dn_metas is not None
+                and self.sampler.num_temp_dn_groups > 0
+                and dn_id_target is not None
+            ):
+                (
                     instance_feature,
                     anchor,
-                    anchor_embed,
-                    time_interval=time_interval,
-                    return_cls=True,
+                    temp_dn_reg_target,
+                    temp_dn_cls_target,
+                    temp_valid_mask,
+                    dn_id_target,
+                ) = self.sampler.update_dn(
+                    instance_feature,
+                    anchor,
+                    dn_reg_target,
+                    dn_cls_target,
+                    valid_mask,
+                    dn_id_target,
+                    self.instance_bank.num_anchor,
+                    self.instance_bank.mask,
                 )
-                prediction.append(anchor)
-                classification.append(cls)
-                quality.append(qt)
-                if len(prediction) == self.num_single_frame_decoder:
-                    instance_feature, anchor = self.instance_bank.update(
-                        instance_feature, anchor, cls
-                    )
-                    if (
-                        dn_metas is not None
-                        and self.sampler.num_temp_dn_groups > 0
-                        and dn_id_target is not None
-                    ):
-                        (
-                            instance_feature,
-                            anchor,
-                            temp_dn_reg_target,
-                            temp_dn_cls_target,
-                            temp_valid_mask,
-                            dn_id_target,
-                        ) = self.sampler.update_dn(
-                            instance_feature,
-                            anchor,
-                            dn_reg_target,
-                            dn_cls_target,
-                            valid_mask,
-                            dn_id_target,
-                            self.instance_bank.num_anchor,
-                            self.instance_bank.mask,
-                        )
-                anchor_embed = self.anchor_encoder(anchor)
-                if (
-                    len(prediction) > self.num_single_frame_decoder
-                    and temp_anchor_embed is not None
-                ):
-                    temp_anchor_embed = anchor_embed[
-                        :, : self.instance_bank.num_temp_instances
-                    ]
-            else:
-                raise NotImplementedError(f"{op} is not supported.")
+            anchor_embed = self.anchor_encoder(anchor)
+
+        for i in range(len(self.temp_gnns)):
+            instance_feature, anchor, cls, qt = self.temp_decoder_forward(
+                i,
+                instance_feature,
+                anchor,
+                anchor_embed,
+                feature_maps,
+                metas,
+                temp_instance_feature=temp_instance_feature,
+                temp_anchor_embed=temp_anchor_embed,
+                attn_mask=attn_mask,
+                time_interval=time_interval,
+            )
+            prediction.append(anchor)
+            classification.append(cls)
+            quality.append(qt)
+            anchor_embed = self.anchor_encoder(anchor)
+            if temp_anchor_embed is not None:
+                temp_anchor_embed = anchor_embed[
+                    :, : self.instance_bank.num_temp_instances
+                ]
 
         output = {}
 
