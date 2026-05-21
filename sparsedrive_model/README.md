@@ -26,6 +26,10 @@ model = build()
 model.init_weights()
 ```
 
+Stage configs now only select hyperparameters. The hyperparameter dictionaries
+live in `configs/sparsedrive_hyperparams.py`, while `SparseDrive` and its heads
+construct their own backbone, neck, task heads, losses, samplers, and decoders.
+
 The model expects the same tensor/data contract as the original SparseDrive
 heads: `img` is shaped `[B, N_cam, 3, H, W]`, and metadata such as
 `projection_mat`, `image_wh`, `timestamp`, `img_metas`, labels, boxes, and map

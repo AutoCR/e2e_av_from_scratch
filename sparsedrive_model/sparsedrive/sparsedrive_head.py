@@ -5,23 +5,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .detection3d_head import Sparse4DHead
+from .motion_planning_head import MotionPlanningHead
+
 class SparseDriveHead(nn.Module):
     def __init__(
         self,
-        task_config: dict,
-        det_head=None,
-        map_head=None,
-        motion_plan_head=None,
-        **kwargs,
+        hyperparams: dict,
     ):
         super().__init__()
-        self.task_config = task_config
+        self.hyperparams = hyperparams
+        self.task_config = hyperparams["task_config"]
         if self.task_config['with_det']:
-            self.det_head = det_head
+            self.det_head = Sparse4DHead(hyperparams, task="det")
         if self.task_config['with_map']:
-            self.map_head = map_head
+            self.map_head = Sparse4DHead(hyperparams, task="map")
         if self.task_config['with_motion_plan']:
-            self.motion_plan_head = motion_plan_head
+            self.motion_plan_head = MotionPlanningHead(hyperparams)
 
     def init_weights(self):
         if self.task_config['with_det']:

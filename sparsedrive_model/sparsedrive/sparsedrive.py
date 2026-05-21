@@ -3,7 +3,10 @@ from inspect import signature
 import torch
 import torch.nn as nn
 
+from .backbone import FPN, TimmResNet50
+from .blocks import DenseDepthNet
 from .grid_mask import GridMask
+from .sparsedrive_head import SparseDriveHead
 
 try:
     from .ops import feature_maps_format
@@ -17,25 +20,43 @@ __all__ = ["SparseDrive"]
 class SparseDrive(nn.Module):
     def __init__(
         self,
-        img_backbone,
-        head,
-        img_neck=None,
-        use_grid_mask=True,
-        use_deformable_func=False,
-        depth_branch=None,
+        hyperparams=None,
     ):
         super().__init__()
-        self.img_backbone = img_backbone
-        self.img_neck = img_neck
-        self.head = head
-        self.use_grid_mask = use_grid_mask
-        if use_deformable_func:
+        if hyperparams is None:
+            from configs.sparsedrive_hyperparams import get_stage1_hyperparams
+
+            hyperparams = get_stage1_hyperparams()
+        self.hyperparams = hyperparams
+        self.img_backbone = TimmResNet50(
+            pretrained=hyperparams["backbone_pretrained"],
+            with_cp=hyperparams["backbone_with_cp"],
+        )
+        self.img_neck = FPN(
+            num_outs=len(hyperparams["strides"]),
+            out_channels=hyperparams["fpn_out_channels"],
+            add_extra_convs=hyperparams["fpn_add_extra_convs"],
+            in_channels=hyperparams["fpn_in_channels"],
+        )
+        self.depth_branch = DenseDepthNet(
+            embed_dims=hyperparams["embed_dims"],
+            num_depth_layers=hyperparams["num_depth_layers"],
+            loss_weight=hyperparams["depth_loss_weight"],
+        )
+        self.head = SparseDriveHead(hyperparams)
+        self.use_grid_mask = hyperparams["use_grid_mask"]
+        if hyperparams["use_deformable_func"]:
             assert DAF_VALID, "deformable_aggregation needs to be set up."
-        self.use_deformable_func = use_deformable_func
-        self.depth_branch = depth_branch
-        if use_grid_mask:
+        self.use_deformable_func = hyperparams["use_deformable_func"]
+        if self.use_grid_mask:
             self.grid_mask = GridMask(
-                True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7
+                hyperparams["grid_mask_use_h"],
+                hyperparams["grid_mask_use_w"],
+                rotate=hyperparams["grid_mask_rotate"],
+                offset=hyperparams["grid_mask_offset"],
+                ratio=hyperparams["grid_mask_ratio"],
+                mode=hyperparams["grid_mask_mode"],
+                prob=hyperparams["grid_mask_prob"],
             ) 
 
     def init_weights(self):

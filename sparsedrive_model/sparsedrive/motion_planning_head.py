@@ -11,7 +11,14 @@ from .geometry import box3d_to_corners
 from .box3d import *
 
 from .attention import gen_sineembed_for_position
+from .attention import MultiheadFlashAttention
 from .blocks import linear_relu_ln
+from .blocks import AsymmetricFFN
+from .instance_queue import InstanceQueue
+from .motion_blocks import MotionPlanningRefinementModule
+from .motion_decoder import HierarchicalPlanningDecoder, SparseBox3DMotionDecoder
+from .motion_target import MotionTarget, PlanningTarget
+from .nn_utils import FocalLoss, L1Loss
 from .instance_bank import topk
 Linear = nn.Linear
 
@@ -19,48 +26,73 @@ Linear = nn.Linear
 class MotionPlanningHead(nn.Module):
     def __init__(
         self,
-        fut_ts=12,
-        fut_mode=6,
-        ego_fut_ts=6,
-        ego_fut_mode=3,
-        motion_anchor=None,
-        plan_anchor=None,
-        embed_dims=256,
-        decouple_attn=False,
-        instance_queue=None,
-        operation_order=None,
-        temp_graph_model=None,
-        graph_model_factory=None,
-        cross_graph_model_factory=None,
-        norm_layer_factory=None,
-        ffn_factory=None,
-        refine_layer_factory=None,
-        motion_sampler=None,
-        motion_loss_cls=None,
-        motion_loss_reg=None,
-        planning_sampler=None,
-        plan_loss_cls=None,
-        plan_loss_reg=None,
-        plan_loss_status=None,
-        motion_decoder=None,
-        planning_decoder=None,
-        num_det=50,
-        num_map=10,
+        hyperparams: dict,
     ):
         super().__init__()
-        self.fut_ts = fut_ts
-        self.fut_mode = fut_mode
-        self.ego_fut_ts = ego_fut_ts
-        self.ego_fut_mode = ego_fut_mode
+        self.hyperparams = hyperparams
+        embed_dims = hyperparams["embed_dims"]
+        self.fut_ts = hyperparams["fut_ts"]
+        self.fut_mode = hyperparams["fut_mode"]
+        self.ego_fut_ts = hyperparams["ego_fut_ts"]
+        self.ego_fut_mode = hyperparams["ego_fut_mode"]
 
-        self.decouple_attn = decouple_attn
-        self.operation_order = operation_order
+        self.decouple_attn = hyperparams["decouple_attn_motion"]
+        self.operation_order = (
+            [
+                "temp_gnn",
+                "gnn",
+                "norm",
+                "cross_gnn",
+                "norm",
+                "ffn",
+                "norm",
+            ]
+            * hyperparams["motion_num_decoder_layers"]
+            + ["refine"]
+        )
 
-        self.instance_queue = instance_queue
-        self.motion_sampler = motion_sampler
-        self.planning_sampler = planning_sampler
-        self.motion_decoder = motion_decoder
-        self.planning_decoder = planning_decoder
+        attn_dims = embed_dims * 2 if self.decouple_attn else embed_dims
+        temp_graph_model = self._attn_factory(hyperparams, attn_dims)
+        graph_model_factory = self._attn_factory(hyperparams, attn_dims)
+        cross_graph_model_factory = self._attn_factory(hyperparams, embed_dims)
+        norm_layer_factory = lambda: nn.LayerNorm(embed_dims)
+        ffn_factory = lambda: AsymmetricFFN(
+            in_channels=embed_dims,
+            pre_norm=hyperparams["ffn_pre_norm"],
+            embed_dims=embed_dims,
+            feedforward_channels=embed_dims * 2,
+            num_fcs=hyperparams["motion_ffn_num_fcs"],
+            ffn_drop=hyperparams["drop_out"],
+            act_cfg=hyperparams["ffn_act_cfg"],
+        )
+        refine_layer_factory = lambda: MotionPlanningRefinementModule(
+            embed_dims=embed_dims,
+            fut_ts=self.fut_ts,
+            fut_mode=self.fut_mode,
+            ego_fut_ts=self.ego_fut_ts,
+            ego_fut_mode=self.ego_fut_mode,
+        )
+
+        self.instance_queue = InstanceQueue(
+            embed_dims=embed_dims,
+            queue_length=hyperparams["queue_length"],
+            tracking_threshold=hyperparams["motion_tracking_threshold"],
+            feature_map_scale=(
+                hyperparams["input_shape"][1] / hyperparams["strides"][-1],
+                hyperparams["input_shape"][0] / hyperparams["strides"][-1],
+            ),
+        )
+        self.motion_sampler = MotionTarget()
+        self.planning_sampler = PlanningTarget(
+            ego_fut_ts=self.ego_fut_ts,
+            ego_fut_mode=self.ego_fut_mode,
+        )
+        self.motion_decoder = SparseBox3DMotionDecoder()
+        self.planning_decoder = HierarchicalPlanningDecoder(
+            ego_fut_ts=self.ego_fut_ts,
+            ego_fut_mode=self.ego_fut_mode,
+            use_rescore=hyperparams["planning_decoder_use_rescore"],
+        )
         self.op_config_map = {
             "temp_gnn": temp_graph_model if callable(temp_graph_model) else (lambda: temp_graph_model),
             "gnn": graph_model_factory,
@@ -88,13 +120,29 @@ class MotionPlanningHead(nn.Module):
             self.fc_before = nn.Identity()
             self.fc_after = nn.Identity()
 
-        self.motion_loss_cls = motion_loss_cls
-        self.motion_loss_reg = motion_loss_reg
-        self.plan_loss_cls = plan_loss_cls
-        self.plan_loss_reg = plan_loss_reg
-        self.plan_loss_status = plan_loss_status
+        self.motion_loss_cls = FocalLoss(
+            use_sigmoid=True,
+            gamma=hyperparams["det_loss_gamma"],
+            alpha=hyperparams["det_loss_alpha"],
+            loss_weight=hyperparams["motion_loss_cls_weight"],
+        )
+        self.motion_loss_reg = L1Loss(loss_weight=hyperparams["motion_loss_reg_weight"])
+        self.plan_loss_cls = FocalLoss(
+            use_sigmoid=True,
+            gamma=hyperparams["det_loss_gamma"],
+            alpha=hyperparams["det_loss_alpha"],
+            loss_weight=hyperparams["plan_loss_cls_weight"],
+        )
+        self.plan_loss_reg = L1Loss(loss_weight=hyperparams["plan_loss_reg_weight"])
+        self.plan_loss_status = L1Loss(
+            loss_weight=hyperparams["plan_loss_status_weight"]
+        )
 
         # motion init
+        motion_anchor = (
+            f"{hyperparams['kmeans_dir']}/"
+            f"{hyperparams['motion_anchor_file'].format(fut_mode=self.fut_mode)}"
+        )
         motion_anchor = np.load(motion_anchor)
         self.motion_anchor = nn.Parameter(
             torch.tensor(motion_anchor, dtype=torch.float32),
@@ -106,6 +154,10 @@ class MotionPlanningHead(nn.Module):
         )
 
         # plan anchor init
+        plan_anchor = (
+            f"{hyperparams['kmeans_dir']}/"
+            f"{hyperparams['plan_anchor_file'].format(ego_fut_mode=self.ego_fut_mode)}"
+        )
         plan_anchor = np.load(plan_anchor)
         self.plan_anchor = nn.Parameter(
             torch.tensor(plan_anchor, dtype=torch.float32),
@@ -116,8 +168,17 @@ class MotionPlanningHead(nn.Module):
             Linear(embed_dims, embed_dims),
         )
 
-        self.num_det = num_det
-        self.num_map = num_map
+        self.num_det = hyperparams["motion_num_det"]
+        self.num_map = hyperparams["motion_num_map"]
+
+    @staticmethod
+    def _attn_factory(hyperparams, dims):
+        return lambda: MultiheadFlashAttention(
+            embed_dims=dims,
+            num_heads=hyperparams["num_groups"],
+            batch_first=hyperparams["attention_batch_first"],
+            dropout=hyperparams["drop_out"],
+        )
 
     def init_weights(self):
         for i, op in enumerate(self.operation_order):

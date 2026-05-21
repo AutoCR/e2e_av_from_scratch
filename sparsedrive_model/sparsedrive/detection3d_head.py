@@ -3,7 +3,28 @@ from typing import List, Optional, Union
 import torch
 import torch.nn as nn
 
+from .attention import MultiheadFlashAttention
+from .blocks import AsymmetricFFN, DeformableFeatureAggregation
+from .detection3d_blocks import (
+    SparseBox3DEncoder,
+    SparseBox3DKeyPointsGenerator,
+    SparseBox3DRefinementModule,
+)
+from .detection3d_decoder import SparseBox3DDecoder
+from .detection3d_losses import SparseBox3DLoss
+from .detection3d_target import SparseBox3DTarget
 from .dist_utils import reduce_mean
+from .instance_bank import InstanceBank
+from .map_blocks import (
+    SparsePoint3DEncoder,
+    SparsePoint3DKeyPointsGenerator,
+    SparsePoint3DRefinementModule,
+)
+from .map_decoder import SparsePoint3DDecoder
+from .map_loss import LinesL1Loss, SparseLineLoss
+from .map_match_cost import FocalLossCost, LinesL1Cost, MapQueriesCost
+from .map_target import HungarianLinesAssigner, SparsePoint3DTarget
+from .nn_utils import CrossEntropyLoss, FocalLoss, GaussianFocalLoss, L1Loss
 
 __all__ = ["Sparse4DHead"]
 
@@ -11,32 +32,38 @@ __all__ = ["Sparse4DHead"]
 class Sparse4DHead(nn.Module):
     def __init__(
         self,
-        instance_bank: nn.Module,
-        anchor_encoder: nn.Module,
-        graph_model_factory,
-        norm_layer_factory,
-        ffn_factory,
-        deformable_model,
-        refine_layer_factory,
-        num_decoder: int = 6,
-        num_single_frame_decoder: int = -1,
-        temp_graph_model=None,
-        decouple_attn: bool = True,
-        loss_cls: nn.Module = None,
-        loss_reg: nn.Module = None,
-        decoder=None,
-        sampler=None,
-        gt_cls_key: str = "gt_labels_3d",
-        gt_reg_key: str = "gt_bboxes_3d",
-        gt_id_key: str = "instance_id",
-        with_instance_id: bool = True,
-        task_prefix: str = "det",
-        reg_weights: List = None,
-        cls_threshold_to_reg: float = -1,
-        dn_loss_weight: float = 5.0,
-        **kwargs,
+        hyperparams: dict,
+        task: str = "det",
     ):
         super().__init__()
+        (
+            instance_bank,
+            anchor_encoder,
+            graph_model_factory,
+            norm_layer_factory,
+            ffn_factory,
+            deformable_model,
+            refine_layer_factory,
+            num_decoder,
+            num_single_frame_decoder,
+            temp_graph_model,
+            decouple_attn,
+            loss_cls,
+            loss_reg,
+            decoder,
+            sampler,
+            gt_cls_key,
+            gt_reg_key,
+            gt_id_key,
+            with_instance_id,
+            task_prefix,
+            reg_weights,
+            cls_threshold_to_reg,
+            dn_loss_weight,
+            operation_order,
+        ) = self._build_components(hyperparams, task)
+        self.hyperparams = hyperparams
+        self.task = task
         self.num_decoder = num_decoder
         self.decouple_attn = decouple_attn
         self.gt_cls_key = gt_cls_key
@@ -80,7 +107,6 @@ class Sparse4DHead(nn.Module):
         # of the passed operation_order (absorbed from config kwargs).
         # det_head uses _det_operation_order()[2:] → first op is "deformable" → no gnn.
         # map_head uses _map_operation_order()   → first op is "gnn"        → has gnn.
-        operation_order = kwargs.get("operation_order", None)
         if operation_order is not None and sf_count > 0:
             self.include_sf_gnn = operation_order[0] == "gnn"
         else:
@@ -103,6 +129,282 @@ class Sparse4DHead(nn.Module):
         self.temp_ffns = nn.ModuleList([ffn_factory() for _ in range(temp_count)])
         self.temp_norm2s = nn.ModuleList([norm_layer_factory() for _ in range(temp_count)])
         self.temp_refines = nn.ModuleList([refine_layer_factory() for _ in range(temp_count)])
+
+    @staticmethod
+    def _attn_factory(hyperparams, dims):
+        return lambda: MultiheadFlashAttention(
+            embed_dims=dims,
+            num_heads=hyperparams["num_groups"],
+            batch_first=hyperparams["attention_batch_first"],
+            dropout=hyperparams["drop_out"],
+        )
+
+    @staticmethod
+    def _det_operation_order(hyperparams):
+        return (
+            ["gnn", "norm", "deformable", "ffn", "norm", "refine"]
+            * hyperparams["num_single_frame_decoder"]
+            + ["temp_gnn", "gnn", "norm", "deformable", "ffn", "norm", "refine"]
+            * (hyperparams["num_decoder"] - hyperparams["num_single_frame_decoder"])
+        )[2:]
+
+    @staticmethod
+    def _map_operation_order(hyperparams):
+        return (
+            ["gnn", "norm", "deformable", "ffn", "norm", "refine"]
+            * hyperparams["num_single_frame_decoder_map"]
+            + ["temp_gnn", "gnn", "norm", "deformable", "ffn", "norm", "refine"]
+            * (hyperparams["num_decoder"] - hyperparams["num_single_frame_decoder_map"])
+        )
+
+    @classmethod
+    def _build_components(cls, hyperparams, task):
+        if task == "det":
+            return cls._build_det_components(hyperparams)
+        if task == "map":
+            return cls._build_map_components(hyperparams)
+        raise ValueError(f"Unsupported Sparse4DHead task: {task}")
+
+    @classmethod
+    def _build_det_components(cls, hyperparams):
+        embed_dims = hyperparams["embed_dims"]
+        decouple_attn = hyperparams["decouple_attn"]
+        class_names = hyperparams["class_names"]
+        num_classes = len(class_names)
+        kmeans_dir = hyperparams["kmeans_dir"]
+        num_levels = len(hyperparams["strides"])
+        bank_kps = SparseBox3DKeyPointsGenerator()
+
+        def deformable_factory():
+            return DeformableFeatureAggregation(
+                embed_dims=embed_dims,
+                num_groups=hyperparams["num_groups"],
+                num_levels=num_levels,
+                num_cams=hyperparams["num_cams"],
+                attn_drop=hyperparams["deformable_attn_drop"],
+                use_deformable_func=hyperparams["use_deformable_func"],
+                use_camera_embed=hyperparams["deformable_use_camera_embed"],
+                residual_mode=hyperparams["deformable_residual_mode"],
+                kps_generator=SparseBox3DKeyPointsGenerator(
+                    num_learnable_pts=hyperparams["det_keypoint_num_learnable_pts"],
+                    fix_scale=hyperparams["det_keypoint_fix_scale"],
+                ),
+            )
+
+        attn_dims = embed_dims * 2 if decouple_attn else embed_dims
+        temp_graph_model = (
+            cls._attn_factory(hyperparams, attn_dims)
+            if hyperparams["temporal"]
+            else None
+        )
+        return (
+            InstanceBank(
+                num_anchor=hyperparams["det_num_anchor"],
+                embed_dims=embed_dims,
+                anchor=f"{kmeans_dir}/{hyperparams['det_anchor_file']}",
+                anchor_handler=bank_kps,
+                num_temp_instances=(
+                    hyperparams["det_num_temp_instances"]
+                    if hyperparams["temporal"]
+                    else -1
+                ),
+                confidence_decay=hyperparams["det_confidence_decay"],
+                feat_grad=hyperparams["det_feat_grad"],
+            ),
+            SparseBox3DEncoder(
+                vel_dims=hyperparams["det_encoder_vel_dims"],
+                embed_dims=(
+                    hyperparams["det_encoder_embed_dims_decoupled"]
+                    if decouple_attn
+                    else hyperparams["det_encoder_embed_dims_coupled"]
+                ),
+                mode="cat" if decouple_attn else "add",
+                output_fc=not decouple_attn,
+                in_loops=hyperparams["det_encoder_in_loops"],
+                out_loops=(
+                    hyperparams["det_encoder_out_loops_decoupled"]
+                    if decouple_attn
+                    else hyperparams["det_encoder_out_loops_coupled"]
+                ),
+            ),
+            cls._attn_factory(hyperparams, attn_dims),
+            lambda: nn.LayerNorm(embed_dims),
+            lambda: AsymmetricFFN(
+                in_channels=embed_dims * 2,
+                pre_norm=hyperparams["ffn_pre_norm"],
+                embed_dims=embed_dims,
+                feedforward_channels=embed_dims * 4,
+                num_fcs=hyperparams["det_ffn_num_fcs"],
+                ffn_drop=hyperparams["drop_out"],
+                act_cfg=hyperparams["ffn_act_cfg"],
+            ),
+            deformable_factory,
+            lambda: SparseBox3DRefinementModule(
+                embed_dims=embed_dims,
+                num_cls=num_classes,
+                refine_yaw=hyperparams["det_refine_yaw"],
+                with_quality_estimation=hyperparams["with_quality_estimation"],
+            ),
+            hyperparams["num_decoder"],
+            hyperparams["num_single_frame_decoder"],
+            temp_graph_model,
+            decouple_attn,
+            FocalLoss(
+                use_sigmoid=True,
+                gamma=hyperparams["det_loss_gamma"],
+                alpha=hyperparams["det_loss_alpha"],
+                loss_weight=hyperparams["det_loss_cls_weight"],
+            ),
+            SparseBox3DLoss(
+                loss_box=L1Loss(loss_weight=hyperparams["det_loss_reg_weight"]),
+                loss_centerness=CrossEntropyLoss(use_sigmoid=True),
+                loss_yawness=GaussianFocalLoss(),
+                cls_allow_reverse=[
+                    class_names.index(name)
+                    for name in hyperparams["det_cls_allow_reverse"]
+                ],
+            ),
+            SparseBox3DDecoder(),
+            SparseBox3DTarget(
+                num_dn_groups=hyperparams["det_num_dn_groups"],
+                num_temp_dn_groups=hyperparams["det_num_temp_dn_groups"],
+                dn_noise_scale=hyperparams["det_dn_noise_scale"],
+                max_dn_gt=hyperparams["det_max_dn_gt"],
+                add_neg_dn=hyperparams["det_add_neg_dn"],
+                cls_weight=hyperparams["det_target_cls_weight"],
+                box_weight=hyperparams["det_target_box_weight"],
+                reg_weights=hyperparams["det_target_reg_weights"],
+                cls_wise_reg_weights={
+                    class_names.index(name): weights
+                    for name, weights in hyperparams[
+                        "det_cls_wise_reg_weights"
+                    ].items()
+                },
+            ),
+            hyperparams["det_gt_cls_key"],
+            hyperparams["det_gt_reg_key"],
+            hyperparams["det_gt_id_key"],
+            hyperparams["det_with_instance_id"],
+            hyperparams["det_task_prefix"],
+            hyperparams["det_loss_reg_weights"],
+            hyperparams["det_cls_threshold_to_reg"],
+            hyperparams["det_dn_loss_weight"],
+            cls._det_operation_order(hyperparams),
+        )
+
+    @classmethod
+    def _build_map_components(cls, hyperparams):
+        embed_dims = hyperparams["embed_dims"]
+        decouple_attn = hyperparams["decouple_attn_map"]
+        num_map_classes = len(hyperparams["map_class_names"])
+        kmeans_dir = hyperparams["kmeans_dir"]
+        num_levels = len(hyperparams["strides"])
+        bank_kps = SparsePoint3DKeyPointsGenerator()
+
+        def deformable_factory():
+            return DeformableFeatureAggregation(
+                embed_dims=embed_dims,
+                num_groups=hyperparams["num_groups"],
+                num_levels=num_levels,
+                num_cams=hyperparams["num_cams"],
+                attn_drop=hyperparams["deformable_attn_drop"],
+                use_deformable_func=hyperparams["use_deformable_func"],
+                use_camera_embed=hyperparams["deformable_use_camera_embed"],
+                residual_mode=hyperparams["deformable_residual_mode"],
+                kps_generator=SparsePoint3DKeyPointsGenerator(
+                    embed_dims=embed_dims,
+                    num_sample=hyperparams["num_sample"],
+                    num_learnable_pts=hyperparams["map_keypoint_num_learnable_pts"],
+                    fix_height=hyperparams["map_keypoint_fix_height"],
+                    ground_height=hyperparams["map_keypoint_ground_height"],
+                ),
+            )
+
+        attn_dims = embed_dims * 2 if decouple_attn else embed_dims
+        temp_graph_model = (
+            cls._attn_factory(hyperparams, attn_dims)
+            if hyperparams["temporal_map"]
+            else None
+        )
+        return (
+            InstanceBank(
+                num_anchor=hyperparams["map_num_anchor"],
+                embed_dims=embed_dims,
+                anchor=f"{kmeans_dir}/{hyperparams['map_anchor_file']}",
+                anchor_handler=bank_kps,
+                num_temp_instances=(
+                    hyperparams["num_map_temp_instances"]
+                    if hyperparams["temporal_map"]
+                    else -1
+                ),
+                confidence_decay=hyperparams["map_confidence_decay"],
+                feat_grad=hyperparams["map_feat_grad"],
+            ),
+            SparsePoint3DEncoder(
+                embed_dims=embed_dims,
+                num_sample=hyperparams["num_sample"],
+            ),
+            cls._attn_factory(hyperparams, attn_dims),
+            lambda: nn.LayerNorm(embed_dims),
+            lambda: AsymmetricFFN(
+                in_channels=embed_dims * 2,
+                pre_norm=hyperparams["ffn_pre_norm"],
+                embed_dims=embed_dims,
+                feedforward_channels=embed_dims * 4,
+                num_fcs=hyperparams["det_ffn_num_fcs"],
+                ffn_drop=hyperparams["drop_out"],
+                act_cfg=hyperparams["ffn_act_cfg"],
+            ),
+            deformable_factory,
+            lambda: SparsePoint3DRefinementModule(
+                embed_dims=embed_dims,
+                num_sample=hyperparams["num_sample"],
+                num_cls=num_map_classes,
+            ),
+            hyperparams["num_decoder"],
+            hyperparams["num_single_frame_decoder_map"],
+            temp_graph_model,
+            decouple_attn,
+            FocalLoss(
+                use_sigmoid=True,
+                gamma=hyperparams["det_loss_gamma"],
+                alpha=hyperparams["det_loss_alpha"],
+                loss_weight=hyperparams["map_loss_cls_weight"],
+            ),
+            SparseLineLoss(
+                loss_line=LinesL1Loss(
+                    loss_weight=hyperparams["map_loss_reg_weight"],
+                    beta=hyperparams["map_loss_beta"],
+                ),
+                num_sample=hyperparams["num_sample"],
+                roi_size=hyperparams["roi_size"],
+            ),
+            SparsePoint3DDecoder(),
+            SparsePoint3DTarget(
+                assigner=HungarianLinesAssigner(
+                    cost=MapQueriesCost(
+                        cls_cost=FocalLossCost(weight=hyperparams["map_loss_cls_weight"]),
+                        reg_cost=LinesL1Cost(
+                            weight=hyperparams["map_loss_reg_weight"],
+                            beta=hyperparams["map_loss_beta"],
+                            permute=True,
+                        ),
+                    )
+                ),
+                num_cls=num_map_classes,
+                num_sample=hyperparams["num_sample"],
+                roi_size=hyperparams["roi_size"],
+            ),
+            hyperparams["map_gt_cls_key"],
+            hyperparams["map_gt_reg_key"],
+            hyperparams["map_gt_id_key"],
+            hyperparams["map_with_instance_id"],
+            hyperparams["map_task_prefix"],
+            hyperparams["map_reg_weights"],
+            hyperparams["map_cls_threshold_to_reg"],
+            hyperparams["det_dn_loss_weight"],
+            cls._map_operation_order(hyperparams),
+        )
 
     def init_weights(self):
         non_refine_lists = [
