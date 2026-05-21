@@ -49,22 +49,128 @@ def _convert_flat_layer_state_dict(old_sd, flat_index_map):
     return new_sd
 
 
+def _decoupled_head_indices(embed_dims, num_heads, device):
+    old_head_dim = embed_dims // num_heads
+    new_head_dim = old_head_dim * 2
+    indices = [
+        head_idx * new_head_dim + dim_idx
+        for head_idx in range(num_heads)
+        for dim_idx in range(old_head_dim)
+    ]
+    return torch.tensor(indices, device=device)
+
+
+def _expand_coupled_in_proj_weight(weight, embed_dims, num_heads):
+    indices = _decoupled_head_indices(embed_dims, num_heads, weight.device)
+    expanded = weight.new_zeros((6 * embed_dims, 2 * embed_dims))
+    for proj_idx in range(3):
+        old_rows = slice(proj_idx * embed_dims, (proj_idx + 1) * embed_dims)
+        new_rows = indices + proj_idx * 2 * embed_dims
+        expanded[new_rows, :embed_dims] = weight[old_rows]
+        if proj_idx < 2:
+            expanded[new_rows, embed_dims:] = weight[old_rows]
+    return expanded
+
+
+def _expand_coupled_in_proj_bias(bias, embed_dims, num_heads):
+    indices = _decoupled_head_indices(embed_dims, num_heads, bias.device)
+    expanded = bias.new_zeros(6 * embed_dims)
+    for proj_idx in range(3):
+        old_rows = slice(proj_idx * embed_dims, (proj_idx + 1) * embed_dims)
+        new_rows = indices + proj_idx * 2 * embed_dims
+        expanded[new_rows] = bias[old_rows]
+    return expanded
+
+
+def _expand_coupled_out_proj_weight(weight, embed_dims, num_heads):
+    indices = _decoupled_head_indices(embed_dims, num_heads, weight.device)
+    expanded = weight.new_zeros((2 * embed_dims, 2 * embed_dims))
+    expanded[:embed_dims, indices] = weight
+    return expanded
+
+
+def _expand_coupled_out_proj_bias(bias, embed_dims):
+    expanded = bias.new_zeros(2 * embed_dims)
+    expanded[:embed_dims] = bias
+    return expanded
+
+
+def _decoupled_fc_before_weight(embed_dims, template):
+    weight = template.new_zeros((2 * embed_dims, embed_dims))
+    weight[:embed_dims] = torch.eye(
+        embed_dims, dtype=template.dtype, device=template.device
+    )
+    return weight
+
+
+def _decoupled_fc_after_weight(embed_dims, template):
+    weight = template.new_zeros((embed_dims, 2 * embed_dims))
+    weight[:, :embed_dims] = torch.eye(
+        embed_dims, dtype=template.dtype, device=template.device
+    )
+    return weight
+
+
+def _adapt_coupled_map_state_dict(state_dict, embed_dims, num_heads):
+    adapted = OrderedDict()
+    template = None
+    found_coupled_attention = False
+
+    for key, value in state_dict.items():
+        if not torch.is_tensor(value):
+            adapted[key] = value
+            continue
+
+        if value.is_floating_point() and template is None:
+            template = value
+
+        if key.endswith(".attn.in_proj_weight") and value.shape == (
+            3 * embed_dims,
+            embed_dims,
+        ):
+            value = _expand_coupled_in_proj_weight(value, embed_dims, num_heads)
+            found_coupled_attention = True
+        elif key.endswith(".attn.in_proj_bias") and value.shape == (
+            3 * embed_dims,
+        ):
+            value = _expand_coupled_in_proj_bias(value, embed_dims, num_heads)
+            found_coupled_attention = True
+        elif key.endswith(".attn.out_proj.weight") and value.shape == (
+            embed_dims,
+            embed_dims,
+        ):
+            value = _expand_coupled_out_proj_weight(value, embed_dims, num_heads)
+            found_coupled_attention = True
+        elif key.endswith(".attn.out_proj.bias") and value.shape == (embed_dims,):
+            value = _expand_coupled_out_proj_bias(value, embed_dims)
+            found_coupled_attention = True
+
+        adapted[key] = value
+
+    if found_coupled_attention and template is not None:
+        adapted.setdefault(
+            "fc_before.weight", _decoupled_fc_before_weight(embed_dims, template)
+        )
+        adapted.setdefault(
+            "fc_after.weight", _decoupled_fc_after_weight(embed_dims, template)
+        )
+    return adapted
+
+
 class Sparse4DDetHead(nn.Module):
     def __init__(self, hyperparams: dict):
         super().__init__()
         embed_dims = hyperparams["embed_dims"]
-        decouple_attn = hyperparams["decouple_attn"]
         class_names = hyperparams["class_names"]
         num_classes = len(class_names)
         num_levels = len(hyperparams["strides"])
         kmeans_dir = hyperparams["kmeans_dir"]
-        attn_dims = embed_dims * 2 if decouple_attn else embed_dims
+        attn_dims = embed_dims * 2
         sf_count = max(hyperparams["num_single_frame_decoder"], 0)
         temp_count = hyperparams["num_decoder"] - sf_count
 
         self.hyperparams = hyperparams
         self.num_decoder = hyperparams["num_decoder"]
-        self.decouple_attn = decouple_attn
         self.gt_cls_key = hyperparams["det_gt_cls_key"]
         self.gt_reg_key = hyperparams["det_gt_reg_key"]
         self.gt_id_key = hyperparams["det_gt_id_key"]
@@ -89,19 +195,11 @@ class Sparse4DDetHead(nn.Module):
         )
         self.anchor_encoder = SparseBox3DEncoder(
             vel_dims=hyperparams["det_encoder_vel_dims"],
-            embed_dims=(
-                hyperparams["det_encoder_embed_dims_decoupled"]
-                if decouple_attn
-                else hyperparams["det_encoder_embed_dims_coupled"]
-            ),
-            mode="cat" if decouple_attn else "add",
-            output_fc=not decouple_attn,
+            embed_dims=hyperparams["det_encoder_embed_dims_decoupled"],
+            mode="cat",
+            output_fc=False,
             in_loops=hyperparams["det_encoder_in_loops"],
-            out_loops=(
-                hyperparams["det_encoder_out_loops_decoupled"]
-                if decouple_attn
-                else hyperparams["det_encoder_out_loops_coupled"]
-            ),
+            out_loops=hyperparams["det_encoder_out_loops_decoupled"],
         )
         self.sampler = SparseBox3DTarget(
             num_dn_groups=hyperparams["det_num_dn_groups"],
@@ -133,12 +231,8 @@ class Sparse4DDetHead(nn.Module):
             ],
         )
         self.embed_dims = self.instance_bank.embed_dims
-        if decouple_attn:
-            self.fc_before = nn.Linear(self.embed_dims, self.embed_dims * 2, bias=False)
-            self.fc_after = nn.Linear(self.embed_dims * 2, self.embed_dims, bias=False)
-        else:
-            self.fc_before = nn.Identity()
-            self.fc_after = nn.Identity()
+        self.fc_before = nn.Linear(self.embed_dims, self.embed_dims * 2, bias=False)
+        self.fc_after = nn.Linear(self.embed_dims * 2, self.embed_dims, bias=False)
 
         self.sf_gnns = nn.ModuleList(
             ([nn.Identity()] if sf_count > 0 else [])
@@ -393,27 +487,18 @@ class Sparse4DDetHead(nn.Module):
 
         for decoder_idx in range(self.num_single_frame_decoder):
             if decoder_idx > 0:
-                if self.decouple_attn:
-                    query = torch.cat([instance_feature, anchor_embed], dim=-1)
-                    value = self.fc_before(instance_feature)
-                    instance_feature = self.fc_after(
-                        self.sf_gnns[decoder_idx](
-                            query,
-                            None,
-                            value,
-                            query_pos=None,
-                            key_pos=None,
-                            attn_mask=attn_mask,
-                        )
-                    )
-                else:
-                    instance_feature = self.sf_gnns[decoder_idx](
-                        instance_feature,
+                query = torch.cat([instance_feature, anchor_embed], dim=-1)
+                value = self.fc_before(instance_feature)
+                instance_feature = self.fc_after(
+                    self.sf_gnns[decoder_idx](
+                        query,
                         None,
-                        instance_feature,
-                        query_pos=anchor_embed,
+                        value,
+                        query_pos=None,
+                        key_pos=None,
                         attn_mask=attn_mask,
                     )
+                )
                 instance_feature = self.sf_norm1s[decoder_idx](instance_feature)
 
             instance_feature = self.sf_deformables[decoder_idx](
@@ -462,59 +547,40 @@ class Sparse4DDetHead(nn.Module):
             anchor_embed = self.anchor_encoder(anchor)
 
         for decoder_idx in range(self.num_temporal_decoder):
-            if self.decouple_attn:
-                query = torch.cat([instance_feature, anchor_embed], dim=-1)
-                if temp_instance_feature is not None:
-                    key = torch.cat(
-                        [temp_instance_feature, temp_anchor_embed], dim=-1
-                    )
-                    value = self.fc_before(temp_instance_feature)
-                else:
-                    key = None
-                    value = None
-                instance_feature = self.fc_after(
-                    self.temp_gnns[decoder_idx](
-                        query,
-                        key,
-                        value,
-                        query_pos=None,
-                        key_pos=None,
-                        attn_mask=(
-                            attn_mask if temp_instance_feature is None else None
-                        ),
-                    )
+            query = torch.cat([instance_feature, anchor_embed], dim=-1)
+            if temp_instance_feature is not None:
+                key = torch.cat(
+                    [temp_instance_feature, temp_anchor_embed], dim=-1
                 )
+                value = self.fc_before(temp_instance_feature)
             else:
-                instance_feature = self.temp_gnns[decoder_idx](
-                    instance_feature,
-                    temp_instance_feature,
-                    temp_instance_feature,
-                    query_pos=anchor_embed,
-                    key_pos=temp_anchor_embed,
-                    attn_mask=attn_mask if temp_instance_feature is None else None,
+                key = None
+                value = None
+            instance_feature = self.fc_after(
+                self.temp_gnns[decoder_idx](
+                    query,
+                    key,
+                    value,
+                    query_pos=None,
+                    key_pos=None,
+                    attn_mask=(
+                        attn_mask if temp_instance_feature is None else None
+                    ),
                 )
+            )
 
-            if self.decouple_attn:
-                query = torch.cat([instance_feature, anchor_embed], dim=-1)
-                value = self.fc_before(instance_feature)
-                instance_feature = self.fc_after(
-                    self.temp_local_gnns[decoder_idx](
-                        query,
-                        None,
-                        value,
-                        query_pos=None,
-                        key_pos=None,
-                        attn_mask=attn_mask,
-                    )
-                )
-            else:
-                instance_feature = self.temp_local_gnns[decoder_idx](
-                    instance_feature,
+            query = torch.cat([instance_feature, anchor_embed], dim=-1)
+            value = self.fc_before(instance_feature)
+            instance_feature = self.fc_after(
+                self.temp_local_gnns[decoder_idx](
+                    query,
                     None,
-                    instance_feature,
-                    query_pos=anchor_embed,
+                    value,
+                    query_pos=None,
+                    key_pos=None,
                     attn_mask=attn_mask,
                 )
+            )
             instance_feature = self.temp_norm1s[decoder_idx](instance_feature)
             instance_feature = self.temp_deformables[decoder_idx](
                 instance_feature, anchor, anchor_embed, feature_maps, metas
@@ -794,17 +860,15 @@ class Sparse4DMap(nn.Module):
     def __init__(self, hyperparams: dict):
         super().__init__()
         embed_dims = hyperparams["embed_dims"]
-        decouple_attn = hyperparams["decouple_attn_map"]
         num_map_classes = len(hyperparams["map_class_names"])
         num_levels = len(hyperparams["strides"])
         kmeans_dir = hyperparams["kmeans_dir"]
-        attn_dims = embed_dims * 2 if decouple_attn else embed_dims
+        attn_dims = embed_dims * 2
         sf_count = max(hyperparams["num_single_frame_decoder_map"], 0)
         temp_count = hyperparams["num_decoder"] - sf_count
 
         self.hyperparams = hyperparams
         self.num_decoder = hyperparams["num_decoder"]
-        self.decouple_attn = decouple_attn
         self.gt_cls_key = hyperparams["map_gt_cls_key"]
         self.gt_reg_key = hyperparams["map_gt_reg_key"]
         self.gt_id_key = hyperparams["map_gt_id_key"]
@@ -864,12 +928,8 @@ class Sparse4DMap(nn.Module):
             roi_size=hyperparams["roi_size"],
         )
         self.embed_dims = self.instance_bank.embed_dims
-        if decouple_attn:
-            self.fc_before = nn.Linear(self.embed_dims, self.embed_dims * 2, bias=False)
-            self.fc_after = nn.Linear(self.embed_dims * 2, self.embed_dims, bias=False)
-        else:
-            self.fc_before = nn.Identity()
-            self.fc_after = nn.Identity()
+        self.fc_before = nn.Linear(self.embed_dims, self.embed_dims * 2, bias=False)
+        self.fc_after = nn.Linear(self.embed_dims * 2, self.embed_dims, bias=False)
 
         self.sf_gnns = nn.ModuleList(
             [
@@ -1062,25 +1122,17 @@ class Sparse4DMap(nn.Module):
         cls = None
 
         for decoder_idx in range(self.num_single_frame_decoder):
-            if self.decouple_attn:
-                query = torch.cat([instance_feature, anchor_embed], dim=-1)
-                value = self.fc_before(instance_feature)
-                instance_feature = self.fc_after(
-                    self.sf_gnns[decoder_idx](
-                        query,
-                        None,
-                        value,
-                        query_pos=None,
-                        key_pos=None,
-                    )
-                )
-            else:
-                instance_feature = self.sf_gnns[decoder_idx](
-                    instance_feature,
+            query = torch.cat([instance_feature, anchor_embed], dim=-1)
+            value = self.fc_before(instance_feature)
+            instance_feature = self.fc_after(
+                self.sf_gnns[decoder_idx](
+                    query,
                     None,
-                    instance_feature,
-                    query_pos=anchor_embed,
+                    value,
+                    query_pos=None,
+                    key_pos=None,
                 )
+            )
             instance_feature = self.sf_norm1s[decoder_idx](instance_feature)
             instance_feature = self.sf_deformables[decoder_idx](
                 instance_feature, anchor, anchor_embed, feature_maps, metas
@@ -1106,53 +1158,36 @@ class Sparse4DMap(nn.Module):
             anchor_embed = self.anchor_encoder(anchor)
 
         for decoder_idx in range(self.num_temporal_decoder):
-            if self.decouple_attn:
-                query = torch.cat([instance_feature, anchor_embed], dim=-1)
-                if temp_instance_feature is not None:
-                    key = torch.cat(
-                        [temp_instance_feature, temp_anchor_embed], dim=-1
-                    )
-                    value = self.fc_before(temp_instance_feature)
-                else:
-                    key = None
-                    value = None
-                instance_feature = self.fc_after(
-                    self.temp_gnns[decoder_idx](
-                        query,
-                        key,
-                        value,
-                        query_pos=None,
-                        key_pos=None,
-                    )
+            query = torch.cat([instance_feature, anchor_embed], dim=-1)
+            if temp_instance_feature is not None:
+                key = torch.cat(
+                    [temp_instance_feature, temp_anchor_embed], dim=-1
                 )
+                value = self.fc_before(temp_instance_feature)
             else:
-                instance_feature = self.temp_gnns[decoder_idx](
-                    instance_feature,
-                    temp_instance_feature,
-                    temp_instance_feature,
-                    query_pos=anchor_embed,
-                    key_pos=temp_anchor_embed,
+                key = None
+                value = None
+            instance_feature = self.fc_after(
+                self.temp_gnns[decoder_idx](
+                    query,
+                    key,
+                    value,
+                    query_pos=None,
+                    key_pos=None,
                 )
+            )
 
-            if self.decouple_attn:
-                query = torch.cat([instance_feature, anchor_embed], dim=-1)
-                value = self.fc_before(instance_feature)
-                instance_feature = self.fc_after(
-                    self.temp_local_gnns[decoder_idx](
-                        query,
-                        None,
-                        value,
-                        query_pos=None,
-                        key_pos=None,
-                    )
-                )
-            else:
-                instance_feature = self.temp_local_gnns[decoder_idx](
-                    instance_feature,
+            query = torch.cat([instance_feature, anchor_embed], dim=-1)
+            value = self.fc_before(instance_feature)
+            instance_feature = self.fc_after(
+                self.temp_local_gnns[decoder_idx](
+                    query,
                     None,
-                    instance_feature,
-                    query_pos=anchor_embed,
+                    value,
+                    query_pos=None,
+                    key_pos=None,
                 )
+            )
             instance_feature = self.temp_norm1s[decoder_idx](instance_feature)
             instance_feature = self.temp_deformables[decoder_idx](
                 instance_feature, anchor, anchor_embed, feature_maps, metas
@@ -1299,8 +1334,13 @@ class Sparse4DMap(nn.Module):
 
     @classmethod
     def convert_state_dict(cls, old_sd, hyperparams):
-        return _convert_flat_layer_state_dict(
+        converted = _convert_flat_layer_state_dict(
             old_sd, cls._flat_layer_key_map(hyperparams)
+        )
+        return _adapt_coupled_map_state_dict(
+            converted,
+            embed_dims=hyperparams["embed_dims"],
+            num_heads=hyperparams["num_groups"],
         )
 
 

@@ -50,8 +50,6 @@ SPARSEDRIVE_STAGE1_HYPERPARAMS = {
     "drop_out": 0.1,
     "temporal": True,
     "temporal_map": True,
-    "decouple_attn": True,
-    "decouple_attn_map": False,
     "decouple_attn_motion": True,
     "with_quality_estimation": True,
     "task_config": {"with_det": True, "with_map": True, "with_motion_plan": False},
