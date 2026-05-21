@@ -3,7 +3,7 @@ from .backbone import FPN, ResNet50FPN, TimmResNet50
 from .blocks import AsymmetricFFN, DeformableFeatureAggregation, DenseDepthNet, FFN
 from .detection3d_blocks import SparseBox3DEncoder, SparseBox3DKeyPointsGenerator, SparseBox3DRefinementModule
 from .detection3d_decoder import SparseBox3DDecoder
-from .detection3d_head import Sparse4DHead
+from .detection3d_head import Sparse4DDetHead, Sparse4DMap, convert_sparse4d_state_dict
 from .detection3d_losses import SparseBox3DLoss
 from .detection3d_target import SparseBox3DTarget
 from .instance_bank import InstanceBank

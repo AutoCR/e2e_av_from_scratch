@@ -49,7 +49,16 @@ The top-level attribute names are preserved:
 - `head.map_head`
 - `head.motion_plan_head`
 
+`head.det_head` is implemented by `Sparse4DDetHead`, and `head.map_head` is
+implemented by `Sparse4DMap`. The old public `Sparse4DHead` API has been
+removed; use the task-specific classes directly.
+
 The FPN implementation keeps MMDetection-style `lateral_convs.*.conv` and
 `fpn_convs.*.conv` child names so released SparseDrive checkpoints can be
 loaded without changing neck keys. The ResNet trunk exposes `conv1`, `bn1`,
 and `layer1` through `layer4` directly under `img_backbone`.
+
+Raw SparseDrive checkpoints that store det/map decoder blocks as flat
+`head.det_head.layers.*` and `head.map_head.layers.*` keys are converted by
+`SparseDrive.load_state_dict()` to the split-head ModuleList keys. Already
+converted checkpoints remain load-compatible.

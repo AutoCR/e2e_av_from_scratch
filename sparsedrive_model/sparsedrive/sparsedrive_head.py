@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .detection3d_head import Sparse4DHead
+from .detection3d_head import Sparse4DDetHead, Sparse4DMap
 from .motion_planning_head import MotionPlanningHead
 
 class SparseDriveHead(nn.Module):
@@ -17,9 +17,9 @@ class SparseDriveHead(nn.Module):
         self.hyperparams = hyperparams
         self.task_config = hyperparams["task_config"]
         if self.task_config['with_det']:
-            self.det_head = Sparse4DHead(hyperparams, task="det")
+            self.det_head = Sparse4DDetHead(hyperparams)
         if self.task_config['with_map']:
-            self.map_head = Sparse4DHead(hyperparams, task="map")
+            self.map_head = Sparse4DMap(hyperparams)
         if self.task_config['with_motion_plan']:
             self.motion_plan_head = MotionPlanningHead(hyperparams)
 

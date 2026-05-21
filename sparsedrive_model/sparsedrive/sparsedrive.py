@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from .backbone import FPN, TimmResNet50
 from .blocks import DenseDepthNet
+from .detection3d_head import convert_sparse4d_state_dict
 from .grid_mask import GridMask
 from .sparsedrive_head import SparseDriveHead
 
@@ -65,6 +66,10 @@ class SparseDrive(nn.Module):
                 module.init_weights()
             elif hasattr(module, "init_weight"):
                 module.init_weight()
+
+    def load_state_dict(self, state_dict, strict=True, *args, **kwargs):
+        state_dict = convert_sparse4d_state_dict(state_dict, self.hyperparams)
+        return super().load_state_dict(state_dict, strict=strict, *args, **kwargs)
 
     def extract_feat(self, img, return_depth=False, metas=None):
         bs = img.shape[0]
