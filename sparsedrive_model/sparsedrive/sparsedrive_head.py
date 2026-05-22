@@ -104,7 +104,7 @@ class SparseDriveHead(nn.Module):
                 data,
             )
 
-        results = [dict()] * batch_size
+        results = [dict() for _ in range(batch_size)]
         for i in range(batch_size):
             if self.task_config['with_det']:
                 results[i].update(det_result[i])
