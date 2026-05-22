@@ -144,6 +144,26 @@ class MotionPlanningHead(nn.Module):
             f"{hyperparams['motion_anchor_file'].format(fut_mode=self.fut_mode)}"
         )
         motion_anchor = np.load(motion_anchor)
+        expected_motion_anchor_shape = (
+            len(hyperparams["class_names"]),
+            self.fut_mode,
+            self.fut_ts,
+            2,
+        )
+        if motion_anchor.shape != expected_motion_anchor_shape:
+            if (
+                motion_anchor.shape[0] > expected_motion_anchor_shape[0]
+                or motion_anchor.shape[1:] != expected_motion_anchor_shape[1:]
+            ):
+                raise ValueError(
+                    "motion_anchor shape must be "
+                    f"{expected_motion_anchor_shape}, got {motion_anchor.shape}."
+                )
+            padded_motion_anchor = np.zeros(
+                expected_motion_anchor_shape, dtype=motion_anchor.dtype
+            )
+            padded_motion_anchor[: motion_anchor.shape[0]] = motion_anchor
+            motion_anchor = padded_motion_anchor
         self.motion_anchor = nn.Parameter(
             torch.tensor(motion_anchor, dtype=torch.float32),
             requires_grad=False,

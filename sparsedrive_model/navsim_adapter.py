@@ -21,7 +21,9 @@ DEFAULT_NUPLAN_MAPS_ROOT: Optional[PathLike] = None
 DEFAULT_SPLIT = "mini"
 DEFAULT_NUM_HISTORY_FRAMES = 4
 DEFAULT_NUM_FUTURE_FRAMES = 10
-DEFAULT_IMAGE_HW = (704, 256)
+# SparseDrive configs store input_shape as (width, height); this adapter uses
+# image_hw as (height, width) for PIL/tensor preprocessing.
+DEFAULT_IMAGE_HW = (256, 704)
 DEFAULT_IMAGE_MEAN = (0.485, 0.456, 0.406)
 DEFAULT_IMAGE_STD = (0.229, 0.224, 0.225)
 DEFAULT_MAP_VERSION = "nuplan-maps-v1.0"
@@ -52,6 +54,19 @@ DEFAULT_CAMERA_ORDER = (
 # SparseDrive's planning branch indexes commands as [straight, left, right].
 DEFAULT_GT_EGO_FUT_CMD = (1.0, 0.0, 0.0)
 NAVSIM_COMMAND_TO_SPARSEDRIVE = {0: 0, 1: 1, 2: 2, 3: 0}
+
+
+def image_hw_from_sparsedrive_input_shape(input_shape: Sequence[int]) -> tuple[int, int]:
+    try:
+        width, height = tuple(int(dim) for dim in input_shape)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "SparseDrive input_shape must contain exactly two dimensions in "
+            f"(width, height) order, got {input_shape!r}."
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise ValueError(f"SparseDrive input_shape dimensions must be positive, got {input_shape!r}.")
+    return height, width
 
 
 @dataclass(frozen=True)
@@ -492,6 +507,7 @@ __all__ = [
     "build_navsim_sensor_config",
     "build_navsim_sparsedrive_sample",
     "collate_navsim_sparsedrive_samples",
+    "image_hw_from_sparsedrive_input_shape",
     "load_navsim_sparsedrive_samples",
     "normalize_camera_order",
     "resolve_navsim_paths",

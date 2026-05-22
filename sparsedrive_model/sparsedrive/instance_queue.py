@@ -22,6 +22,7 @@ class InstanceQueue(nn.Module):
         self.tracking_threshold = tracking_threshold
 
         kernel_size = tuple([int(x / 2) for x in feature_map_scale])
+        self.ego_pool_kernel_size = kernel_size
         self.ego_feature_encoder = nn.Sequential(
             nn.Conv2d(embed_dims, embed_dims, 3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(embed_dims),
@@ -162,6 +163,17 @@ class InstanceQueue(nn.Module):
         ## ego instance init
         feature_maps_inv = feature_maps_format(feature_maps, inverse=True)
         feature_map = feature_maps_inv[0][-1][:, 0]
+        pooled_input_h = (feature_map.shape[-2] + 1) // 2
+        pooled_input_w = (feature_map.shape[-1] + 1) // 2
+        kernel_h, kernel_w = self.ego_pool_kernel_size
+        if pooled_input_h < kernel_h or pooled_input_w < kernel_w:
+            raise ValueError(
+                "SparseDrive ego feature map is too small for planning pooling: "
+                f"selected feature map shape={tuple(feature_map.shape)}, stride-2 conv output "
+                f"would be ({pooled_input_h}, {pooled_input_w}), but AvgPool2d kernel is "
+                f"({kernel_h}, {kernel_w}). Check preprocessing: SparseDrive input_shape is "
+                "(width, height), while image tensors must use (height, width)."
+            )
         ego_feature = self.ego_feature_encoder(feature_map)
         ego_feature = ego_feature.unsqueeze(1).squeeze(-1).squeeze(-1)
 

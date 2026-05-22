@@ -13,6 +13,8 @@ import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("NUPLAN_MAPS_ROOT", "/Users/chenran/Code/nuplan/dataset/maps")
+os.environ.setdefault("OPENSCENE_DATA_ROOT", os.path.expandvars("$HOME/Code/navsim/dataset"))
 SPARSEDRIVE_ROOT = Path(__file__).resolve().parent
 for path in (REPO_ROOT, SPARSEDRIVE_ROOT):
     path_str = str(path)
@@ -27,7 +29,7 @@ OPENSCENE_DATA_ROOT = os.environ.get("OPENSCENE_DATA_ROOT")
 NUPLAN_MAPS_ROOT = os.environ.get("NUPLAN_MAPS_ROOT")
 SPLIT = "mini"
 CONFIG_NAME = "stage2"  # "stage1" or "stage2"; stage2 enables motion/planning.
-CHECKPOINT_PATH = "/Users/chenran/Code/e2e_av_from_scratch/model_weights/sparse_drive/sparsedrive_stage1.pth"
+CHECKPOINT_PATH = f"model_weights/sparse_drive/sparsedrive_{CONFIG_NAME}.pth"
 LIMIT = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -43,7 +45,7 @@ CAMERA_ORDER = (
 )
 
 OUTPUT_DIR = "sparsedrive_model/outputs/navsim_mini_inference"
-VISUALIZE = False
+VISUALIZE = True
 # -----------------------------------------------------------------------------
 
 if TYPE_CHECKING:
@@ -74,21 +76,37 @@ def _require_checkpoint_path(path_like: str | os.PathLike[str]) -> Path:
     checkpoint_path = _resolve_repo_path(path_like)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(
-            f"SparseDrive checkpoint not found: {checkpoint_path}. Place the stage2 "
+            f"SparseDrive checkpoint not found: {checkpoint_path}. Place matching "
             "weights there or edit CHECKPOINT_PATH in sparsedrive_model/test.py; "
             "this script refuses to run with random weights."
         )
     return checkpoint_path
 
 
-def _build_model(config_name: str) -> torch.nn.Module:
+def _get_config_module(config_name: str) -> Any:
     normalized = config_name.lower().strip()
     module_name = CONFIG_MODULES.get(normalized)
     if module_name is None:
         valid = ", ".join(sorted(CONFIG_MODULES))
         raise ValueError(f"Unsupported CONFIG_NAME={config_name!r}; expected one of: {valid}.")
+    return importlib.import_module(module_name)
 
-    config_module = importlib.import_module(module_name)
+
+def _image_hw_from_config(config_name: str) -> tuple[int, int]:
+    config_module = _get_config_module(config_name)
+    input_shape = getattr(config_module, "input_shape", None)
+    if input_shape is None:
+        hyperparams = getattr(config_module, "hyperparams", None)
+        if isinstance(hyperparams, Mapping):
+            input_shape = hyperparams.get("input_shape")
+
+    from navsim_adapter import image_hw_from_sparsedrive_input_shape
+
+    return image_hw_from_sparsedrive_input_shape(input_shape)
+
+
+def _build_model(config_name: str) -> torch.nn.Module:
+    config_module = _get_config_module(config_name)
     model = config_module.build()
     if hasattr(model, "init_weights"):
         model.init_weights()
@@ -177,7 +195,7 @@ def _resolve_device(device_name: str) -> torch.device:
     return device
 
 
-def _load_navsim_samples() -> list[Any]:
+def _load_navsim_samples(image_hw: tuple[int, int]) -> list[Any]:
     from navsim_adapter import (
         build_navsim_scene_loader,
         load_navsim_sparsedrive_samples,
@@ -199,6 +217,7 @@ def _load_navsim_samples() -> list[Any]:
         scene_loader,
         max_samples=LIMIT,
         camera_order=CAMERA_ORDER,
+        image_hw=image_hw,
         maps_root=NUPLAN_MAPS_ROOT,
         include_map_api=VISUALIZE,
     )
@@ -308,6 +327,7 @@ def main() -> None:
     checkpoint_path = _require_checkpoint_path(CHECKPOINT_PATH)
     output_dir = _resolve_repo_path(OUTPUT_DIR)
     device = _resolve_device(DEVICE)
+    image_hw = _image_hw_from_config(CONFIG_NAME)
 
     print(f"Building SparseDrive {CONFIG_NAME} model on {device}...")
     model = _build_model(CONFIG_NAME)
@@ -315,11 +335,11 @@ def main() -> None:
     model.to(device)
     model.eval()
 
-    print(f"Loading NAVSIM split={SPLIT!r}, limit={LIMIT}...")
+    print(f"Loading NAVSIM split={SPLIT!r}, limit={LIMIT}, image_hw={image_hw}...")
     from navsim_adapter import collate_navsim_sparsedrive_samples, sample_to_device
     from prediction_decode import DecodedSparseDrivePrediction, decode_sparsedrive_outputs
 
-    samples = _load_navsim_samples()
+    samples = _load_navsim_samples(image_hw)
     batch = collate_navsim_sparsedrive_samples(samples)
     batch = sample_to_device(batch, device)
 

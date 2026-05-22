@@ -197,7 +197,10 @@ def _plot_prediction_panel(
     _plot_prediction_obstacles(ax, decoded_prediction)
     _plot_trajectory_with_navsim_helper(
         ax,
-        decoded_prediction.predicted_ego_trajectory,
+        _sparsedrive_poses_to_navsim_poses(
+            decoded_prediction.predicted_ego_trajectory,
+            "predicted_ego_trajectory",
+        ),
         TRAJECTORY_CONFIG["agent"],
     )
     ax.text(
@@ -260,25 +263,42 @@ def _plot_prediction_obstacles(
     for index, box_values in enumerate(boxes):
         if not np.isfinite(box_values[:7]).all():
             raise ValueError(f"predicted obstacle box {index} contains non-finite values.")
-        x, y, width, length, height, heading = (
-            float(box_values[0]),
-            float(box_values[1]),
+        navsim_center = _sparsedrive_xy_to_navsim_xy(
+            np.asarray(box_values[:2], dtype=np.float64).reshape(1, 2),
+            f"predicted_obstacle_boxes[{index}].center",
+        )[0]
+        x, y, length, width, height, heading = (
+            float(navsim_center[0]),
+            float(navsim_center[1]),
+            # SparseDrive W is along its yaw axis; after heading conversion this is NAVSIM length.
             max(float(box_values[3]), 0.01),
             max(float(box_values[4]), 0.01),
             max(float(box_values[5]), 0.01),
-            float(box_values[6]),
+            float(_sparsedrive_heading_to_navsim_heading(box_values[6])),
         )
         obstacle_box = OrientedBox(StateSE2(x, y, heading), length, width, height)
         add_oriented_box_to_bev_ax(ax, obstacle_box, PREDICTED_OBSTACLE_CONFIG)
 
         if trajectories.size:
-            path = np.concatenate([np.array([[x, y]], dtype=np.float64), trajectories[index]], axis=0)
+            path = np.concatenate(
+                [
+                    np.array([[x, y]], dtype=np.float64),
+                    _sparsedrive_xy_to_navsim_xy(
+                        trajectories[index],
+                        f"predicted_obstacle_trajectories[{index}]",
+                    ),
+                ],
+                axis=0,
+            )
             _plot_xy_path(ax, path, **PREDICTED_OBSTACLE_TRAJECTORY_CONFIG)
 
 
 def _plot_predicted_map(ax: plt.Axes, polylines: Sequence[np.ndarray]) -> None:
     for polyline_idx, polyline in enumerate(polylines):
-        points = _ensure_xy_array(polyline, f"predicted_map_polylines[{polyline_idx}]")
+        points = _sparsedrive_xy_to_navsim_xy(
+            polyline,
+            f"predicted_map_polylines[{polyline_idx}]",
+        )
         if points.shape[0] < 2:
             continue
         _plot_xy_path(ax, points, **PREDICTED_MAP_CONFIG)
@@ -309,6 +329,40 @@ def _plot_xy_path(ax: plt.Axes, xy: Any, **plot_kwargs: Any) -> None:
     if not np.isfinite(points).all():
         raise ValueError("xy path contains non-finite values.")
     ax.plot(points[:, 1], points[:, 0], **plot_kwargs)
+
+
+def _sparsedrive_xy_to_navsim_xy(value: Any, name: str) -> np.ndarray:
+    points = _ensure_xy_array(value, name)
+    converted = np.empty_like(points, dtype=np.float64)
+    converted[:, 0] = points[:, 1]
+    converted[:, 1] = -points[:, 0]
+    return converted
+
+
+def _sparsedrive_poses_to_navsim_poses(value: Any, name: str) -> np.ndarray:
+    array = _to_numpy(value, name).astype(np.float64, copy=False)
+    if array.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    if array.ndim != 2 or array.shape[1] not in (2, 3):
+        raise ValueError(f"{name} must be shaped [N, 2] or [N, 3], got {array.shape}.")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains non-finite values.")
+
+    converted = np.empty((array.shape[0], 3), dtype=np.float64)
+    converted[:, :2] = _sparsedrive_xy_to_navsim_xy(array[:, :2], name)
+    if array.shape[1] == 3:
+        converted[:, 2] = _sparsedrive_heading_to_navsim_heading(array[:, 2])
+    else:
+        converted[:, 2] = 0.0
+    return converted
+
+
+def _sparsedrive_heading_to_navsim_heading(heading: Any) -> Any:
+    return _normalize_angle(np.asarray(heading, dtype=np.float64) - np.pi / 2.0)
+
+
+def _normalize_angle(angle: Any) -> Any:
+    return np.arctan2(np.sin(angle), np.cos(angle))
 
 
 def _add_ego(ax: plt.Axes) -> None:
