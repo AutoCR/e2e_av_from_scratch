@@ -24,6 +24,7 @@ UNIAD_BASE_E2E_HPARAMS = dict(
     dummy_motion_anchor_seed=0,
     dummy_motion_anchor_scale=1.0,
     use_nonlinear_optimizer=True,
+    use_dcn=True,
     occ_n_future=4,
     occ_n_future_plan=6,
     occflow_grid_conf=dict(

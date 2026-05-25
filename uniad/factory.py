@@ -186,6 +186,8 @@ def _model_kwargs_from_hparams(hparams):
     ffn_dims = hparams["ffn_dims"]
     num_levels = hparams["num_feature_levels"]
     losses = _loss_cfgs()
+    dcn_cfg = dict(type="DCNv2", deform_groups=1, fallback_on_stride=False) if hparams.get("use_dcn", True) else None
+    stage_with_dcn = (False, False, True, True) if dcn_cfg is not None else (False, False, False, False)
 
     return dict(
         gt_iou_threshold=hparams["train_gt_iou_threshold"],
@@ -205,8 +207,8 @@ def _model_kwargs_from_hparams(hparams):
             norm_cfg=dict(type="BN2d", requires_grad=False),
             norm_eval=True,
             style="caffe",
-            dcn=dict(type="DCNv2", deform_groups=1, fallback_on_stride=False),
-            stage_with_dcn=(False, False, True, True),
+            dcn=dcn_cfg,
+            stage_with_dcn=stage_with_dcn,
         ),
         img_neck=dict(
             type="FPN",
@@ -313,6 +315,7 @@ def _model_kwargs_from_hparams(hparams):
         occ_head=dict(
             type="OccHead",
             grid_conf=hparams["occflow_grid_conf"],
+            bev_size=canvas_size,
             ignore_index=255,
             bev_proj_dim=256,
             bev_proj_nlayers=4,
@@ -371,6 +374,8 @@ def _model_kwargs_from_hparams(hparams):
         ),
         planning_head=dict(
             type="PlanningHeadSingleMode",
+            bev_h=bev_h,
+            bev_w=bev_w,
             embed_dims=embed_dims,
             planning_steps=hparams["planning_steps"],
             loss_planning=dict(type="PlanningLoss"),

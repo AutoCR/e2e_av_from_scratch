@@ -207,11 +207,27 @@ def build_sampler(cfg, context=None):
 
 
 def build_backbone(cfg):
-    return BackbonePlaceholder(cfg)
+    if cfg is None or isinstance(cfg, nn.Module):
+        return cfg
+    cfg = copy.deepcopy(cfg)
+    backbone_type = cfg.pop("type")
+    if backbone_type == "ResNet":
+        from uniad.core.image_modules import ResNet
+
+        return ResNet(**cfg)
+    return BackbonePlaceholder({"type": backbone_type, **cfg})
 
 
 def build_neck(cfg):
-    return NeckPlaceholder(cfg)
+    if cfg is None or isinstance(cfg, nn.Module):
+        return cfg
+    cfg = copy.deepcopy(cfg)
+    neck_type = cfg.pop("type")
+    if neck_type == "FPN":
+        from uniad.core.image_modules import FPN
+
+        return FPN(**cfg)
+    return NeckPlaceholder({"type": neck_type, **cfg})
 
 
 def build_transformer(cfg):

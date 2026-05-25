@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from .base import BaseModule
+from .tensor_utils import inverse_sigmoid
 
 
 class FFN(BaseModule):
@@ -67,7 +68,7 @@ class MultiheadAttention(BaseModule):
         **kwargs,
     ):
         if key is None:
-            key = query
+            key = value if value is not None else query
         if value is None:
             value = key
         if query_pos is not None:
@@ -107,6 +108,59 @@ class TransformerLayerSequence(BaseModule):
         return query
 
 
+class DeformableDetrTransformerDecoder(TransformerLayerSequence):
+    def __init__(self, *args, return_intermediate=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.return_intermediate = return_intermediate
+
+    def forward(
+        self,
+        query,
+        *args,
+        reference_points=None,
+        valid_ratios=None,
+        reg_branches=None,
+        key_padding_mask=None,
+        **kwargs,
+    ):
+        output = query
+        intermediate = []
+        intermediate_reference_points = []
+
+        for layer_idx, layer in enumerate(self.layers):
+            reference_points_input = reference_points
+            if reference_points is not None and valid_ratios is not None:
+                if reference_points.shape[-1] == 4:
+                    reference_points_input = reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[:, None]
+                else:
+                    reference_points_input = reference_points[:, :, None] * valid_ratios[:, None]
+
+            output = layer(
+                output,
+                *args,
+                reference_points=reference_points_input,
+                key_padding_mask=key_padding_mask,
+                **kwargs,
+            )
+
+            if reg_branches is not None and reference_points is not None:
+                output_for_reg = output.permute(1, 0, 2)
+                tmp = reg_branches[layer_idx](output_for_reg)
+                if reference_points.shape[-1] == 4:
+                    new_reference_points = tmp + inverse_sigmoid(reference_points)
+                else:
+                    new_reference_points = tmp[..., :2] + inverse_sigmoid(reference_points)
+                reference_points = new_reference_points.sigmoid().detach()
+
+            if self.return_intermediate:
+                intermediate.append(output)
+                intermediate_reference_points.append(reference_points)
+
+        if self.return_intermediate:
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points)
+        return output, reference_points
+
+
 class BaseTransformerLayer(BaseModule):
     def __init__(
         self,
@@ -141,7 +195,9 @@ class BaseTransformerLayer(BaseModule):
             attn_masks = [None] * self.num_attn
         for layer in self.operation_order:
             if layer == "self_attn":
-                query = self.attentions[attn_i](query, query, query, identity if self.pre_norm else None, query_pos=query_pos, key_pos=query_pos, attn_mask=attn_masks[attn_i], **kwargs)
+                self_attn_kwargs = dict(kwargs)
+                self_attn_kwargs.pop("key_padding_mask", None)
+                query = self.attentions[attn_i](query, query, query, identity if self.pre_norm else None, query_pos=query_pos, key_pos=query_pos, attn_mask=attn_masks[attn_i], **self_attn_kwargs)
                 identity = query
                 attn_i += 1
             elif layer == "cross_attn":
@@ -237,8 +293,10 @@ def build_transformer_layer_sequence(cfg):
         return cfg
     cfg = dict(cfg)
     sequence_type = cfg.pop("type", None)
-    if sequence_type in ("TransformerLayerSequence", "DetrTransformerEncoder", "DetrTransformerDecoder", "DeformableDetrTransformerDecoder"):
+    if sequence_type in ("TransformerLayerSequence", "DetrTransformerEncoder", "DetrTransformerDecoder"):
         return TransformerLayerSequence(**cfg)
+    if sequence_type == "DeformableDetrTransformerDecoder":
+        return DeformableDetrTransformerDecoder(**cfg)
     if sequence_type == "BEVFormerEncoder":
         from uniad.models.modules.encoder import BEVFormerEncoder
 

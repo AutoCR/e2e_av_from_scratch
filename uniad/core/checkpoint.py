@@ -26,6 +26,16 @@ def normalize_state_dict_keys(state_dict):
 
 def load_state_dict(model, state_dict, strict=False):
     state_dict = normalize_state_dict_keys(state_dict)
+    skipped = []
+    if not strict:
+        model_state = model.state_dict()
+        filtered = OrderedDict()
+        for key, value in state_dict.items():
+            if key in model_state and tuple(model_state[key].shape) != tuple(value.shape):
+                skipped.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                continue
+            filtered[key] = value
+        state_dict = filtered
     incompatible = model.load_state_dict(state_dict, strict=False)
     missing = list(incompatible.missing_keys)
     unexpected = list(incompatible.unexpected_keys)
@@ -37,7 +47,7 @@ def load_state_dict(model, state_dict, strict=False):
             module.load_checkpoint_tensors(name, state_dict)
     if strict and (missing or unexpected):
         raise RuntimeError(f"Error(s) in loading state_dict: missing={missing}, unexpected={unexpected}")
-    return {"missing_keys": missing, "unexpected_keys": unexpected}
+    return {"missing_keys": missing, "unexpected_keys": unexpected, "skipped_mismatched_keys": skipped}
 
 
 def load_checkpoint(model, filename_or_checkpoint, map_location="cpu", strict=False):

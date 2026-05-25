@@ -135,7 +135,7 @@ class PerceptionTransformer(BaseModule):
                 prev_bev = prev_bev.permute(1, 0, 2)
             if self.rotate_prev_bev:
                 for i in range(bs):
-                    rotation_angle = img_metas[i]['can_bus'][-1]
+                    rotation_angle = float(img_metas[i]['can_bus'][-1])
                     tmp_prev_bev = prev_bev[:, i].reshape(
                         bev_h, bev_w, -1).permute(2, 0, 1)
                     tmp_prev_bev = rotate(tmp_prev_bev, rotation_angle,
