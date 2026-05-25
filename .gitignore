@@ -217,3 +217,5 @@ exp/*
 sparsedrive_model/data/*
 
 vis/
+
+sparsedrive_model/outputs/*

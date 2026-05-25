@@ -53,7 +53,7 @@ SPARSEDRIVE_STAGE1_HYPERPARAMS = {
     "decouple_attn_motion": True,
     "with_quality_estimation": True,
     "task_config": {"with_det": True, "with_map": True, "with_motion_plan": False},
-    "kmeans_dir": "./sparsedrive_model/data/kmeans",
+    "kmeans_dir": "./sparsedrive_model/data/kmeans_nuscenes",
     "backbone_pretrained": "model_weights/resnet50-19c8e357.pth",
     "backbone_with_cp": True,
     "fpn_out_channels": 256,
