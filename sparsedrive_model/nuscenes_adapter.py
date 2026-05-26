@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -243,6 +244,22 @@ class SparseDriveNuScenesSample:
         }
 
 
+@dataclass(frozen=True)
+class NuScenesSelectedLog:
+    token: str
+    name: str
+    location: Optional[str]
+    sample_tokens: tuple[str, ...]
+    scene_tokens: tuple[str, ...]
+    record: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class SparseDriveNuScenesLogSamples:
+    log: NuScenesSelectedLog
+    samples: tuple[SparseDriveNuScenesSample, ...]
+
+
 def image_hw_from_sparsedrive_input_shape(input_shape: Sequence[int]) -> tuple[int, int]:
     try:
         width, height = tuple(int(dim) for dim in input_shape)
@@ -472,6 +489,90 @@ def load_nuscenes_sparsedrive_samples(
     ]
 
 
+def selected_nuscenes_logs(
+    metadata: NuScenesMetadata,
+    log_tokens: Optional[Sequence[str]] = None,
+    log_names: Optional[Sequence[str]] = None,
+    max_logs: Optional[int] = None,
+    sampling_method: str = "sequential",
+    random_seed: Optional[int] = None,
+) -> tuple[NuScenesSelectedLog, ...]:
+    """Select nuScenes logs and resolve every keyframe sample token in each log."""
+
+    max_count = _validate_max_logs(max_logs)
+    method = _validate_log_sampling_method(sampling_method)
+    candidate_records = _candidate_log_records(metadata, log_tokens=log_tokens, log_names=log_names)
+
+    if method == "random":
+        sample_count = len(candidate_records) if max_count is None else min(max_count, len(candidate_records))
+        candidate_records = tuple(random.Random(random_seed).sample(list(candidate_records), sample_count))
+    elif max_count is not None:
+        candidate_records = candidate_records[:max_count]
+
+    if not candidate_records:
+        raise ValueError("No nuScenes logs selected.")
+    return tuple(_selected_log_from_record(metadata, record) for record in candidate_records)
+
+
+def discover_nuscenes_logs(metadata: NuScenesMetadata) -> tuple[NuScenesSelectedLog, ...]:
+    """Return all nuScenes logs in metadata order with their resolved sample tokens."""
+
+    return selected_nuscenes_logs(metadata=metadata)
+
+
+def sample_tokens_for_nuscenes_log(
+    metadata: NuScenesMetadata,
+    log: Union[str, Mapping[str, Any], NuScenesSelectedLog],
+) -> tuple[str, ...]:
+    """Return all keyframe sample tokens for a log token, logfile/name, or log record."""
+
+    if isinstance(log, NuScenesSelectedLog):
+        return log.sample_tokens
+    log_record = _coerce_log_record(metadata, log)
+    sample_tokens, _ = _sample_tokens_and_scene_tokens_for_log(metadata, log_record)
+    return sample_tokens
+
+
+def load_nuscenes_sparsedrive_log_samples(
+    dataset_root: PathLike = DEFAULT_NUSCENES_ROOT,
+    version: str = DEFAULT_VERSION,
+    log_tokens: Optional[Sequence[str]] = None,
+    log_names: Optional[Sequence[str]] = None,
+    max_logs: Optional[int] = None,
+    sampling_method: str = "sequential",
+    random_seed: Optional[int] = None,
+    camera_order: Sequence[str] = DEFAULT_CAMERA_ORDER,
+    image_hw: tuple[int, int] = DEFAULT_IMAGE_HW,
+    metadata: Optional[NuScenesMetadata] = None,
+) -> list[SparseDriveNuScenesLogSamples]:
+    """Load SparseDrive-ready samples for every keyframe in each selected log."""
+
+    metadata = metadata or load_nuscenes_metadata(dataset_root=dataset_root, version=version)
+    selected_logs = selected_nuscenes_logs(
+        metadata=metadata,
+        log_tokens=log_tokens,
+        log_names=log_names,
+        max_logs=max_logs,
+        sampling_method=sampling_method,
+        random_seed=random_seed,
+    )
+    return [
+        SparseDriveNuScenesLogSamples(
+            log=selected_log,
+            samples=tuple(
+                build_nuscenes_sparsedrive_sample(
+                    metadata=metadata,
+                    token=sample_token,
+                    camera_order=camera_order,
+                    image_hw=image_hw,
+                )
+                for sample_token in selected_log.sample_tokens
+            ),
+        )
+        for selected_log in selected_logs
+    ]
+
+
 def collate_nuscenes_sparsedrive_samples(samples: Sequence[SparseDriveNuScenesSample]) -> dict[str, Any]:
     if not samples:
         raise ValueError("At least one SparseDriveNuScenesSample is required to build a batch.")
@@ -543,6 +644,289 @@ def _require_field(record: Mapping[str, Any], field: str, table_name: str) -> An
         token = record.get("token", "<unknown>")
         raise KeyError(f"nuScenes {table_name} record {token!r} is missing required field {field!r}.")
     return record[field]
+
+
+def _candidate_log_records(
+    metadata: NuScenesMetadata,
+    log_tokens: Optional[Sequence[str]],
+    log_names: Optional[Sequence[str]],
+) -> tuple[Mapping[str, Any], ...]:
+    if not metadata.logs:
+        raise ValueError("nuScenes metadata contains no log records.")
+
+    requested_tokens = _normalize_optional_str_sequence(log_tokens, "log_tokens")
+    requested_names = _normalize_optional_str_sequence(log_names, "log_names")
+    if requested_tokens is None and requested_names is None:
+        return tuple(metadata.logs)
+    if not requested_tokens and not requested_names:
+        raise ValueError("At least one log token or log name must be provided for explicit log selection.")
+
+    selected_tokens: set[str] = set()
+    for log_token in requested_tokens or ():
+        if log_token not in metadata.log_by_token:
+            raise KeyError(f"Unknown nuScenes log token {log_token!r}.")
+        selected_tokens.add(log_token)
+
+    logs_by_name = _log_records_by_name(metadata)
+    for log_name in requested_names or ():
+        matches = logs_by_name.get(log_name, ())
+        if not matches:
+            raise KeyError(f"Unknown nuScenes log name {log_name!r}.")
+        if len(matches) > 1:
+            tokens = ", ".join(str(_require_field(record, "token", "log")) for record in matches)
+            raise ValueError(f"nuScenes log name {log_name!r} is ambiguous; matched tokens: {tokens}.")
+        selected_tokens.add(str(_require_field(matches[0], "token", "log")))
+
+    return tuple(
+        log_record
+        for log_record in metadata.logs
+        if str(_require_field(log_record, "token", "log")) in selected_tokens
+    )
+
+
+def _selected_log_from_record(metadata: NuScenesMetadata, log_record: Mapping[str, Any]) -> NuScenesSelectedLog:
+    sample_tokens, scene_tokens = _sample_tokens_and_scene_tokens_for_log(metadata, log_record)
+    return NuScenesSelectedLog(
+        token=str(_require_field(log_record, "token", "log")),
+        name=_log_record_name(log_record),
+        location=_optional_string(log_record.get("location")),
+        sample_tokens=sample_tokens,
+        scene_tokens=scene_tokens,
+        record=log_record,
+    )
+
+
+def _sample_tokens_and_scene_tokens_for_log(
+    metadata: NuScenesMetadata,
+    log_record: Mapping[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    scene_records = _ordered_scene_records_for_log(metadata, log_record)
+    if not scene_records:
+        raise ValueError(f"nuScenes log {_format_log_context(log_record)} contains no scenes.")
+
+    sample_tokens: list[str] = []
+    scene_tokens: list[str] = []
+    for scene_record in scene_records:
+        scene_token = str(_require_field(scene_record, "token", "scene"))
+        scene_sample_tokens = _sample_tokens_for_scene(metadata, scene_record)
+        if not scene_sample_tokens:
+            raise ValueError(f"nuScenes scene {scene_token!r} in log {_format_log_context(log_record)} is empty.")
+        sample_tokens.extend(scene_sample_tokens)
+        scene_tokens.append(scene_token)
+
+    if not sample_tokens:
+        raise ValueError(f"nuScenes log {_format_log_context(log_record)} contains no keyframe samples.")
+    return tuple(sample_tokens), tuple(scene_tokens)
+
+
+def _ordered_scene_records_for_log(
+    metadata: NuScenesMetadata,
+    log_record: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    log_token = str(_require_field(log_record, "token", "log"))
+    ordered_scenes: list[tuple[float, int, Mapping[str, Any]]] = []
+    for scene_order, scene_record in enumerate(metadata.scenes):
+        if str(scene_record.get("log_token", "")) != log_token:
+            continue
+        first_sample_token = _require_non_empty_string_field(scene_record, "first_sample_token", "scene")
+        first_sample = _lookup_scene_sample(metadata, scene_record, first_sample_token, "first_sample_token")
+        try:
+            first_timestamp = float(_require_field(first_sample, "timestamp", "sample"))
+        except (TypeError, ValueError) as exc:
+            scene_token = scene_record.get("token", "<unknown>")
+            raise TypeError(f"nuScenes scene {scene_token!r} first sample timestamp must be numeric.") from exc
+        ordered_scenes.append((first_timestamp, scene_order, scene_record))
+
+    ordered_scenes.sort(key=lambda item: (item[0], item[1]))
+    return tuple(scene_record for _, _, scene_record in ordered_scenes)
+
+
+def _sample_tokens_for_scene(
+    metadata: NuScenesMetadata,
+    scene_record: Mapping[str, Any],
+) -> tuple[str, ...]:
+    scene_token = str(_require_field(scene_record, "token", "scene"))
+    first_token = _require_non_empty_string_field(scene_record, "first_sample_token", "scene")
+    last_token = _require_non_empty_string_field(scene_record, "last_sample_token", "scene")
+    _lookup_scene_sample(metadata, scene_record, first_token, "first_sample_token")
+    _lookup_scene_sample(metadata, scene_record, last_token, "last_sample_token")
+
+    cursor_token = first_token
+    seen: set[str] = set()
+    sample_tokens: list[str] = []
+    while True:
+        if cursor_token in seen:
+            raise ValueError(
+                f"nuScenes scene {scene_token!r} sample next traversal contains a cycle at {cursor_token!r}."
+            )
+        seen.add(cursor_token)
+
+        sample_record = _lookup_scene_sample(metadata, scene_record, cursor_token, "sample next traversal")
+        sample_scene_token = str(_require_field(sample_record, "scene_token", "sample"))
+        if sample_scene_token != scene_token:
+            raise ValueError(
+                f"nuScenes scene {scene_token!r} sample chain reached sample {cursor_token!r} "
+                f"from scene {sample_scene_token!r}."
+            )
+        sample_tokens.append(cursor_token)
+
+        next_token = _optional_string(sample_record.get("next"))
+        if cursor_token == last_token:
+            if next_token:
+                if next_token in seen:
+                    raise ValueError(
+                        f"nuScenes scene {scene_token!r} sample next traversal contains a cycle at "
+                        f"{next_token!r} after last_sample_token {last_token!r}."
+                    )
+                raise ValueError(
+                    f"nuScenes scene {scene_token!r} last_sample_token {last_token!r} has non-empty "
+                    f"next token {next_token!r}."
+                )
+            break
+        if not next_token:
+            raise ValueError(
+                f"nuScenes scene {scene_token!r} sample chain ended at {cursor_token!r} "
+                f"before last_sample_token {last_token!r}."
+            )
+        cursor_token = next_token
+
+    expected_samples = scene_record.get("nbr_samples")
+    if expected_samples is not None:
+        expected_count = _optional_int(expected_samples, f"nuScenes scene {scene_token!r} nbr_samples")
+        if expected_count < 0:
+            raise ValueError(f"nuScenes scene {scene_token!r} nbr_samples must be non-negative.")
+        if expected_count != len(sample_tokens):
+            raise ValueError(
+                f"nuScenes scene {scene_token!r} declares {expected_count} samples but traversal found "
+                f"{len(sample_tokens)}."
+            )
+    return tuple(sample_tokens)
+
+
+def _coerce_log_record(
+    metadata: NuScenesMetadata,
+    log: Union[str, Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    if isinstance(log, Mapping):
+        log_token = str(_require_field(log, "token", "log"))
+        return _lookup_record(metadata.log_by_token, log_token, "log")
+
+    log_identifier = str(log)
+    if not log_identifier:
+        raise ValueError("nuScenes log token/name must be non-empty.")
+    if log_identifier in metadata.log_by_token:
+        return metadata.log_by_token[log_identifier]
+
+    matches = _log_records_by_name(metadata).get(log_identifier, ())
+    if not matches:
+        raise KeyError(f"Unknown nuScenes log token/name {log_identifier!r}.")
+    if len(matches) > 1:
+        tokens = ", ".join(str(_require_field(record, "token", "log")) for record in matches)
+        raise ValueError(f"nuScenes log name {log_identifier!r} is ambiguous; matched tokens: {tokens}.")
+    return matches[0]
+
+
+def _lookup_scene_sample(
+    metadata: NuScenesMetadata,
+    scene_record: Mapping[str, Any],
+    sample_token: str,
+    field: str,
+) -> Mapping[str, Any]:
+    try:
+        return metadata.get_sample(sample_token)
+    except KeyError as exc:
+        scene_token = scene_record.get("token", "<unknown>")
+        raise KeyError(
+            f"nuScenes scene {scene_token!r} {field} references unknown sample token {sample_token!r}."
+        ) from exc
+
+
+def _normalize_optional_str_sequence(values: Optional[Sequence[str]], label: str) -> Optional[tuple[str, ...]]:
+    if values is None:
+        return None
+    raw_values: Sequence[Any]
+    if isinstance(values, str):
+        raw_values = (values,)
+    else:
+        try:
+            raw_values = tuple(values)
+        except TypeError as exc:
+            raise TypeError(f"{label} must be a sequence of non-empty strings.") from exc
+
+    normalized: list[str] = []
+    for value in raw_values:
+        if value is None:
+            raise ValueError(f"{label} entries must be non-empty strings.")
+        text = str(value)
+        if not text:
+            raise ValueError(f"{label} entries must be non-empty strings.")
+        normalized.append(text)
+    return tuple(normalized)
+
+
+def _validate_max_logs(max_logs: Optional[int]) -> Optional[int]:
+    if max_logs is None:
+        return None
+    if isinstance(max_logs, bool) or not isinstance(max_logs, int):
+        raise TypeError(f"max_logs must be a positive integer or None, got {max_logs!r}.")
+    if max_logs <= 0:
+        raise ValueError(f"max_logs must be positive or None, got {max_logs!r}.")
+    return max_logs
+
+
+def _validate_log_sampling_method(sampling_method: str) -> str:
+    if not isinstance(sampling_method, str):
+        raise TypeError(f"sampling_method must be 'sequential' or 'random', got {sampling_method!r}.")
+    method = sampling_method.lower()
+    if method not in {"sequential", "random"}:
+        raise ValueError(f"Unsupported nuScenes log sampling_method {sampling_method!r}; expected 'sequential' or 'random'.")
+    return method
+
+
+def _log_records_by_name(metadata: NuScenesMetadata) -> dict[str, tuple[Mapping[str, Any], ...]]:
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for log_record in metadata.logs:
+        for name in _log_record_name_aliases(log_record):
+            grouped[name].append(log_record)
+    return {name: tuple(records) for name, records in grouped.items()}
+
+
+def _log_record_name(log_record: Mapping[str, Any]) -> str:
+    return _log_record_name_aliases(log_record)[0]
+
+
+def _log_record_name_aliases(log_record: Mapping[str, Any]) -> tuple[str, ...]:
+    aliases: list[str] = []
+    for field in ("name", "logfile"):
+        value = _optional_string(log_record.get(field))
+        if value:
+            aliases.append(value)
+    if not aliases:
+        aliases.append(str(_require_field(log_record, "token", "log")))
+    return tuple(dict.fromkeys(aliases))
+
+
+def _format_log_context(log_record: Mapping[str, Any]) -> str:
+    token = str(log_record.get("token", "<unknown>"))
+    name = _log_record_name(log_record)
+    location = _optional_string(log_record.get("location"))
+    location_text = f", location={location!r}" if location else ""
+    return f"name={name!r}, token={token!r}{location_text}"
+
+
+def _require_non_empty_string_field(record: Mapping[str, Any], field: str, table_name: str) -> str:
+    value = _optional_string(_require_field(record, field, table_name))
+    if not value:
+        token = record.get("token", "<unknown>")
+        raise ValueError(f"nuScenes {table_name} record {token!r} has empty required field {field!r}.")
+    return value
+
+
+def _optional_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _group_sample_data_by_sample_channel(
@@ -1045,13 +1429,19 @@ __all__ = [
     "NuScenesFutureObstacleTrajectory",
     "NuScenesLidarAnnotation",
     "NuScenesMetadata",
+    "NuScenesSelectedLog",
+    "SparseDriveNuScenesLogSamples",
     "SparseDriveNuScenesSample",
     "build_nuscenes_sparsedrive_sample",
     "collate_nuscenes_sparsedrive_samples",
+    "discover_nuscenes_logs",
     "image_hw_from_sparsedrive_input_shape",
     "load_nuscenes_metadata",
+    "load_nuscenes_sparsedrive_log_samples",
     "load_nuscenes_sparsedrive_sample",
     "load_nuscenes_sparsedrive_samples",
     "normalize_camera_order",
+    "sample_tokens_for_nuscenes_log",
     "sample_to_device",
+    "selected_nuscenes_logs",
 ]

@@ -198,25 +198,45 @@ def visualize_nuscenes_inference(
     filename: Optional[str] = None,
     dpi: int = 150,
     close: bool = True,
+    layout: str = "vertical",
 ) -> Path:
     """Render and save a two-panel SparseDrive nuScenes inference BEV figure."""
 
     output_path = _figure_output_path(sample, output_dir, filename)
-    fig, axes = plt.subplots(2, 1, figsize=(8, 13))
+    fig = render_nuscenes_inference_figure(
+        sample,
+        decoded_prediction,
+        summary=summary,
+        layout=layout,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    if close:
+        plt.close(fig)
+    return output_path
 
-    _plot_prediction_panel(axes[0], sample, decoded_prediction, summary=summary)
-    _plot_ground_truth_panel(axes[1], sample)
+
+def render_nuscenes_inference_figure(
+    sample: Any,
+    decoded_prediction: DecodedSparseDrivePrediction,
+    *,
+    summary: Optional[Mapping[str, Any]] = None,
+    layout: str = "vertical",
+) -> plt.Figure:
+    """Render a SparseDrive nuScenes inference BEV figure without saving it."""
+
+    fig, axes = _create_nuscenes_inference_figure(layout)
+    prediction_ax, ground_truth_ax = axes
+
+    _plot_prediction_panel(prediction_ax, sample, decoded_prediction, summary=summary)
+    _plot_ground_truth_panel(ground_truth_ax, sample)
 
     for ax in axes:
         _configure_bev_axis(ax)
 
     fig.suptitle(f"SparseDrive nuScenes inference: {_sample_token(sample)}", fontsize=12)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
-    if close:
-        plt.close(fig)
-    return output_path
+    return fig
 
 
 def visualize_nuscenes_sparsedrive_predictions(
@@ -226,6 +246,7 @@ def visualize_nuscenes_sparsedrive_predictions(
     decoded_predictions: Optional[Sequence[DecodedSparseDrivePrediction]] = None,
     summaries: Optional[Sequence[Mapping[str, Any]]] = None,
     output_dir: PathLike,
+    layout: str = "vertical",
 ) -> list[Path]:
     """Batch-compatible helper used by sparsedrive_model/test_nuscenes_mini.py."""
 
@@ -237,9 +258,22 @@ def visualize_nuscenes_sparsedrive_predictions(
             prediction,
             output_dir,
             summary=summary,
+            layout=layout,
         )
         for sample, prediction, summary in zip(samples, predictions, normalized_summaries)
     ]
+
+
+def _create_nuscenes_inference_figure(layout: str) -> tuple[plt.Figure, tuple[plt.Axes, plt.Axes]]:
+    if layout == "vertical":
+        fig, axes = plt.subplots(2, 1, figsize=(8, 13))
+    elif layout == "horizontal":
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6.5))
+    else:
+        raise ValueError(f"Unsupported layout {layout!r}; expected 'vertical' or 'horizontal'.")
+
+    axes_tuple = tuple(np.asarray(axes, dtype=object).reshape(-1))
+    return fig, (axes_tuple[0], axes_tuple[1])
 
 
 def _plot_prediction_panel(
@@ -1402,6 +1436,7 @@ def _sanitize_filename(value: str) -> str:
 
 
 __all__ = [
+    "render_nuscenes_inference_figure",
     "visualize_nuscenes_inference",
     "visualize_nuscenes_sparsedrive_predictions",
 ]
