@@ -23,7 +23,7 @@ DEFAULT_IMAGE_MEAN = (0.485, 0.456, 0.406)
 DEFAULT_IMAGE_STD = (0.229, 0.224, 0.225)
 DEFAULT_NUM_FUTURE_STEPS = 6
 DEFAULT_LATERAL_COMMAND_THRESHOLD_METERS = 2.0
-DEFAULT_GT_EGO_FUT_CMD = (1.0, 0.0, 0.0)
+DEFAULT_GT_EGO_FUT_CMD = (0.0, 0.0, 1.0)
 DEFAULT_LIDAR_CHANNEL = "LIDAR_TOP"
 
 DEFAULT_CAMERA_ORDER = (
@@ -1037,7 +1037,7 @@ def _resize_crop_image(
     resized_w = max(target_w, int(math.ceil(src_w * scale)))
     resized_h = max(target_h, int(math.ceil(src_h * scale)))
     crop_left = (resized_w - target_w) // 2
-    crop_top = (resized_h - target_h) // 2
+    crop_top = resized_h - target_h
 
     resampling = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
     resized = image.resize((resized_w, resized_h), resampling)
@@ -1378,7 +1378,7 @@ def _build_gt_ego_fut_cmd(
     future_lidar_origins: torch.Tensor,
     lateral_command_threshold_meters: float,
 ) -> torch.Tensor:
-    """Build SparseDrive [straight, left, right] command from raw LIDAR_TOP offsets.
+    """Build SparseDrive [right, left, straight] command from raw LIDAR_TOP offsets.
 
     Raw nuScenes LIDAR_TOP XY here has +x to ego-right and +y to ego-forward, so
     lateral turn direction must be derived from raw x, not raw y.
@@ -1389,11 +1389,11 @@ def _build_gt_ego_fut_cmd(
 
     final_right_offset = float(future_lidar_origins[-1, 0].item())
     sparse_idx = (
-        1
-        if final_right_offset < -lateral_command_threshold_meters
+        0
+        if final_right_offset >= lateral_command_threshold_meters
+        else 1
+        if final_right_offset <= -lateral_command_threshold_meters
         else 2
-        if final_right_offset > lateral_command_threshold_meters
-        else 0
     )
     command = np.zeros(3, dtype=np.float32)
     command[sparse_idx] = 1.0
