@@ -19,6 +19,18 @@ DYNAMIC_CLASSES = {"car", "truck", "construction_vehicle", "bus", "trailer",
                    "motorcycle", "bicycle", "pedestrian"}
 HEADING_IDX = 6
 
+# NavSim/NuPlan uses consolidated class names; map them to SparseDrive taxonomy
+# before checking DYNAMIC_CLASSES / looking up CLASSES index.
+_NAVSIM_TO_SPARSEDRIVE = {
+    "vehicle": "car",
+    "pedestrian": "pedestrian",
+    "bicycle": "bicycle",
+    "traffic_cone": "traffic_cone",
+    "barrier": "barrier",
+    "generic_object": None,
+    "czone_sign": None,
+}
+
 
 def _process_seq(args_tuple):
     seq, dis_thresh, future_steps = args_tuple
@@ -53,8 +65,8 @@ def _process_seq(args_tuple):
                 token_to_future[ftok].append(local_to_global_xy(fp, fbox[:2]))
 
         for box, name, tok in zip(boxes, names, tokens):
-            cls_name = str(name)
-            if cls_name not in DYNAMIC_CLASSES:
+            cls_name = _NAVSIM_TO_SPARSEDRIVE.get(str(name), str(name))
+            if cls_name is None or cls_name not in DYNAMIC_CLASSES:
                 continue
             cls_idx = CLASSES.index(cls_name)
 
@@ -118,7 +130,7 @@ def main():
 
     intention = _merge_intentions(results, len(CLASSES))
 
-    clusters_list = []
+    result = np.zeros((len(CLASSES), args.k, args.future_steps, 2), dtype=np.float64)
     for i, cls_name in enumerate(CLASSES):
         trajs = intention[i]
         if len(trajs) < args.k:
@@ -127,7 +139,7 @@ def main():
         trajs_arr = np.stack(trajs, axis=0).reshape(len(trajs), -1)
         cluster = KMeans(n_clusters=args.k, random_state=42).fit(trajs_arr).cluster_centers_
         cluster = cluster.reshape(args.k, args.future_steps, 2)
-        clusters_list.append(cluster)
+        result[i] = cluster
 
         plt.figure()
         for j in range(args.k):
@@ -136,7 +148,6 @@ def main():
         plt.close()
         print(f"  {cls_name}: {len(trajs)} samples → {args.k} clusters")
 
-    result = np.stack(clusters_list, axis=0)
     out_path = os.path.join(args.out_dir, f"kmeans_motion_{args.k}.npy")
     np.save(out_path, result)
     print(f"Saved {result.shape} to {out_path}")
