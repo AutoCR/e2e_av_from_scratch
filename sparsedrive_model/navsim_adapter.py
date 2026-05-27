@@ -39,9 +39,9 @@ VALID_NAVSIM_CAMERA_NAMES = (
     "CAM_B0",
 )
 
-# NAVSIM provides eight cameras, while this SparseDrive port is configured for
-# exactly six. Edit this constant to choose a different six-camera subset/order,
-# but keep exactly six valid NAVSIM camera names from VALID_NAVSIM_CAMERA_NAMES.
+# SparseDrive's original nuScenes recipe uses six cameras; keep that default for
+# backward compatibility. The NAVSIM training port can opt into all eight cameras
+# via DEFAULT_CAMERA_ORDER_8.
 DEFAULT_CAMERA_ORDER = (
     "CAM_F0",  # front
     "CAM_R0",  # front/right side
@@ -49,6 +49,16 @@ DEFAULT_CAMERA_ORDER = (
     "CAM_B0",  # rear
     "CAM_L2",  # rear/left side
     "CAM_R2",  # rear/right side
+)
+DEFAULT_CAMERA_ORDER_8 = (
+    "CAM_F0",
+    "CAM_L0",
+    "CAM_L1",
+    "CAM_R0",
+    "CAM_R1",
+    "CAM_L2",
+    "CAM_R2",
+    "CAM_B0",
 )
 
 # SparseDrive's planning branch indexes commands as [straight, left, right].
@@ -168,8 +178,8 @@ def _normalize_camera_name(camera_name: str) -> str:
 
 def normalize_camera_order(camera_order: Sequence[str] = DEFAULT_CAMERA_ORDER) -> tuple[str, ...]:
     normalized = tuple(_normalize_camera_name(camera) for camera in camera_order)
-    if len(normalized) != 6:
-        raise ValueError(f"SparseDrive requires exactly six cameras, got {len(normalized)}: {normalized}")
+    if len(normalized) not in {6, 8}:
+        raise ValueError(f"SparseDrive requires either six or eight cameras, got {len(normalized)}: {normalized}")
     if len(set(normalized)) != len(normalized):
         raise ValueError(f"Camera order must not contain duplicates: {normalized}")
     return normalized
@@ -499,6 +509,7 @@ def sample_to_device(data: Any, device: Union[str, torch.device], non_blocking: 
 
 __all__ = [
     "DEFAULT_CAMERA_ORDER",
+    "DEFAULT_CAMERA_ORDER_8",
     "DEFAULT_GT_EGO_FUT_CMD",
     "DEFAULT_IMAGE_HW",
     "NavSimPathConfig",
