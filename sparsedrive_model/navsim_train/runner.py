@@ -28,6 +28,7 @@ from sparsedrive_model.navsim_train.amp import Fp16Wrapper
 from sparsedrive_model.configs.sparsedrive_hyperparams import get_stage_hyperparams
 from sparsedrive_model.navsim_train.eval_hook import run_eval
 from sparsedrive_model.navsim_train.optim import CosineWithLinearWarmup, build_optimizer, clip_grad_norm
+from sparsedrive_model.navsim_train.scene_filter_loader import load_log_names, load_scene_filter_fields
 from sparsedrive_model.sparsedrive import SparseDrive
 from sparsedrive_model.sparsedrive import nn_utils as _sparsedrive_nn_utils
 
@@ -108,7 +109,48 @@ def _load_data_api():
     return NavSimSparseDriveDataset, build_dataloader, collate_fn
 
 
-def _build_dataset(dataset_cls, *, split, config, test_mode, max_scenes):
+def _resolve_split_config(split_config, repo_root=None):
+    """Resolve a split config entry to (directory_name, log_names_or_None, tokens_or_None).
+
+    Accepts:
+    - str: directory name only, no filtering applied.
+    - dict with keys:
+        - "dir": directory name under navsim_logs/ (required)
+        - "log_names_yaml": YAML path for log names (optional, relative to repo_root or absolute)
+        - "log_names_key": key in log_names_yaml; defaults to "log_names" (optional)
+        - "tokens_yaml": YAML path for scene tokens (optional, may differ from log_names_yaml)
+        - "tokens_key": key in tokens_yaml; defaults to "tokens" (optional)
+      Omitting or setting a yaml field to None disables that filter.
+    """
+    if isinstance(split_config, str):
+        return split_config, None, None
+
+    dir_name = split_config["dir"]
+
+    def _resolve_path(yaml_path_str):
+        if yaml_path_str is None:
+            return None
+        p = Path(yaml_path_str)
+        if not p.is_absolute() and repo_root is not None:
+            p = Path(repo_root) / p
+        return p
+
+    log_names = None
+    log_names_yaml = _resolve_path(split_config.get("log_names_yaml"))
+    if log_names_yaml is not None:
+        log_names_key = split_config.get("log_names_key", "log_names")
+        log_names, _ = load_scene_filter_fields(log_names_yaml, log_names_key=log_names_key, tokens_key=None)
+
+    tokens = None
+    tokens_yaml = _resolve_path(split_config.get("tokens_yaml"))
+    if tokens_yaml is not None:
+        tokens_key = split_config.get("tokens_key", "tokens")
+        _, tokens = load_scene_filter_fields(tokens_yaml, log_names_key=None, tokens_key=tokens_key)
+
+    return dir_name, log_names, tokens
+
+
+def _build_dataset(dataset_cls, *, split, config, test_mode, max_scenes, log_names=None, tokens=None):
     kwargs = {
         "split": split,
         "openscene_data_root": config["openscene_data_root"],
@@ -118,6 +160,10 @@ def _build_dataset(dataset_cls, *, split, config, test_mode, max_scenes):
     }
     if max_scenes is not None:
         kwargs["max_scenes"] = max_scenes
+    if log_names is not None:
+        kwargs["log_names"] = log_names
+    if tokens is not None:
+        kwargs["tokens"] = tokens
     try:
         return dataset_cls(**kwargs)
     except TypeError:
@@ -271,9 +317,39 @@ def run(config: dict):
     NavSimSparseDriveDataset, build_dataloader_fn, collate_fn_fn = _load_data_api()
     max_scenes = 2 if config.get("quick_smoke") else None
     splits = config["splits"]
-    train_dataset = _build_dataset(NavSimSparseDriveDataset, split=splits["train"], config=config, test_mode=False, max_scenes=max_scenes)
-    val_dataset = _build_dataset(NavSimSparseDriveDataset, split=splits["val"], config=config, test_mode=True, max_scenes=max_scenes)
-    test_dataset = _build_dataset(NavSimSparseDriveDataset, split=splits["test"], config=config, test_mode=True, max_scenes=max_scenes)
+    _REPO_ROOT_RUNNER = Path(__file__).resolve().parents[2]
+
+    train_split_dir, train_log_names, train_tokens = _resolve_split_config(splits["train"], _REPO_ROOT_RUNNER)
+    val_split_dir, val_log_names, val_tokens = _resolve_split_config(splits["val"], _REPO_ROOT_RUNNER)
+    test_split_dir, test_log_names, test_tokens = _resolve_split_config(splits["test"], _REPO_ROOT_RUNNER)
+
+    train_dataset = _build_dataset(
+        NavSimSparseDriveDataset,
+        split=train_split_dir,
+        config=config,
+        test_mode=False,
+        max_scenes=max_scenes,
+        log_names=train_log_names,
+        tokens=train_tokens,
+    )
+    val_dataset = _build_dataset(
+        NavSimSparseDriveDataset,
+        split=val_split_dir,
+        config=config,
+        test_mode=True,
+        max_scenes=max_scenes,
+        log_names=val_log_names,
+        tokens=val_tokens,
+    )
+    test_dataset = _build_dataset(
+        NavSimSparseDriveDataset,
+        split=test_split_dir,
+        config=config,
+        test_mode=True,
+        max_scenes=max_scenes,
+        log_names=test_log_names,
+        tokens=test_tokens,
+    )
     train_sampler = _build_sampler(train_dataset, shuffle=True)
 
     train_loader = _build_loader(

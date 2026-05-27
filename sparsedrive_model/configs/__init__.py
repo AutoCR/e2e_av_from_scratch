@@ -1,4 +1,4 @@
-from sparsedrive import SparseDrive
+from sparsedrive_model.sparsedrive import SparseDrive
 
 from .sparsedrive_hyperparams import get_stage1_hyperparams, get_stage2_hyperparams
 

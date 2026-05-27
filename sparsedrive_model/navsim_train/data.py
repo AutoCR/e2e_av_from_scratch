@@ -5,7 +5,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, List, Mapping, Optional, Sequence
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -199,6 +199,8 @@ class NavSimSparseDriveDataset(Dataset):
         image_hw: tuple[int, int] = (256, 704),
         test_mode: bool = False,
         max_scenes: int | None = None,
+        log_names: Optional[List[str]] = None,
+        tokens: Optional[List[str]] = None,
         augment: bool = True,
         with_seq_flag: bool = True,
         sequences_split_num: int | str = 2,
@@ -211,6 +213,8 @@ class NavSimSparseDriveDataset(Dataset):
         self.num_future_frames = int(num_future_frames)
         self.image_hw = tuple(int(x) for x in image_hw)
         self.test_mode = bool(test_mode)
+        self.log_names = log_names
+        self.tokens = tokens
         self.augment_enabled = bool(augment) and not self.test_mode
         self.with_seq_flag = bool(with_seq_flag)
         self.sequences_split_num = sequences_split_num
@@ -226,8 +230,10 @@ class NavSimSparseDriveDataset(Dataset):
             num_history_frames=self.num_history_frames,
             num_future_frames=self.num_future_frames,
             max_scenes=max_scenes,
+            log_names=log_names,
+            tokens=tokens,
         )
-        self.tokens = list(self.scene_loader.tokens)
+        self.scene_tokens = list(self.scene_loader.tokens)
         self._subseq_for_index, self._subseq_to_indices = self._build_subseq_index()
         self.resize_aug = ResizeCropFlipImage(DATA_AUG_CONF, test_mode=self.test_mode)
         self.photo_aug = PhotoMetricDistortionMultiViewImage()
@@ -236,7 +242,7 @@ class NavSimSparseDriveDataset(Dataset):
         self.depth_generator = MultiScaleDepthMapGenerator(downsample=(4, 8, 16))
 
     def __len__(self) -> int:
-        return len(self.tokens)
+        return len(self.scene_tokens)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -247,7 +253,7 @@ class NavSimSparseDriveDataset(Dataset):
 
     def _build_subseq_index(self) -> tuple[dict[int, int], dict[int, list[int]]]:
         groups: dict[str, list[int]] = {}
-        for idx, token in enumerate(self.tokens):
+        for idx, token in enumerate(self.scene_tokens):
             frames = self.scene_loader.scene_frames_dicts[token]
             log_name = str(frames[0].get("log_name", "default"))
             groups.setdefault(log_name, []).append(idx)
@@ -336,7 +342,7 @@ class NavSimSparseDriveDataset(Dataset):
         return torch.stack(imgs), torch.stack(projection), torch.stack(image_wh), torch.tensor(focal, dtype=torch.float32)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        token = self.tokens[int(index)]
+        token = self.scene_tokens[int(index)]
         frame_list = self.scene_loader.scene_frames_dicts[token]
         current_index = self.num_history_frames - 1
         current_frame = frame_list[current_index]
