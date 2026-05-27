@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 import os
+from tqdm import tqdm
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -422,6 +423,14 @@ def run(config: dict):
     ckpt_cadence = max(1, num_iters_per_epoch * int(recipe["ckpt_epoch_interval"]))
 
     iteration = start_iter
+    pbar = tqdm(
+        total=max_iters,
+        initial=start_iter,
+        desc="Training",
+        unit="iter",
+        dynamic_ncols=True,
+        disable=not _is_main_process(),
+    )
     try:
         for _epoch in range(int(recipe["num_epochs"])):
             if train_sampler is not None:
@@ -448,17 +457,25 @@ def run(config: dict):
                 scheduler.step(iteration + 1)
                 global_iter = iteration + 1
 
+                pbar.update(1)
                 if global_iter % int(recipe["log_interval"]) == 0:
                     losses_for_log = {k: float(v.detach().cpu()) for k, v in loss_dict.items() if torch.is_tensor(v)}
+                    lr = optimizer.param_groups[-1]["lr"]
+                    pbar.set_description(f"Epoch [{_epoch + 1}/{int(recipe['num_epochs'])}]")
+                    pbar.set_postfix(
+                        loss=f"{float(loss.detach().cpu()):.4f}",
+                        lr=f"{lr:.2e}",
+                        grad_norm=f"{float(grad_norm):.3f}",
+                    )
                     if _is_main_process():
                         writer.add_scalar("train/loss_total", float(loss.detach().cpu()), global_iter)
-                        writer.add_scalar("train/lr", optimizer.param_groups[-1]["lr"], global_iter)
+                        writer.add_scalar("train/lr", lr, global_iter)
                         writer.add_scalar("train/grad_norm", float(grad_norm), global_iter)
                         for key, value in losses_for_log.items():
                             writer.add_scalar(f"train/{key}", value, global_iter)
-                        print(
+                        tqdm.write(
                             f"iter={global_iter}/{max_iters} loss={float(loss.detach().cpu()):.6f} "
-                            f"lr={optimizer.param_groups[-1]['lr']:.8f} grad_norm={float(grad_norm):.4f}"
+                            f"lr={lr:.8f} grad_norm={float(grad_norm):.4f}"
                         )
 
                 if global_iter % eval_cadence == 0 and _is_main_process():
@@ -478,6 +495,7 @@ def run(config: dict):
             print(f"final_val@{final_iter}: {run_eval(model, val_loader, device, output_dir, writer, final_iter, recipe['eval_mode'], 'val_final')}")
             print(f"final_test@{final_iter}: {run_eval(model, test_loader, device, output_dir, writer, final_iter, recipe['eval_mode'], 'test_final')}")
     finally:
+        pbar.close()
         _cleanup_distributed()
         if writer is not None:
             writer.flush()
