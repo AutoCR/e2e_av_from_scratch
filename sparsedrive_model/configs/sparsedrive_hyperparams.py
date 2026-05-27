@@ -8,12 +8,12 @@ from copy import deepcopy
 RUNTIME_CONFIG = {
     "stage": "stage1",              # "stage1" (det+map pre-train) or "stage2" (full fine-tune)
     "splits": {
-        "train": "mini",            # "mini" (323 scenes) or "trainval" (28130 scenes)
-        "val": "mini",
-        "test": "mini",
+        "train": "trainval",            # "mini" (323 scenes) or "trainval" (28130 scenes)
+        "val": "test",
+        "test": "test",
     },
-    "openscene_data_root": "/Users/chenran/Code/navsim/dataset",
-    "nuplan_maps_root": "/Users/chenran/Code/navsim/dataset/maps",
+    "openscene_data_root": "/prediction_database/navsim",
+    "nuplan_maps_root": "/prediction_database/nuplan/dataset/maps",
     "output_dir": "sparsedrive_model/outputs/train_navsim",
     "load_from": None,              # Path to a checkpoint to init weights (stage2: "ckpt/sparsedrive_stage1.pth")
     "resume_from": None,            # Path to a full checkpoint to resume interrupted training
@@ -134,8 +134,8 @@ MODEL_ARCH = {
     "with_quality_estimation": True,
     "task_config": {"with_det": True, "with_map": True, "with_motion_plan": False},
     # --- Paths ---
-    "kmeans_dir": "./sparsedrive_model/data/kmeans_nuscenes",
-    "backbone_pretrained": "model_weights/resnet50-19c8e357.pth",
+    "kmeans_dir": "./sparsedrive_model/data/kmeans",
+    "backbone_pretrained": "model_weights/resnet50/resnet50-19c8e357.pth",
     # --- Backbone ---
     "backbone_with_cp": True,       # Use gradient checkpointing in backbone
     # --- FPN ---
