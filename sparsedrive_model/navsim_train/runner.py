@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 import random
 import shutil
 import sys
@@ -272,48 +271,54 @@ def run(config: dict):
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     writer = SummaryWriter(log_dir=str(output_dir / "tb" / f"{stage}_{timestamp}"))
-    train_iter = itertools.cycle(train_loader)
     eval_cadence = max(1, num_iters_per_epoch * int(recipe["eval_epoch_interval"]))
     ckpt_cadence = max(1, num_iters_per_epoch * int(recipe["ckpt_epoch_interval"]))
 
+    iteration = start_iter
     try:
-        for iteration in range(start_iter, max_iters):
-            model.train()
-            raw_batch = next(train_iter)
-            if not isinstance(raw_batch, dict) or "img" not in raw_batch:
-                raise KeyError("Training batches must be dicts containing an 'img' tensor.")
-            batch = _move_to_device(raw_batch, device)
-            img = batch.pop("img")
-            optimizer.zero_grad(set_to_none=True)
-            with scaler.autocast():
-                loss_dict = model(img=img, **batch)
-                loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = clip_grad_norm(model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step(iteration + 1)
-            global_iter = iteration + 1
+        for _epoch in range(int(recipe["num_epochs"])):
+            for raw_batch in train_loader:
+                if iteration >= max_iters:
+                    break
+                model.train()
+                if not isinstance(raw_batch, dict) or "img" not in raw_batch:
+                    raise KeyError("Training batches must be dicts containing an 'img' tensor.")
+                batch = _move_to_device(raw_batch, device)
+                img = batch.pop("img")
+                optimizer.zero_grad(set_to_none=True)
+                with scaler.autocast():
+                    loss_dict = model(img=img, **batch)
+                    loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = clip_grad_norm(model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step(iteration + 1)
+                global_iter = iteration + 1
 
-            if global_iter % int(recipe["log_interval"]) == 0:
-                losses_for_log = {k: float(v.detach().cpu()) for k, v in loss_dict.items() if torch.is_tensor(v)}
-                writer.add_scalar("train/loss_total", float(loss.detach().cpu()), global_iter)
-                writer.add_scalar("train/lr", optimizer.param_groups[-1]["lr"], global_iter)
-                writer.add_scalar("train/grad_norm", float(grad_norm), global_iter)
-                for key, value in losses_for_log.items():
-                    writer.add_scalar(f"train/{key}", value, global_iter)
-                print(
-                    f"iter={global_iter}/{max_iters} loss={float(loss.detach().cpu()):.6f} "
-                    f"lr={optimizer.param_groups[-1]['lr']:.8f} grad_norm={float(grad_norm):.4f}"
-                )
+                if global_iter % int(recipe["log_interval"]) == 0:
+                    losses_for_log = {k: float(v.detach().cpu()) for k, v in loss_dict.items() if torch.is_tensor(v)}
+                    writer.add_scalar("train/loss_total", float(loss.detach().cpu()), global_iter)
+                    writer.add_scalar("train/lr", optimizer.param_groups[-1]["lr"], global_iter)
+                    writer.add_scalar("train/grad_norm", float(grad_norm), global_iter)
+                    for key, value in losses_for_log.items():
+                        writer.add_scalar(f"train/{key}", value, global_iter)
+                    print(
+                        f"iter={global_iter}/{max_iters} loss={float(loss.detach().cpu()):.6f} "
+                        f"lr={optimizer.param_groups[-1]['lr']:.8f} grad_norm={float(grad_norm):.4f}"
+                    )
 
-            if global_iter % eval_cadence == 0:
-                summary = run_eval(model, val_loader, device, output_dir, writer, global_iter, recipe["eval_mode"], "val")
-                print(f"val@{global_iter}: {summary}")
-            if global_iter % ckpt_cadence == 0:
-                _checkpoint_if_needed(output_dir, model, optimizer, scheduler, scaler, global_iter, config)
+                if global_iter % eval_cadence == 0:
+                    summary = run_eval(model, val_loader, device, output_dir, writer, global_iter, recipe["eval_mode"], "val")
+                    print(f"val@{global_iter}: {summary}")
+                if global_iter % ckpt_cadence == 0:
+                    _checkpoint_if_needed(output_dir, model, optimizer, scheduler, scaler, global_iter, config)
+
+                iteration += 1
+            if iteration >= max_iters:
+                break
 
         final_iter = max_iters
         print(f"final_val@{final_iter}: {run_eval(model, val_loader, device, output_dir, writer, final_iter, recipe['eval_mode'], 'val_final')}")
