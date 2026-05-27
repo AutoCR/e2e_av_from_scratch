@@ -220,3 +220,4 @@ vis/
 
 sparsedrive_model/outputs/*
 .vscode/*
+sparsedrive_model/vis/*
