@@ -7,10 +7,41 @@ from copy import deepcopy
 
 RUNTIME_CONFIG = {
     "stage": "stage1",              # "stage1" (det+map pre-train) or "stage2" (full fine-tune)
+    # Split config format (per split):
+    #   str form:  "mini"  — load all scenes from that directory, no filtering.
+    #   dict form:
+    #     "dir"            — directory name under navsim_logs/  (required)
+    #     "log_names_yaml" — YAML path (relative to repo root) for log-name list (optional)
+    #     "log_names_key"  — key in log_names_yaml; default "log_names"
+    #     "tokens_yaml"    — YAML path for scene-token whitelist (optional, may be same file)
+    #     "tokens_key"     — key in tokens_yaml; default "tokens"
+    # Omitting or setting a yaml field to None disables that filter entirely.
     "splits": {
-        "train": "trainval",            # "mini" (323 scenes) or "trainval" (28130 scenes)
-        "val": "test",
-        "test": "test",
+        "train": {
+            "dir": "trainval",
+            # log names: use train_logs from the official log split (978 of 1192 navtrain logs)
+            "log_names_yaml": "navsim/planning/script/config/training/default_train_val_test_log_split.yaml",
+            "log_names_key": "train_logs",
+            # tokens: navtrain scene whitelist (covers both train and val navtrain logs)
+            "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml",
+            "tokens_key": "tokens",
+        },
+        "val": {
+            "dir": "trainval",
+            # log names: use val_logs from the official log split (214 of 1192 navtrain logs)
+            "log_names_yaml": "navsim/planning/script/config/training/default_train_val_test_log_split.yaml",
+            "log_names_key": "val_logs",
+            # tokens: same navtrain whitelist; log_names filter ensures only val-log scenes are returned
+            "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml",
+            "tokens_key": "tokens",
+        },
+        "test": {
+            "dir": "trainval",
+            "log_names_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
+            "log_names_key": "log_names",
+            "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
+            "tokens_key": "tokens",
+        },
     },
     "openscene_data_root": "/prediction_database/navsim",
     "nuplan_maps_root": "/prediction_database/nuplan/dataset/maps",
