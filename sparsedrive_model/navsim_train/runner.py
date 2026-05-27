@@ -25,7 +25,7 @@ if __package__ in {None, ""}:
             sys.path.insert(0, _path)
 
 from sparsedrive_model.navsim_train.amp import Fp16Wrapper
-from sparsedrive_model.navsim_train.config import get_stage_hyperparams
+from sparsedrive_model.configs.sparsedrive_hyperparams import get_stage_hyperparams
 from sparsedrive_model.navsim_train.eval_hook import run_eval
 from sparsedrive_model.navsim_train.optim import CosineWithLinearWarmup, build_optimizer, clip_grad_norm
 from sparsedrive_model.sparsedrive import SparseDrive

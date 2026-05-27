@@ -90,10 +90,6 @@ class SparseDriveLogInferenceResult:
     frame_layout: str = "horizontal"
 
 
-CONFIG_MODULES = {
-    "stage1": "configs.sparsedrive_small_stage1",
-    "stage2": "configs.sparsedrive_small_stage2",
-}
 STATE_DICT_WRAPPERS = ("state_dict", "model", "model_state_dict", "net")
 VISUALIZATION_HELPERS = (
     ("visualize_nuscenes_inference", "visualize_nuscenes_sparsedrive_predictions"),
@@ -133,31 +129,25 @@ def _require_checkpoint_path(path_like: str | Path) -> Path:
     return checkpoint_path
 
 
-def _get_config_module(config_name: str) -> Any:
-    normalized = config_name.lower().strip()
-    module_name = CONFIG_MODULES.get(normalized)
-    if module_name is None:
-        valid = ", ".join(sorted(CONFIG_MODULES))
-        raise ValueError(f"Unsupported CONFIG_NAME={config_name!r}; expected one of: {valid}.")
-    return importlib.import_module(module_name)
-
-
 def _image_hw_from_config(config_name: str) -> tuple[int, int]:
-    config_module = _get_config_module(config_name)
-    input_shape = getattr(config_module, "input_shape", None)
-    if input_shape is None:
-        hyperparams = getattr(config_module, "hyperparams", None)
-        if isinstance(hyperparams, Mapping):
-            input_shape = hyperparams.get("input_shape")
-
+    from sparsedrive_model.configs.sparsedrive_hyperparams import MODEL_ARCH
     from nuscenes_adapter import image_hw_from_sparsedrive_input_shape
 
-    return image_hw_from_sparsedrive_input_shape(input_shape)
+    return image_hw_from_sparsedrive_input_shape(MODEL_ARCH["input_shape"])
 
 
 def _build_model(config_name: str) -> torch.nn.Module:
-    config_module = _get_config_module(config_name)
-    model = config_module.build()
+    normalized = config_name.lower().strip()
+    if normalized == "stage1":
+        from sparsedrive_model.configs import build_stage1
+
+        model = build_stage1()
+    elif normalized == "stage2":
+        from sparsedrive_model.configs import build_stage2
+
+        model = build_stage2()
+    else:
+        raise ValueError(f"Unsupported CONFIG_NAME={config_name!r}; expected 'stage1' or 'stage2'.")
     if hasattr(model, "init_weights"):
         model.init_weights()
     return model
