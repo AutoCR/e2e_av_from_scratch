@@ -61,7 +61,7 @@ RUNTIME_CONFIG = {
 
 TRAINING_SCHEDULE_STAGE1 = {
     "num_epochs": 100,
-    "total_batch_size": 64,
+    "total_batch_size": 1,
     "num_gpus": 8,                  # Reference GPU count (used only by derive_training_hyperparams)
     "ckpt_epoch_interval": 20,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
@@ -78,7 +78,7 @@ TRAINING_SCHEDULE_STAGE1 = {
 
 TRAINING_SCHEDULE_STAGE2 = {
     "num_epochs": 10,
-    "total_batch_size": 48,
+    "total_batch_size": 1,
     "num_gpus": 8,
     "ckpt_epoch_interval": 10,
     "eval_epoch_interval": 10,
@@ -99,16 +99,16 @@ TRAINING_SCHEDULE_STAGE2 = {
 # Learning rate, weight decay, warmup schedule, gradient clipping, and logging.
 
 OPTIMIZER_CONFIG = {
-    "lr": 4e-4,
+    "lr": 5e-5,
     "weight_decay": 0.001,
     "backbone_lr_mult": 0.5,        # LR multiplier for backbone parameters
     "grad_clip_max_norm": 25.0,
     "grad_clip_norm_type": 2.0,
-    "warmup_iters": 500,
+    "warmup_iters": 4000,
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,           # Final LR = lr * min_lr_ratio
     "fp16_loss_scale": 32.0,
-    "log_interval": 51,             # Print/TensorBoard log every N iterations
+    "log_interval": 20,             # Print/TensorBoard log every N iterations
     # NAVSIM uses 8 cameras; overrides the model-architecture default of 6.
     "num_cams": 8,
 }
