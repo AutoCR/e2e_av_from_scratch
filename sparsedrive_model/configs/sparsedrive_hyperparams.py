@@ -19,8 +19,8 @@ RUNTIME_CONFIG = {
     "resume_from": None,            # Path to a full checkpoint to resume interrupted training
     "seed": 0,
     "num_workers": 4,
-    "device": "cpu",                # "auto", "cuda", "mps", or "cpu"
-    "quick_smoke": True,           # True → 1-iter smoke test with 2 scenes
+    "device": "auto",                # "auto", "cuda", "mps", or "cpu"
+    "quick_smoke": False,           # True → 1-iter smoke test with 2 scenes
 }
 
 # =============================================================================
