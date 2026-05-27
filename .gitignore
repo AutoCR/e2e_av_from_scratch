@@ -219,5 +219,6 @@ sparsedrive_model/data/*
 vis/
 
 sparsedrive_model/outputs/*
-.vscode/*
 sparsedrive_model/vis/*
+sparsedrive_model/data/*
+.vscode/*

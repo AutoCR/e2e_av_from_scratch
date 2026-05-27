@@ -17,6 +17,7 @@ CLASSES = [
 ]
 DYNAMIC_CLASSES = {"car", "truck", "construction_vehicle", "bus", "trailer",
                    "motorcycle", "bicycle", "pedestrian"}
+VEHICLE_INDICES = [1, 2, 3, 4, 6]  # truck, construction_vehicle, bus, trailer, motorcycle
 HEADING_IDX = 6
 
 # NavSim/NuPlan uses consolidated class names; map them to SparseDrive taxonomy
@@ -134,7 +135,8 @@ def main():
     for i, cls_name in enumerate(CLASSES):
         trajs = intention[i]
         if len(trajs) < args.k:
-            print(f"  Skipping {cls_name}: only {len(trajs)} samples (need {args.k})")
+            if i not in VEHICLE_INDICES:
+                print(f"  Skipping {cls_name}: only {len(trajs)} samples (need {args.k})")
             continue
         trajs_arr = np.stack(trajs, axis=0).reshape(len(trajs), -1)
         cluster = KMeans(n_clusters=args.k, random_state=42).fit(trajs_arr).cluster_centers_
@@ -147,6 +149,13 @@ def main():
         plt.savefig(f"vis/kmeans/motion_intention_{cls_name}_{args.k}.png", bbox_inches="tight")
         plt.close()
         print(f"  {cls_name}: {len(trajs)} samples → {args.k} clusters")
+
+    car_clusters = result[0]
+    if car_clusters.any():
+        for vehicle_idx in VEHICLE_INDICES:
+            if not result[vehicle_idx].any():
+                result[vehicle_idx] = car_clusters
+                print(f"  {CLASSES[vehicle_idx]}: copied from car (no NavSim samples)")
 
     out_path = os.path.join(args.out_dir, f"kmeans_motion_{args.k}.npy")
     np.save(out_path, result)
