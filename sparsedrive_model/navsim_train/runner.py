@@ -9,6 +9,11 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import os
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 if __package__ in {None, ""}:
@@ -120,17 +125,20 @@ def _build_dataset(dataset_cls, *, split, config, test_mode, max_scenes):
         return dataset_cls(**kwargs)
 
 
-def _build_loader(build_dataloader_fn, dataset, *, batch_size, num_workers, shuffle, collate_fn):
+def _build_loader(build_dataloader_fn, dataset, *, batch_size, num_workers, shuffle, collate_fn, sampler=None):
+    effective_shuffle = shuffle if sampler is None else False
     try:
         return build_dataloader_fn(
             dataset,
             batch_size=batch_size,
             num_workers=num_workers,
-            shuffle=shuffle,
+            shuffle=effective_shuffle,
             collate_fn=collate_fn,
+            sampler=sampler,
         )
     except TypeError:
-        return build_dataloader_fn(dataset, batch_size, num_workers, shuffle, collate_fn)
+        # Fallback for older build_dataloader signatures that don't accept sampler
+        return build_dataloader_fn(dataset, batch_size, num_workers, effective_shuffle, collate_fn)
 
 
 def _prepare_hyperparams_for_local_build(hyperparams):
@@ -157,9 +165,10 @@ def _load_weights(model, path, device, label):
 
 def _save_checkpoint(path, model, optimizer, scheduler, scaler, iteration, config):
     path.parent.mkdir(parents=True, exist_ok=True)
+    raw_model = model.module if isinstance(model, DDP) else model
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": raw_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
@@ -179,9 +188,62 @@ def _checkpoint_if_needed(output_dir, model, optimizer, scheduler, scaler, itera
     print(f"Saved checkpoint {iter_path}")
 
 
+# ---------------------------------------------------------------------------
+# Distributed training helpers
+# ---------------------------------------------------------------------------
+
+
+def _init_distributed():
+    """Initialize NCCL process group when launched via torchrun.
+
+    Reads RANK / LOCAL_RANK / WORLD_SIZE from environment variables.
+    Returns (local_rank, world_size) or (0, 1) for non-distributed runs.
+    """
+    rank = int(os.environ.get("RANK", -1))
+    if rank == -1:
+        return 0, 1  # non-DDP
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return local_rank, world_size
+
+
+def _get_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def _get_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def _is_main_process() -> bool:
+    return _get_rank() == 0
+
+
+def _cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _build_sampler(dataset, *, shuffle: bool):
+    """Return a DistributedSampler when DDP is active, else None."""
+    if _get_world_size() > 1:
+        return DistributedSampler(dataset, shuffle=shuffle)
+    return None
+
+
 def run(config: dict):
+    local_rank, world_size = _init_distributed()
     _set_seed(int(config.get("seed", 0)))
-    device = _choose_device(config.get("device", "auto"))
+    if world_size > 1:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = _choose_device(config.get("device", "auto"))
     _patch_cuda_calls_for_local_device(device)
     _patch_loss_weight_broadcasting()
     stage = config.get("stage", "stage1")
@@ -212,14 +274,16 @@ def run(config: dict):
     train_dataset = _build_dataset(NavSimSparseDriveDataset, split=splits["train"], config=config, test_mode=False, max_scenes=max_scenes)
     val_dataset = _build_dataset(NavSimSparseDriveDataset, split=splits["val"], config=config, test_mode=True, max_scenes=max_scenes)
     test_dataset = _build_dataset(NavSimSparseDriveDataset, split=splits["test"], config=config, test_mode=True, max_scenes=max_scenes)
+    train_sampler = _build_sampler(train_dataset, shuffle=True)
 
     train_loader = _build_loader(
         build_dataloader_fn,
         train_dataset,
         batch_size=total_batch_size,
         num_workers=int(config.get("num_workers", 0)),
-        shuffle=True,
+        shuffle=False,
         collate_fn=collate_fn_fn,
+        sampler=train_sampler,
     )
     val_loader = _build_loader(
         build_dataloader_fn,
@@ -228,6 +292,7 @@ def run(config: dict):
         num_workers=int(config.get("num_workers", 0)),
         shuffle=False,
         collate_fn=collate_fn_fn,
+        sampler=None,
     )
     test_loader = _build_loader(
         build_dataloader_fn,
@@ -236,13 +301,17 @@ def run(config: dict):
         num_workers=int(config.get("num_workers", 0)),
         shuffle=False,
         collate_fn=collate_fn_fn,
+        sampler=None,
     )
 
     model = SparseDrive(_prepare_hyperparams_for_local_build(hyperparams))
     model.init_weights()
     model.to(device)
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank])
+    raw_model = model.module if isinstance(model, DDP) else model
 
-    optimizer = build_optimizer(model, recipe["lr"], recipe["weight_decay"], recipe["backbone_lr_mult"])
+    optimizer = build_optimizer(raw_model, recipe["lr"], recipe["weight_decay"], recipe["backbone_lr_mult"])
     num_iters_per_epoch = max(1, len(train_dataset) // total_batch_size)
     max_iters = num_iters_per_epoch * int(recipe["num_epochs"])
     scheduler = CosineWithLinearWarmup(
@@ -257,7 +326,7 @@ def run(config: dict):
     start_iter = 0
     if config.get("resume_from"):
         checkpoint = torch.load(config["resume_from"], map_location=device)
-        model.load_state_dict(_extract_model_state(checkpoint), strict=False)
+        raw_model.load_state_dict(_extract_model_state(checkpoint), strict=False)
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
         if "scheduler" in checkpoint:
@@ -267,16 +336,20 @@ def run(config: dict):
         start_iter = int(checkpoint.get("iter", 0))
         print(f"Resumed full training state from {config['resume_from']} at iter {start_iter}")
     elif config.get("load_from"):
-        _load_weights(model, config["load_from"], device, "model weights")
+        _load_weights(raw_model, config["load_from"], device, "model weights")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    writer = SummaryWriter(log_dir=str(output_dir / "tb" / f"{stage}_{timestamp}"))
+    writer = None
+    if _is_main_process():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        writer = SummaryWriter(log_dir=str(output_dir / "tb" / f"{stage}_{timestamp}"))
     eval_cadence = max(1, num_iters_per_epoch * int(recipe["eval_epoch_interval"]))
     ckpt_cadence = max(1, num_iters_per_epoch * int(recipe["ckpt_epoch_interval"]))
 
     iteration = start_iter
     try:
         for _epoch in range(int(recipe["num_epochs"])):
+            if train_sampler is not None:
+                train_sampler.set_epoch(_epoch)
             for raw_batch in train_loader:
                 if iteration >= max_iters:
                     break
@@ -291,7 +364,8 @@ def run(config: dict):
                     loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                grad_norm = clip_grad_norm(model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
+                raw_model = model.module if isinstance(model, DDP) else model
+                grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -300,20 +374,21 @@ def run(config: dict):
 
                 if global_iter % int(recipe["log_interval"]) == 0:
                     losses_for_log = {k: float(v.detach().cpu()) for k, v in loss_dict.items() if torch.is_tensor(v)}
-                    writer.add_scalar("train/loss_total", float(loss.detach().cpu()), global_iter)
-                    writer.add_scalar("train/lr", optimizer.param_groups[-1]["lr"], global_iter)
-                    writer.add_scalar("train/grad_norm", float(grad_norm), global_iter)
-                    for key, value in losses_for_log.items():
-                        writer.add_scalar(f"train/{key}", value, global_iter)
-                    print(
-                        f"iter={global_iter}/{max_iters} loss={float(loss.detach().cpu()):.6f} "
-                        f"lr={optimizer.param_groups[-1]['lr']:.8f} grad_norm={float(grad_norm):.4f}"
-                    )
+                    if _is_main_process():
+                        writer.add_scalar("train/loss_total", float(loss.detach().cpu()), global_iter)
+                        writer.add_scalar("train/lr", optimizer.param_groups[-1]["lr"], global_iter)
+                        writer.add_scalar("train/grad_norm", float(grad_norm), global_iter)
+                        for key, value in losses_for_log.items():
+                            writer.add_scalar(f"train/{key}", value, global_iter)
+                        print(
+                            f"iter={global_iter}/{max_iters} loss={float(loss.detach().cpu()):.6f} "
+                            f"lr={optimizer.param_groups[-1]['lr']:.8f} grad_norm={float(grad_norm):.4f}"
+                        )
 
-                if global_iter % eval_cadence == 0:
+                if global_iter % eval_cadence == 0 and _is_main_process():
                     summary = run_eval(model, val_loader, device, output_dir, writer, global_iter, recipe["eval_mode"], "val")
                     print(f"val@{global_iter}: {summary}")
-                if global_iter % ckpt_cadence == 0:
+                if global_iter % ckpt_cadence == 0 and _is_main_process():
                     _checkpoint_if_needed(output_dir, model, optimizer, scheduler, scaler, global_iter, config)
 
                 iteration += 1
@@ -321,11 +396,16 @@ def run(config: dict):
                 break
 
         final_iter = max_iters
-        print(f"final_val@{final_iter}: {run_eval(model, val_loader, device, output_dir, writer, final_iter, recipe['eval_mode'], 'val_final')}")
-        print(f"final_test@{final_iter}: {run_eval(model, test_loader, device, output_dir, writer, final_iter, recipe['eval_mode'], 'test_final')}")
+        if world_size > 1:
+            dist.barrier()
+        if _is_main_process():
+            print(f"final_val@{final_iter}: {run_eval(model, val_loader, device, output_dir, writer, final_iter, recipe['eval_mode'], 'val_final')}")
+            print(f"final_test@{final_iter}: {run_eval(model, test_loader, device, output_dir, writer, final_iter, recipe['eval_mode'], 'test_final')}")
     finally:
-        writer.flush()
-        writer.close()
+        _cleanup_distributed()
+        if writer is not None:
+            writer.flush()
+            writer.close()
 
 
 def _standalone_smoke():

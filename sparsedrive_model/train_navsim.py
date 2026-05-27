@@ -21,8 +21,8 @@ CONFIG = {
     "resume_from": None,
     "seed": 0,
     "num_workers": 4,
-    "device": "cpu",
-    "quick_smoke": True,
+    "device": "auto",
+    "quick_smoke": False,
     "total_batch_size": None,
     "num_epochs": None,
     "log_interval": 51,
@@ -31,6 +31,16 @@ CONFIG = {
     "fp16_loss_scale": 32.0,
 }
 
+# ---------------------------------------------------------------------------
+# Single-GPU:
+#   uv run python sparsedrive_model/train_navsim.py
+#
+# Multi-GPU DDP (e.g. 8 GPUs on one node):
+#   torchrun --nproc_per_node=8 sparsedrive_model/train_navsim.py
+#
+# The runner auto-detects DDP from the RANK/LOCAL_RANK/WORLD_SIZE env vars
+# set by torchrun and falls back to single-device when they are absent.
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     from sparsedrive_model.navsim_train.runner import run
 
