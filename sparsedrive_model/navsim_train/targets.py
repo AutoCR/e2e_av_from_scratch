@@ -21,6 +21,10 @@ SPARSEDRIVE_CLASSES = (
     "traffic_cone",
 )
 _CLASS_TO_LABEL = {name: idx for idx, name in enumerate(SPARSEDRIVE_CLASSES)}
+# NavSim/NuPlan consolidates all vehicle subtypes into a single "vehicle" label,
+# so truck/bus/trailer/construction_vehicle/motorcycle all map to "car".
+# Fine-grained vehicle class distinction is intentionally lost.
+# "generic_object" and "czone_sign" map to None and are excluded from training.
 _NUPLAN_TO_NUSCENES = {
     "vehicle": "car",
     "pedestrian": "pedestrian",

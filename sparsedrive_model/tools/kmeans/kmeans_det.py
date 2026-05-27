@@ -12,14 +12,36 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from navsim_loader import load_sequences
 
+# NavSim/NuPlan → SparseDrive class mapping (mirrors navsim_train/targets.py).
+# Classes mapped to None are excluded from training and should be skipped here
+# so that detection anchors reflect only the objects the model will see.
+_NAVSIM_TO_SPARSEDRIVE = {
+    "vehicle": "car",
+    "pedestrian": "pedestrian",
+    "bicycle": "bicycle",
+    "traffic_cone": "traffic_cone",
+    "barrier": "barrier",
+    "generic_object": None,
+    "czone_sign": None,
+}
+
 
 def _process_seq(args_tuple):
     seq, dis_thresh = args_tuple
     centers = []
     for frame in seq:
         boxes = np.asarray(frame["anns"]["gt_boxes"], dtype=np.float64)
+        names = list(frame["anns"].get("gt_names", []))
         if len(boxes) == 0:
             continue
+        valid_mask = []
+        for i, name in enumerate(names):
+            mapped = _NAVSIM_TO_SPARSEDRIVE.get(str(name), str(name))
+            valid_mask.append(mapped is not None)
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if not valid_mask.any():
+            continue
+        boxes = boxes[valid_mask]
         xyz = boxes[:, :3]
         dist = np.linalg.norm(xyz[:, :2], axis=1)
         keep = xyz[dist < dis_thresh]
