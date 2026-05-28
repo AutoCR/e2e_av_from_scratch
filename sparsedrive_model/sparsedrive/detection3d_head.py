@@ -709,6 +709,7 @@ class Sparse4DDetHead(nn.Module):
             reg_target = torch.where(
                 reg_target.isnan(), reg.new_tensor(0.0), reg_target
             )
+            reg = torch.nan_to_num(reg, nan=0.0, posinf=0.0, neginf=0.0)
             cls_target = cls_target[mask]
             if qt is not None:
                 qt = qt.flatten(end_dim=1)[mask]
@@ -1271,6 +1272,7 @@ class Sparse4DMap(nn.Module):
             reg_target = torch.where(
                 reg_target.isnan(), reg.new_tensor(0.0), reg_target
             )
+            reg = torch.nan_to_num(reg, nan=0.0, posinf=0.0, neginf=0.0)
             cls_target = cls_target[mask]
             if qt is not None:
                 qt = qt.flatten(end_dim=1)[mask]
