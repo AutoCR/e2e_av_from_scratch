@@ -1236,9 +1236,12 @@ class Sparse4DMap(nn.Module):
             zip(cls_scores, reg_preds, quality)
         ):
             reg = reg[..., : len(self.reg_weights)]
+            # Guard against fp16 NaN/Inf from poisoning the Hungarian cost matrix
+            cls_for_match = torch.nan_to_num(cls.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            reg_for_match = torch.nan_to_num(reg.float(), nan=0.0, posinf=0.0, neginf=0.0)
             cls_target, reg_target, reg_weights = self.sampler.sample(
-                cls,
-                reg,
+                cls_for_match,
+                reg_for_match,
                 data[self.gt_cls_key],
                 data[self.gt_reg_key],
             )
