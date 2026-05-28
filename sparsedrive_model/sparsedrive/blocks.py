@@ -314,7 +314,7 @@ class DenseDepthNet(nn.Module):
             focal = focal.reshape(-1)
         depths = []
         for i, feat in enumerate(feature_maps[: self.num_depth_layers]):
-            depth = self.depth_layers[i](feat.flatten(end_dim=1).float()).exp()
+            depth = self.depth_layers[i](feat.flatten(end_dim=1).float()).clamp(max=88.0).exp()
             depth = depth.transpose(0, -1) * focal / self.equal_focal
             depth = depth.transpose(0, -1)
             depths.append(depth)

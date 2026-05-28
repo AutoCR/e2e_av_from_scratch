@@ -284,6 +284,16 @@ def _build_sampler(dataset, *, shuffle: bool):
     return None
 
 
+def _reset_temporal_state(model):
+    """Reset all InstanceBank caches to break NaN propagation across iterations."""
+    for module in model.modules():
+        if hasattr(module, "reset") and callable(module.reset):
+            try:
+                module.reset()
+            except Exception:
+                pass
+
+
 def run(config: dict):
     local_rank, world_size = _init_distributed()
     _set_seed(int(config.get("seed", 0)))
@@ -302,7 +312,7 @@ def run(config: dict):
     if config.get("quick_smoke"):
         recipe.update(
             {
-                "total_batch_size": 2,
+                "total_batch_size": 1,
                 "num_epochs": 1,
                 "warmup_iters": 2,
                 "log_interval": 1,
@@ -447,10 +457,21 @@ def run(config: dict):
                 with scaler.autocast():
                     loss_dict = model(img=img, **batch)
                     loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
+                if not torch.isfinite(loss):
+                    tqdm.write(f"iter={iteration + 1}: non-finite loss={float(loss):.4f}, skipping backward")
+                    _reset_temporal_state(raw_model)
+                    optimizer.zero_grad(set_to_none=True)
+                    iteration += 1
+                    pbar.update(1)
+                    scheduler.step(iteration)
+                    continue
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 raw_model = model.module if isinstance(model, DDP) else model
                 grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
+                if not torch.isfinite(grad_norm):
+                    tqdm.write(f"iter={iteration + 1}: NaN/inf gradients detected (scale={scaler.scaler.get_scale() if scaler.enabled else 'N/A'}), resetting temporal state")
+                    _reset_temporal_state(raw_model)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
