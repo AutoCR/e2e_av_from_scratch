@@ -30,6 +30,9 @@ from navsim_loader import load_sequences, NuplanMapStore, get_ego_pose, rotation
 ROI_X = 30.0   # half-width: left/right
 ROI_Y = 60.0   # half-depth: forward/back
 
+# Bounding-box radius used for spatial pre-filtering (covers any ROI orientation)
+_SPATIAL_RADIUS = (ROI_X ** 2 + ROI_Y ** 2) ** 0.5   # ≈ 67 m
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -43,18 +46,41 @@ def parse_args():
     parser.add_argument("--max_frames", type=int, default=5000,
                         help="Max frames to sample ego poses from (for speed).")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n_jobs", type=int, default=1,
+                        help="Number of parallel worker processes (default: 1 = sequential).")
     return parser.parse_args()
 
 
-def sample_linestring(geom, num_points):
-    from shapely.geometry import LineString
+def sample_linestring_fast(geom, num_points: int) -> np.ndarray | None:
+    """Sample *num_points* evenly spaced along *geom* using numpy interpolation.
+
+    Avoids Shapely's per-point ``interpolate`` calls; extracts raw coords once
+    and uses ``np.interp`` — roughly 10–20× faster per line.
+    """
     if geom is None or geom.is_empty:
         return None
-    line = geom if geom.geom_type == "LineString" else LineString(geom.exterior.coords)
-    if line.length == 0:
+    # Extract raw coordinates as a numpy array (works for LineString; fall back for Polygon)
+    if geom.geom_type == "LineString":
+        coords_xy = np.array(geom.coords, dtype=np.float64)[:, :2]
+    else:
+        coords_xy = np.array(geom.exterior.coords, dtype=np.float64)[:, :2]
+
+    if len(coords_xy) < 2:
         return None
-    dists = np.linspace(0.0, line.length, num_points)
-    return np.array([line.interpolate(d).coords[0] for d in dists], dtype=np.float64)
+
+    diffs = np.diff(coords_xy, axis=0)
+    seg_len = np.hypot(diffs[:, 0], diffs[:, 1])
+    cumlen = np.empty(len(seg_len) + 1, dtype=np.float64)
+    cumlen[0] = 0.0
+    np.cumsum(seg_len, out=cumlen[1:])
+    total_len = cumlen[-1]
+    if total_len == 0.0:
+        return None
+
+    dists = np.linspace(0.0, total_len, num_points)
+    xs = np.interp(dists, cumlen, coords_xy[:, 0])
+    ys = np.interp(dists, cumlen, coords_xy[:, 1])
+    return np.stack([xs, ys], axis=1)
 
 
 def global_to_lidar_top(pts_global_xy: np.ndarray, ego_t: np.ndarray, ego_R: np.ndarray) -> np.ndarray:
@@ -63,6 +89,49 @@ def global_to_lidar_top(pts_global_xy: np.ndarray, ego_t: np.ndarray, ego_R: np.
     ego_xy = (pts_global_xy - ego_t[:2]) @ ego_R[:2, :2]   # row-vec × R^T equivalent
     # Step 2: ego → LIDAR_TOP convention used by SparseDrive / vectorize_map_for_frame
     return np.stack([-ego_xy[:, 1], ego_xy[:, 0]], axis=1)
+
+
+def _collect_centers_for_frame(frame: dict, map_store: NuplanMapStore, num_sample: int) -> list:
+    """Return a list of (cx, cy) float32 ego-relative lane centres for one frame."""
+    pose = get_ego_pose(frame)   # [x_global, y_global, yaw]
+    ego_t_3d = np.array([pose[0], pose[1], 0.0], dtype=np.float64)
+    yaw = pose[2]
+    R_ego2global = rotation_matrix(yaw)   # 2×2
+
+    map_loc = frame.get("map_location")
+    if map_loc is None:
+        return []
+    map_data = map_store._load_map(map_loc)
+
+    # Spatial pre-filter: bounding box around ego in global UTM coordinates
+    ex, ey = pose[0], pose[1]
+    r = _SPATIAL_RADIUS
+    minx, maxx = ex - r, ex + r
+    miny, maxy = ey - r, ey + r
+
+    # Collect sampled mean points from all candidate lanes
+    sampled_pts = []   # list of (num_sample, 2) arrays
+    for col in ("lane_baselines", "connector_baselines"):
+        if col not in map_data:
+            continue
+        # Spatial index slice — reduces ~10k rows to ~50–100
+        candidates = map_data[col].cx[minx:maxx, miny:maxy]
+        for row in candidates.itertuples(index=False):
+            pts = sample_linestring_fast(row.geometry, num_sample)
+            if pts is not None:
+                sampled_pts.append(pts)
+
+    if not sampled_pts:
+        return []
+
+    # Batch-transform all lane centers in one vectorised call
+    all_means = np.stack([p.mean(axis=0) for p in sampled_pts], axis=0)  # (N, 2)
+    lidar_means = global_to_lidar_top(all_means, ego_t_3d, R_ego2global)  # (N, 2)
+
+    # ROI filter
+    mask = (np.abs(lidar_means[:, 0]) <= ROI_X) & (np.abs(lidar_means[:, 1]) <= ROI_Y)
+    valid = lidar_means[mask].astype(np.float32)
+    return [valid[i] for i in range(len(valid))]
 
 
 def main():
@@ -86,30 +155,23 @@ def main():
     map_store = NuplanMapStore(maps_root)
     ego_rel_mean_pts = []
 
-    for frame in tqdm(all_frames, desc="[map] collecting ego-relative line centres"):
-        pose = get_ego_pose(frame)   # [x_global, y_global, yaw]
-        ego_t_3d = np.array([pose[0], pose[1], 0.0], dtype=np.float64)
-        yaw = pose[2]
-        R_ego2global = rotation_matrix(yaw)   # 2×2
+    if args.n_jobs == 1:
+        for frame in tqdm(all_frames, desc="[map] collecting ego-relative line centres"):
+            ego_rel_mean_pts.extend(_collect_centers_for_frame(frame, map_store, args.num_sample))
+    else:
+        import concurrent.futures, functools
+        # Each worker needs its own map store (file handles are not fork-safe)
+        def _worker(frame):
+            ms = NuplanMapStore(maps_root)
+            return _collect_centers_for_frame(frame, ms, args.num_sample)
 
-        map_loc = frame.get("map_location")
-        if map_loc is None:
-            continue
-        map_data = map_store._load_map(map_loc)
-
-        for col in ("lane_baselines", "connector_baselines"):
-            if col not in map_data:
-                continue
-            for _, row in map_data[col].iterrows():
-                pts = sample_linestring(row.geometry, args.num_sample)
-                if pts is None:
-                    continue
-                pts_xy = pts[:, :2]
-                lidar_xy = global_to_lidar_top(pts_xy, ego_t_3d, R_ego2global)
-                cx, cy = lidar_xy.mean(axis=0)
-                # Keep only segments whose centre falls inside the ROI
-                if abs(cx) <= ROI_X and abs(cy) <= ROI_Y:
-                    ego_rel_mean_pts.append(np.array([cx, cy], dtype=np.float32))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.n_jobs) as pool:
+            for centers in tqdm(
+                pool.map(_worker, all_frames, chunksize=max(1, len(all_frames) // (args.n_jobs * 4))),
+                total=len(all_frames),
+                desc="[map] collecting ego-relative line centres",
+            ):
+                ego_rel_mean_pts.extend(centers)
 
     if len(ego_rel_mean_pts) < args.k:
         raise RuntimeError(
