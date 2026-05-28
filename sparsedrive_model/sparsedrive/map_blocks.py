@@ -27,7 +27,24 @@ class SparsePoint3DEncoder(nn.Module):
         self.pos_fc = embedding_layer(self.input_dims)
 
     def forward(self, anchor: torch.Tensor):
-        pos_feat = self.pos_fc(anchor)  
+        # Guard: anchor must be in ego-relative metres (~[-60, 60]).
+        # Global UTM coordinates (>1e4) overflow fp16 inside linear_relu_ln → NaN.
+        # This assert fires during dev; in production it becomes a loud warning so
+        # training can continue but the underlying data-pipeline bug is surfaced.
+        _max_val = anchor.detach().abs().max().item()
+        if _max_val > 1e4:
+            import warnings
+            warnings.warn(
+                f"SparsePoint3DEncoder received anchor with max abs value {_max_val:.1f} "
+                "(expected < 60 for ego-relative coords). "
+                "Check that kmeans_map_100.npy contains ego-relative coordinates, "
+                "not global/UTM coordinates. "
+                "The map anchor will be clamped to avoid fp16 overflow.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            anchor = anchor.clamp(-200.0, 200.0)
+        pos_feat = self.pos_fc(anchor.float()).to(anchor.dtype)
         return pos_feat
 
 
