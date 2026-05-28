@@ -224,14 +224,16 @@ class DeformableFeatureAggregation(nn.Module):
         pts_extend = torch.cat(
             [key_points, torch.ones_like(key_points[..., :1])], dim=-1
         )
+        # Compute in fp32 to avoid fp16 overflow/NaN when dividing by near-zero depth
         points_2d = torch.matmul(
-            projection_mat[:, :, None, None], pts_extend[:, None, ..., None]
+            projection_mat[:, :, None, None].float(),
+            pts_extend[:, None, ..., None].float(),
         ).squeeze(-1)
         points_2d = points_2d[..., :2] / torch.clamp(
-            points_2d[..., 2:3], min=1e-5
+            points_2d[..., 2:3], min=1e-4
         )
         if image_wh is not None:
-            points_2d = points_2d / image_wh[:, :, None, None]
+            points_2d = points_2d / image_wh[:, :, None, None].float()
         return points_2d
 
     @staticmethod
