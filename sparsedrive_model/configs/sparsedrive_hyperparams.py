@@ -51,7 +51,7 @@ RUNTIME_CONFIG = {
     "seed": 0,
     "num_workers": 4,
     "device": "auto",                # "auto", "cuda", "mps", or "cpu"
-    "quick_smoke": False,           # True → 1-iter smoke test with 2 scenes
+    "quick_smoke": False,
 }
 
 # =============================================================================

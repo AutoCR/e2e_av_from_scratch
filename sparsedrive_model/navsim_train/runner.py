@@ -465,9 +465,11 @@ def run(config: dict):
                     pbar.update(1)
                     scheduler.step(iteration)
                     continue
+
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 raw_model = model.module if isinstance(model, DDP) else model
+
                 grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
                 if not torch.isfinite(grad_norm):
                     tqdm.write(f"iter={iteration + 1}: NaN/inf gradients detected (scale={scaler.scaler.get_scale() if scaler.enabled else 'N/A'}), resetting temporal state")

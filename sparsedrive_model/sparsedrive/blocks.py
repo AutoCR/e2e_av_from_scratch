@@ -224,17 +224,21 @@ class DeformableFeatureAggregation(nn.Module):
         pts_extend = torch.cat(
             [key_points, torch.ones_like(key_points[..., :1])], dim=-1
         )
-        # Compute in fp32 to avoid fp16 overflow/NaN when dividing by near-zero depth
-        points_2d = torch.matmul(
-            projection_mat[:, :, None, None].float(),
-            pts_extend[:, None, ..., None].float(),
-        ).squeeze(-1)
-        points_2d = points_2d[..., :2] / torch.clamp(
-            points_2d[..., 2:3], min=1e-4
-        )
-        if image_wh is not None:
-            points_2d = points_2d / image_wh[:, :, None, None].float()
-        return points_2d
+        # Must disable autocast here: even with explicit .float() casts, torch.matmul
+        # inside autocast still downcasts inputs to fp16.  The resulting fp16 division
+        # by near-zero depth (z clamped at 1e-4) produces huge gradients during
+        # backward (upstream / z ≈ upstream × 10000) that overflow fp16 → NaN.
+        with torch.cuda.amp.autocast(enabled=False):
+            points_2d = torch.matmul(
+                projection_mat[:, :, None, None].float(),
+                pts_extend[:, None, ..., None].float(),
+            ).squeeze(-1)
+            points_2d = points_2d[..., :2] / torch.clamp(
+                points_2d[..., 2:3], min=1e-4
+            )
+            if image_wh is not None:
+                points_2d = points_2d / image_wh[:, :, None, None].float()
+        return points_2d  # fp32
 
     @staticmethod
     def feature_sampling(
@@ -255,10 +259,13 @@ class DeformableFeatureAggregation(nn.Module):
 
         features = []
         for fm in feature_maps:
+            # project_points returns fp32; grid_sample requires grid dtype == input
+            # dtype.  Cast the grid to match the feature map.  The backward of this
+            # cast is a safe fp16→fp32 upcast — no overflow risk.
+            fm_flat = fm.flatten(end_dim=1)
+            grid = points_2d.to(dtype=fm_flat.dtype)
             features.append(
-                torch.nn.functional.grid_sample(
-                    fm.flatten(end_dim=1), points_2d
-                )
+                torch.nn.functional.grid_sample(fm_flat, grid)
             )
         features = torch.stack(features, dim=1)
         features = features.reshape(
@@ -314,7 +321,12 @@ class DenseDepthNet(nn.Module):
             focal = focal.reshape(-1)
         depths = []
         for i, feat in enumerate(feature_maps[: self.num_depth_layers]):
-            depth = self.depth_layers[i](feat.flatten(end_dim=1).float()).clamp(max=88.0).exp()
+            # detach() stops gradients from flowing back to fp16 backbone features.
+            # Without detach, the exp() backward produces a huge fp32 gradient that
+            # overflows when autograd casts it back to fp16, causing NaN in all
+            # backbone/neck parameters.  depth_layers still receive their own
+            # gradients from the depth loss; only the backbone→depth path is cut.
+            depth = self.depth_layers[i](feat.flatten(end_dim=1).detach().float()).clamp(max=88.0).exp()
             depth = depth.transpose(0, -1) * focal / self.equal_focal
             depth = depth.transpose(0, -1)
             depths.append(depth)
