@@ -698,7 +698,8 @@ class Sparse4DDetHead(nn.Module):
 
             cls = cls.flatten(end_dim=1)
             cls_target = cls_target.flatten(end_dim=1)
-            cls_loss = self.loss_cls(cls, cls_target, avg_factor=num_pos)
+            # Cast to fp32 to avoid fp16 NaN in sigmoid/BCE under mixed precision
+            cls_loss = self.loss_cls(cls.float(), cls_target, avg_factor=num_pos)
 
             mask = mask.reshape(-1)
             reg_weights = reg_weights * reg.new_tensor(self.reg_weights)
@@ -1256,7 +1257,8 @@ class Sparse4DMap(nn.Module):
 
             cls = cls.flatten(end_dim=1)
             cls_target = cls_target.flatten(end_dim=1)
-            cls_loss = self.loss_cls(cls, cls_target, avg_factor=num_pos)
+            # Cast to fp32 to avoid fp16 NaN in sigmoid/BCE under mixed precision
+            cls_loss = self.loss_cls(cls.float(), cls_target, avg_factor=num_pos)
 
             mask = mask.reshape(-1)
             reg_weights = reg_weights * reg.new_tensor(self.reg_weights)
