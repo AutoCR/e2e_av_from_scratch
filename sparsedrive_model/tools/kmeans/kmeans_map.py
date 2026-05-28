@@ -51,7 +51,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def sample_linestring_fast(geom, num_points: int) -> np.ndarray | None:
+def sample_linestring_fast(geom, num_points: int):
     """Sample *num_points* evenly spaced along *geom* using numpy interpolation.
 
     Avoids Shapely's per-point ``interpolate`` calls; extracts raw coords once
