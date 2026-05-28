@@ -172,17 +172,19 @@ def _empty_map_targets() -> tuple[torch.Tensor, torch.Tensor]:
 
 def _build_map_targets(map_api: Any, map_name: str | None, frame: Mapping[str, Any], global_to_lidar: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
     try:
-        from sparsedrive_model.navsim_train import map_vectorize  # type: ignore
+        from sparsedrive_model.navsim_train.map_vectorize import vectorize_map_for_frame  # type: ignore
     except ImportError:
         return _empty_map_targets()
     try:
-        if hasattr(map_vectorize, "build_map_targets"):
-            labels, pts = map_vectorize.build_map_targets(map_api, map_name, frame, global_to_lidar)
-        elif hasattr(map_vectorize, "vectorize_map"):
-            labels, pts = map_vectorize.vectorize_map(map_api, map_name, frame, global_to_lidar)
-        else:
-            return _empty_map_targets()
-        return torch.as_tensor(labels, dtype=torch.long), torch.as_tensor(pts, dtype=torch.float32)
+        result = vectorize_map_for_frame(
+            map_api,
+            frame["ego2global_translation"],
+            frame["ego2global_rotation"],
+            permute=True,
+        )
+        labels = torch.as_tensor(result["gt_map_labels"], dtype=torch.long)
+        pts = torch.as_tensor(result["gt_map_pts"], dtype=torch.float32)
+        return labels, pts
     except Exception:
         return _empty_map_targets()
 
