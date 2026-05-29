@@ -38,6 +38,62 @@ points are passed as keyword arguments to `model(img, **data)`.
 The model runs in pure fp32. External `torch.amp.autocast` wrapping is not
 supported.
 
+## NavSim Dataset
+
+### On-disk layout (`/prediction_database/navsim/`)
+
+| Split | Log `.pkl` files | Total frames |
+|-------|-----------------|--------------|
+| `navsim_logs/trainval/` | 1,310 | 723,019 |
+| `navsim_logs/test/` | 147 | 75,122 |
+| **Total** | **1,457** | **~798,141** |
+
+Each log `.pkl` is a list of frame dicts (~552 frames on average). Sensor blobs
+(cameras + LiDAR) are stored under `sensor_blobs/<split>/<log_name>/`.
+
+### Sensor blob coverage
+
+Only 1,192 of the 1,310 `trainval` logs have sensor blobs. The remaining 118
+logs contain metadata only (poses, map, annotations) and cannot be used for
+perception-based training. **Every log in the navtrain whitelist has sensor
+blobs; none of the 118 blob-less logs appear in navtrain.**
+
+### navtrain scene filter
+
+`navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml`
+defines the official curated split:
+
+| Field | Value |
+|-------|-------|
+| `log_names` | **1,192** logs (all sensor-blob logs in trainval) |
+| `tokens` | **103,288** curated keyframe scene tokens |
+| `frame_interval` | **1** (dense, overlapping windows) |
+| `num_history_frames` | 4 |
+| `num_future_frames` | 10 |
+| `has_route` | True |
+
+The token whitelist is a strict subset of all possible keyframes — roughly 1 in
+7 frames passes. About 10% of frames outside the whitelist also have sensor
+blobs (neighboring frames around navtrain keyframes), but those are not part of
+the official split.
+
+### Train / val split
+
+`navsim/planning/script/config/training/default_train_val_test_log_split.yaml`
+partitions the 1,192 navtrain logs:
+
+| Split key | Matching logs on disk | Scenes (`frame_interval=1`) |
+|-----------|-----------------------|-----------------------------|
+| `train_logs` | ~1,085 | **~84,800** |
+| `val_logs` | ~214 | **~18,500** |
+
+> **Note on `frame_interval`:** `SceneFilter` defaults `frame_interval` to
+> `num_frames` (i.e. non-overlapping stride) when left `None`. The navtrain
+> filter is designed for `frame_interval=1` (dense sampling). Omitting it
+> reduces the train set from ~84,800 to ~5,346 scenes (~16× loss).
+> `NavSimSparseDriveDataset` explicitly passes `frame_interval=1` to avoid
+> this.
+
 ## nuScenes K-means anchors
 
 From the `sparsedrive_model` directory:

@@ -231,6 +231,7 @@ class NavSimSparseDriveDataset(Dataset):
             nuplan_maps_root=self.nuplan_maps_root,
             num_history_frames=self.num_history_frames,
             num_future_frames=self.num_future_frames,
+            frame_interval=1,
             max_scenes=max_scenes,
             log_names=log_names,
             tokens=tokens,
