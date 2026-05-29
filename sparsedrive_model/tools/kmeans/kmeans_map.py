@@ -1,8 +1,8 @@
 """Compute map-anchor kmeans in **ego-relative / SparseDrive LIDAR_TOP** coordinates.
 
 Previous version collected global UTM lane centers and clustered them in UTM space,
-producing anchor values of magnitude ~1e5–1e7.  Those values overflow fp16 inside the
-SparsePoint3DEncoder → NaN loss.
+producing anchor values of magnitude ~1e5–1e7.  Those large values cause numerical
+overflow inside the SparsePoint3DEncoder → NaN loss.
 
 This version:
 1. Samples a subset of ego poses from the split.

@@ -49,7 +49,6 @@ class FlashAttention(nn.Module):
         super().__init__()
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
-        self.fp16_enabled = True
 
     def forward(self, q, kv, 
                 causal=False, 

@@ -28,9 +28,10 @@ class SparsePoint3DEncoder(nn.Module):
 
     def forward(self, anchor: torch.Tensor):
         # Guard: anchor must be in ego-relative metres (~[-60, 60]).
-        # Global UTM coordinates (>1e4) overflow fp16 inside linear_relu_ln → NaN.
+        # Global UTM coordinates (>1e4) indicate a data-pipeline bug and can lead
+        # to unstable activations inside linear_relu_ln.
         # This assert fires during dev; in production it becomes a loud warning so
-        # training can continue but the underlying data-pipeline bug is surfaced.
+        # training can continue but the underlying issue is surfaced.
         _max_val = anchor.detach().abs().max().item()
         if _max_val > 1e4:
             import warnings
@@ -39,12 +40,12 @@ class SparsePoint3DEncoder(nn.Module):
                 "(expected < 60 for ego-relative coords). "
                 "Check that kmeans_map_100.npy contains ego-relative coordinates, "
                 "not global/UTM coordinates. "
-                "The map anchor will be clamped to avoid fp16 overflow.",
+                "The map anchor will be clamped to avoid numerical overflow.",
                 RuntimeWarning,
                 stacklevel=2,
             )
             anchor = anchor.clamp(-200.0, 200.0)
-        pos_feat = self.pos_fc(anchor.float()).to(anchor.dtype)
+        pos_feat = self.pos_fc(anchor)
         return pos_feat
 
 
@@ -89,14 +90,13 @@ class SparsePoint3DRefinementModule(nn.Module):
         time_interval: torch.Tensor = 1.0,
         return_cls=True,
     ):
-        with torch.cuda.amp.autocast(enabled=False):
-            output = self.layers(instance_feature.float() + anchor_embed.float())
-            output = output + anchor.float()
-            if return_cls:
-                assert self.with_cls_branch, "Without classification layers !!!"
-                cls = self.cls_layers(instance_feature.float())  ## NOTE anchor embed?
-            else:
-                cls = None
+        output = self.layers(instance_feature + anchor_embed)
+        output = output + anchor
+        if return_cls:
+            assert self.with_cls_branch, "Without classification layers !!!"
+            cls = self.cls_layers(instance_feature)  ## NOTE anchor embed?
+        else:
+            cls = None
         qt = None
         return output, cls, qt
 

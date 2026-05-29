@@ -718,11 +718,9 @@ class Sparse4DDetHead(nn.Module):
             cls_target = cls_target[mask]
             if qt is not None:
                 qt = qt.flatten(end_dim=1)[mask]
-                # Quality predictions feed BCE-with-logits (cns) and sigmoid+log
-                # (yns); under AMP these can become +/-Inf or NaN and propagate
-                # into det_loss_cns_*/det_loss_yns_* as NaN.
+                # Guard against NaN/Inf in quality predictions.
                 qt = torch.nan_to_num(
-                    qt.float(), nan=0.0, posinf=80.0, neginf=-80.0
+                    qt, nan=0.0, posinf=80.0, neginf=-80.0
                 ).clamp_(-80.0, 80.0)
 
             reg_loss = self.loss_reg(
@@ -1248,9 +1246,9 @@ class Sparse4DMap(nn.Module):
             zip(cls_scores, reg_preds, quality)
         ):
             reg = reg[..., : len(self.reg_weights)]
-            # Guard against fp16 NaN/Inf from poisoning the Hungarian cost matrix
-            cls_for_match = torch.nan_to_num(cls.float(), nan=0.0, posinf=0.0, neginf=0.0)
-            reg_for_match = torch.nan_to_num(reg.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            # Guard against NaN/Inf poisoning the Hungarian cost matrix
+            cls_for_match = torch.nan_to_num(cls, nan=0.0, posinf=0.0, neginf=0.0)
+            reg_for_match = torch.nan_to_num(reg, nan=0.0, posinf=0.0, neginf=0.0)
             cls_target, reg_target, reg_weights = self.sampler.sample(
                 cls_for_match,
                 reg_for_match,
@@ -1272,8 +1270,7 @@ class Sparse4DMap(nn.Module):
 
             cls = cls.flatten(end_dim=1)
             cls_target = cls_target.flatten(end_dim=1)
-            # Cast to fp32 to avoid fp16 NaN in sigmoid/BCE under mixed precision
-            cls_loss = self.loss_cls(cls.float(), cls_target, avg_factor=num_pos)
+            cls_loss = self.loss_cls(cls, cls_target, avg_factor=num_pos)
 
             mask = mask.reshape(-1)
             reg_weights = reg_weights * reg.new_tensor(self.reg_weights)
@@ -1287,10 +1284,9 @@ class Sparse4DMap(nn.Module):
             cls_target = cls_target[mask]
             if qt is not None:
                 qt = qt.flatten(end_dim=1)[mask]
-                # Quality predictions feed BCE-with-logits (cns) and sigmoid+log
-                # (yns); under AMP these can become +/-Inf or NaN.
+                # Guard against NaN/Inf in quality predictions.
                 qt = torch.nan_to_num(
-                    qt.float(), nan=0.0, posinf=80.0, neginf=-80.0
+                    qt, nan=0.0, posinf=80.0, neginf=-80.0
                 ).clamp_(-80.0, 80.0)
 
             reg_loss = self.loss_reg(

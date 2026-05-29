@@ -25,7 +25,6 @@ if __package__ in {None, ""}:
         if _path not in sys.path:
             sys.path.insert(0, _path)
 
-from sparsedrive_model.navsim_train.amp import Fp16Wrapper
 from sparsedrive_model.configs.sparsedrive_hyperparams import get_stage_hyperparams
 from sparsedrive_model.navsim_train.eval_hook import run_eval
 from sparsedrive_model.navsim_train.optim import CosineWithLinearWarmup, build_optimizer, clip_grad_norm
@@ -210,7 +209,7 @@ def _load_weights(model, path, device, label):
     print(f"Loaded {label} from {path}: missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}")
 
 
-def _save_checkpoint(path, model, optimizer, scheduler, scaler, iteration, config):
+def _save_checkpoint(path, model, optimizer, scheduler, iteration, config):
     path.parent.mkdir(parents=True, exist_ok=True)
     raw_model = model.module if isinstance(model, DDP) else model
     torch.save(
@@ -218,7 +217,6 @@ def _save_checkpoint(path, model, optimizer, scheduler, scaler, iteration, confi
             "model": raw_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
             "iter": iteration,
             "config": dict(config),
         },
@@ -226,11 +224,11 @@ def _save_checkpoint(path, model, optimizer, scheduler, scaler, iteration, confi
     )
 
 
-def _checkpoint_if_needed(output_dir, model, optimizer, scheduler, scaler, iteration, config):
+def _checkpoint_if_needed(output_dir, model, optimizer, scheduler, iteration, config):
     ckpt_dir = Path(output_dir) / "ckpt"
     iter_path = ckpt_dir / f"iter_{iteration}.pth"
     last_path = ckpt_dir / "last.pth"
-    _save_checkpoint(iter_path, model, optimizer, scheduler, scaler, iteration, config)
+    _save_checkpoint(iter_path, model, optimizer, scheduler, iteration, config)
     shutil.copyfile(iter_path, last_path)
     print(f"Saved checkpoint {iter_path}")
 
@@ -306,7 +304,7 @@ def run(config: dict):
     stage = config.get("stage", "stage1")
     hyperparams, recipe = get_stage_hyperparams(stage, num_cams_override=8)
 
-    for key in ("total_batch_size", "num_epochs", "ckpt_epoch_interval", "eval_epoch_interval", "log_interval", "fp16_loss_scale"):
+    for key in ("total_batch_size", "num_epochs", "ckpt_epoch_interval", "eval_epoch_interval", "log_interval"):
         if config.get(key) is not None:
             recipe[key] = config[key]
     if config.get("quick_smoke"):
@@ -408,7 +406,6 @@ def run(config: dict):
         warmup_ratio=recipe["warmup_ratio"],
         min_lr_ratio=recipe["min_lr_ratio"],
     )
-    scaler = Fp16Wrapper(enabled=(device.type == "cuda"), init_scale=recipe["fp16_loss_scale"])
 
     start_iter = 0
     if config.get("resume_from"):
@@ -418,8 +415,6 @@ def run(config: dict):
             optimizer.load_state_dict(checkpoint["optimizer"])
         if "scheduler" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler"])
-        if "scaler" in checkpoint:
-            scaler.load_state_dict(checkpoint["scaler"])
         start_iter = int(checkpoint.get("iter", 0))
         print(f"Resumed full training state from {config['resume_from']} at iter {start_iter}")
     elif config.get("load_from"):
@@ -454,9 +449,8 @@ def run(config: dict):
                 batch = _move_to_device(raw_batch, device)
                 img = batch.pop("img")
                 optimizer.zero_grad(set_to_none=True)
-                with scaler.autocast():
-                    loss_dict = model(img=img, **batch)
-                    loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
+                loss_dict = model(img=img, **batch)
+                loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
                 if not torch.isfinite(loss):
                     bad = {k: float(v) for k, v in loss_dict.items() if torch.is_tensor(v) and not torch.isfinite(v)}
                     tqdm.write(f"iter={iteration + 1}: non-finite loss={float(loss):.4f}, skipping backward; bad_losses={bad}")
@@ -467,16 +461,19 @@ def run(config: dict):
                     scheduler.step(iteration)
                     continue
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                loss.backward()
                 raw_model = model.module if isinstance(model, DDP) else model
 
                 grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
                 if not torch.isfinite(grad_norm):
-                    tqdm.write(f"iter={iteration + 1}: NaN/inf gradients detected (scale={scaler.scaler.get_scale() if scaler.enabled else 'N/A'}), resetting temporal state")
+                    tqdm.write(f"iter={iteration + 1}: NaN/inf gradients detected, resetting temporal state")
                     _reset_temporal_state(raw_model)
-                scaler.step(optimizer)
-                scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    iteration += 1
+                    pbar.update(1)
+                    scheduler.step(iteration)
+                    continue
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step(iteration + 1)
                 global_iter = iteration + 1
@@ -506,7 +503,7 @@ def run(config: dict):
                     summary = run_eval(model, val_loader, device, output_dir, writer, global_iter, recipe["eval_mode"], "val")
                     print(f"val@{global_iter}: {summary}")
                 if global_iter % ckpt_cadence == 0 and _is_main_process():
-                    _checkpoint_if_needed(output_dir, model, optimizer, scheduler, scaler, global_iter, config)
+                    _checkpoint_if_needed(output_dir, model, optimizer, scheduler, global_iter, config)
 
                 iteration += 1
             if iteration >= max_iters:
@@ -542,12 +539,10 @@ def _standalone_smoke():
     for iteration in (0, 1, 2, 5, 9):
         lrs = scheduler.step(iteration)
         print(f"iter {iteration}: " + ", ".join(f"{lr:.10f}" for lr in lrs))
-    amp = Fp16Wrapper(enabled=torch.cuda.is_available(), init_scale=recipe["fp16_loss_scale"])
     tensor = torch.tensor(1.0, requires_grad=True, device="cuda" if torch.cuda.is_available() else "cpu")
-    with amp.autocast():
-        loss = tensor * 2.0
-    amp.scale(loss).backward()
-    print(f"fp16_enabled={amp.enabled} dummy_grad={float(tensor.grad.detach().cpu()):.1f}")
+    loss = tensor * 2.0
+    loss.backward()
+    print(f"dummy_grad={float(tensor.grad.detach().cpu()):.1f}")
 
 
 if __name__ == "__main__":

@@ -49,26 +49,25 @@ class SparseBox3DEncoder(nn.Module):
             self.output_fc = None
 
     def forward(self, box_3d: torch.Tensor):
-        with torch.cuda.amp.autocast(enabled=False):
-            box_3d_fp32 = torch.nan_to_num(
-                box_3d.float(), nan=0.0, posinf=1e4, neginf=-1e4
-            )
-            pos_feat = self.pos_fc(box_3d_fp32[..., [X, Y, Z]])
-            size_feat = self.size_fc(box_3d_fp32[..., [W, L, H]])
-            yaw_feat = self.yaw_fc(box_3d_fp32[..., [SIN_YAW, COS_YAW]])
-            if self.mode == "add":
-                output = pos_feat + size_feat + yaw_feat
-            elif self.mode == "cat":
-                output = torch.cat([pos_feat, size_feat, yaw_feat], dim=-1)
+        box_3d_safe = torch.nan_to_num(
+            box_3d, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        pos_feat = self.pos_fc(box_3d_safe[..., [X, Y, Z]])
+        size_feat = self.size_fc(box_3d_safe[..., [W, L, H]])
+        yaw_feat = self.yaw_fc(box_3d_safe[..., [SIN_YAW, COS_YAW]])
+        if self.mode == "add":
+            output = pos_feat + size_feat + yaw_feat
+        elif self.mode == "cat":
+            output = torch.cat([pos_feat, size_feat, yaw_feat], dim=-1)
 
-            if self.vel_dims > 0:
-                vel_feat = self.vel_fc(box_3d_fp32[..., VX : VX + self.vel_dims])
-                if self.mode == "add":
-                    output = output + vel_feat
-                elif self.mode == "cat":
-                    output = torch.cat([output, vel_feat], dim=-1)
-            if self.output_fc is not None:
-                output = self.output_fc(output)
+        if self.vel_dims > 0:
+            vel_feat = self.vel_fc(box_3d_safe[..., VX : VX + self.vel_dims])
+            if self.mode == "add":
+                output = output + vel_feat
+            elif self.mode == "cat":
+                output = torch.cat([output, vel_feat], dim=-1)
+        if self.output_fc is not None:
+            output = self.output_fc(output)
         return output
 
 
@@ -125,41 +124,40 @@ class SparseBox3DRefinementModule(nn.Module):
         time_interval: torch.Tensor = 1.0,
         return_cls=True,
     ):
-        with torch.cuda.amp.autocast(enabled=False):
-            instance_feature_fp32 = torch.nan_to_num(
-                instance_feature.float(), nan=0.0, posinf=1e4, neginf=-1e4
+        instance_feature_safe = torch.nan_to_num(
+            instance_feature, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        anchor_embed_safe = torch.nan_to_num(
+            anchor_embed, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        anchor_safe = torch.nan_to_num(
+            anchor, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        feature = instance_feature_safe + anchor_embed_safe
+        output = self.layers(feature)
+        output[..., self.refine_state] = (
+            output[..., self.refine_state] + anchor_safe[..., self.refine_state]
+        )
+        if self.normalize_yaw:
+            output[..., [SIN_YAW, COS_YAW]] = torch.nn.functional.normalize(
+                output[..., [SIN_YAW, COS_YAW]], dim=-1
             )
-            anchor_embed_fp32 = torch.nan_to_num(
-                anchor_embed.float(), nan=0.0, posinf=1e4, neginf=-1e4
-            )
-            anchor_fp32 = torch.nan_to_num(
-                anchor.float(), nan=0.0, posinf=1e4, neginf=-1e4
-            )
-            feature_fp32 = instance_feature_fp32 + anchor_embed_fp32
-            output = self.layers(feature_fp32)
-            output[..., self.refine_state] = (
-                output[..., self.refine_state] + anchor_fp32[..., self.refine_state]
-            )
-            if self.normalize_yaw:
-                output[..., [SIN_YAW, COS_YAW]] = torch.nn.functional.normalize(
-                    output[..., [SIN_YAW, COS_YAW]], dim=-1
-                )
-            if self.output_dim > 8:
-                if not isinstance(time_interval, torch.Tensor):
-                    time_interval = instance_feature.new_tensor(time_interval)
-                translation = torch.transpose(output[..., VX:], 0, -1)
-                velocity = torch.transpose(translation / time_interval.float(), 0, -1)
-                output[..., VX:] = velocity + anchor_fp32[..., VX:]
+        if self.output_dim > 8:
+            if not isinstance(time_interval, torch.Tensor):
+                time_interval = instance_feature.new_tensor(time_interval)
+            translation = torch.transpose(output[..., VX:], 0, -1)
+            velocity = torch.transpose(translation / time_interval.float(), 0, -1)
+            output[..., VX:] = velocity + anchor_safe[..., VX:]
 
-            if return_cls:
-                assert self.with_cls_branch, "Without classification layers !!!"
-                cls = self.cls_layers(instance_feature_fp32)
-            else:
-                cls = None
-            if return_cls and self.with_quality_estimation:
-                quality = self.quality_layers(feature_fp32)
-            else:
-                quality = None
+        if return_cls:
+            assert self.with_cls_branch, "Without classification layers !!!"
+            cls = self.cls_layers(instance_feature_safe)
+        else:
+            cls = None
+        if return_cls and self.with_quality_estimation:
+            quality = self.quality_layers(feature)
+        else:
+            quality = None
         return output, cls, quality
 
 

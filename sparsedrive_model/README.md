@@ -35,8 +35,8 @@ heads: `img` is shaped `[B, N_cam, 3, H, W]`, and metadata such as
 `projection_mat`, `image_wh`, `timestamp`, `img_metas`, labels, boxes, and map
 points are passed as keyword arguments to `model(img, **data)`.
 
-Mixed precision is controlled by the caller with `torch.amp.autocast`; the
-old MMCV `auto_fp16`/`force_fp32` decorators are not used.
+The model runs in pure fp32. External `torch.amp.autocast` wrapping is not
+supported.
 
 ## nuScenes K-means anchors
 

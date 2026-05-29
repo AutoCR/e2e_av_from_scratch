@@ -4,7 +4,7 @@ import time
 import torch
 from mmcv import Config
 from mmcv.parallel import MMDataParallel
-from mmcv.runner import load_checkpoint, wrap_fp16_model
+from mmcv.runner import load_checkpoint
 import sys
 sys.path.append('.')
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
@@ -66,9 +66,6 @@ def get_mem_fps(args):
     # build the model and load checkpoint
     cfg.model.train_cfg = None
     model = build_detector(cfg.model, test_cfg=cfg.get('test_cfg'))
-    fp16_cfg = cfg.get('fp16', None)
-    if fp16_cfg is not None:
-        wrap_fp16_model(model)
     if args.checkpoint is not None:
         load_checkpoint(model, args.checkpoint, map_location='cpu')
     # if args.fuse_conv_bn:
@@ -123,12 +120,9 @@ def get_flops_params(args):
     data_iter = dataloader.__iter__()
     data = next(data_iter)
     data = scatter(data, [gpu_id])[0]
-
+ 
     cfg.model.train_cfg = None
     model = build_detector(cfg.model, test_cfg=cfg.get('test_cfg'))
-    fp16_cfg = cfg.get('fp16', None)
-    if fp16_cfg is not None:
-        wrap_fp16_model(model)
     if args.checkpoint is not None:
         load_checkpoint(model, args.checkpoint, map_location='cpu')
     model = model.cuda(gpu_id)

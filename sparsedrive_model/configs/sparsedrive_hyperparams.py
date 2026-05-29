@@ -107,7 +107,6 @@ OPTIMIZER_CONFIG = {
     "warmup_iters": 1000,
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,           # Final LR = lr * min_lr_ratio
-    "fp16_loss_scale": 32.0,
     "log_interval": 20,             # Print/TensorBoard log every N iterations
     # NAVSIM uses 8 cameras; overrides the model-architecture default of 6.
     "num_cams": 8,
