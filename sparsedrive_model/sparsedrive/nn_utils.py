@@ -137,6 +137,9 @@ class FocalLoss(nn.Module):
 
     def forward(self, pred, target, weight=None, avg_factor=None, reduction_override=None, **kwargs):
         reduction = reduction_override or self.reduction
+        pred = torch.nan_to_num(
+            pred.float(), nan=0.0, posinf=80.0, neginf=-80.0
+        ).clamp_(-80.0, 80.0)
         num_classes = pred.shape[-1]
         valid = (target >= 0) & (target < num_classes)
         target_onehot = pred.new_zeros(pred.shape)
@@ -158,6 +161,9 @@ class CrossEntropyLoss(nn.Module):
     def forward(self, pred, target, weight=None, avg_factor=None, reduction_override=None, **kwargs):
         reduction = reduction_override or self.reduction
         if self.use_sigmoid:
+            pred = torch.nan_to_num(
+                pred.float(), nan=0.0, posinf=80.0, neginf=-80.0
+            ).clamp_(-80.0, 80.0)
             loss = torch.nn.functional.binary_cross_entropy_with_logits(pred, target.float(), reduction="none")
         else:
             loss = torch.nn.functional.cross_entropy(pred, target.long(), reduction="none")
@@ -174,6 +180,10 @@ class GaussianFocalLoss(nn.Module):
 
     def forward(self, pred, target, weight=None, avg_factor=None, reduction_override=None, **kwargs):
         reduction = reduction_override or self.reduction
+        # Sanitize: pred is expected to be a probability in (0, 1); NaN/Inf from
+        # upstream sigmoid would survive .clamp(1e-6, 1-1e-6) (clamp(NaN)=NaN),
+        # so replace non-finite values explicitly before clamping.
+        pred = torch.nan_to_num(pred.float(), nan=0.5, posinf=1.0, neginf=0.0)
         pred = pred.clamp(min=1e-6, max=1 - 1e-6)
         pos_weights = target.eq(1)
         neg_weights = (1 - target).pow(self.gamma)

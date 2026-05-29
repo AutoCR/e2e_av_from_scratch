@@ -458,7 +458,8 @@ def run(config: dict):
                     loss_dict = model(img=img, **batch)
                     loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
                 if not torch.isfinite(loss):
-                    tqdm.write(f"iter={iteration + 1}: non-finite loss={float(loss):.4f}, skipping backward")
+                    bad = {k: float(v) for k, v in loss_dict.items() if torch.is_tensor(v) and not torch.isfinite(v)}
+                    tqdm.write(f"iter={iteration + 1}: non-finite loss={float(loss):.4f}, skipping backward; bad_losses={bad}")
                     _reset_temporal_state(raw_model)
                     optimizer.zero_grad(set_to_none=True)
                     iteration += 1

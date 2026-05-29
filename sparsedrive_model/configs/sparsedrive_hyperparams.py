@@ -36,7 +36,7 @@ RUNTIME_CONFIG = {
             "tokens_key": "tokens",
         },
         "test": {
-            "dir": "trainval",
+            "dir": "test",
             "log_names_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
             "log_names_key": "log_names",
             "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
@@ -61,7 +61,7 @@ RUNTIME_CONFIG = {
 
 TRAINING_SCHEDULE_STAGE1 = {
     "num_epochs": 100,
-    "total_batch_size": 1,
+    "total_batch_size": 2,
     "num_gpus": 8,                  # Reference GPU count (used only by derive_training_hyperparams)
     "ckpt_epoch_interval": 20,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
@@ -78,7 +78,7 @@ TRAINING_SCHEDULE_STAGE1 = {
 
 TRAINING_SCHEDULE_STAGE2 = {
     "num_epochs": 10,
-    "total_batch_size": 1,
+    "total_batch_size": 2,
     "num_gpus": 8,
     "ckpt_epoch_interval": 10,
     "eval_epoch_interval": 10,

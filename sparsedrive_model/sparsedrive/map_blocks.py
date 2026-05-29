@@ -89,13 +89,14 @@ class SparsePoint3DRefinementModule(nn.Module):
         time_interval: torch.Tensor = 1.0,
         return_cls=True,
     ):
-        output = self.layers(instance_feature + anchor_embed)
-        output = output + anchor
-        if return_cls:
-            assert self.with_cls_branch, "Without classification layers !!!"
-            cls = self.cls_layers(instance_feature)  ## NOTE anchor embed?
-        else:
-            cls = None
+        with torch.cuda.amp.autocast(enabled=False):
+            output = self.layers(instance_feature.float() + anchor_embed.float())
+            output = output + anchor.float()
+            if return_cls:
+                assert self.with_cls_branch, "Without classification layers !!!"
+                cls = self.cls_layers(instance_feature.float())  ## NOTE anchor embed?
+            else:
+                cls = None
         qt = None
         return output, cls, qt
 
