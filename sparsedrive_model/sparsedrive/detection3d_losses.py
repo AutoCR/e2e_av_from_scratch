@@ -62,9 +62,14 @@ class SparseBox3DLoss(nn.Module):
         if quality is not None:
             cns = quality[..., CNS]
             yns = quality[..., YNS].sigmoid()
+            # Detach: the centerness target must not backprop into the box
+            # prediction. Without this, torch.norm is differentiated at zero
+            # whenever a matched prediction coincides with its target
+            # (||v||=0 -> 0/0 = NaN grad), producing finite loss but NaN
+            # gradients as training converges.
             cns_target = torch.norm(
                 box_target[..., [X, Y, Z]] - box[..., [X, Y, Z]], p=2, dim=-1
-            )
+            ).detach()
             cns_target = torch.exp(-cns_target)
             cns_loss = self.loss_cns(cns, cns_target, avg_factor=avg_factor)
             output[f"{prefix}loss_cns{suffix}"] = cns_loss

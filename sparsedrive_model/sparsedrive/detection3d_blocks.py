@@ -193,7 +193,14 @@ class SparseBox3DKeyPointsGenerator(nn.Module):
         temp_timestamps=None,
     ):
         bs, num_anchor = anchor.shape[:2]
-        size = anchor[..., None, [W, L, H]].exp()
+        # Clamp the log-size before exp. anchor[..., W/L/H] is stored undecoded
+        # (log space); exp() is differentiated as exp() itself, so an
+        # un-bounded log-size (which the upstream nan_to_num only caps at 1e4,
+        # still far above the fp32 exp overflow point ~88) yields exp -> inf and
+        # an inf gradient even while the sanitized forward loss stays finite.
+        # Real boxes have log-size in roughly [-3, 4], so clamping to [-10, 10]
+        # never affects valid anchors and only tames runaway divergence.
+        size = anchor[..., None, [W, L, H]].clamp(min=-10.0, max=10.0).exp()
         key_points = self.fix_scale * size
         if self.num_learnable_pts > 0 and instance_feature is not None:
             learnable_scale = (

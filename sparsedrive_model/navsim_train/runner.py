@@ -25,7 +25,7 @@ if __package__ in {None, ""}:
         if _path not in sys.path:
             sys.path.insert(0, _path)
 
-from sparsedrive_model.configs.sparsedrive_hyperparams import get_stage_hyperparams
+from sparsedrive_model.configs.sparsedrive_hyperparams import get_camera_order, get_stage_hyperparams
 from sparsedrive_model.navsim_train.eval_hook import run_eval
 from sparsedrive_model.navsim_train.optim import CosineWithLinearWarmup, build_optimizer, clip_grad_norm
 from sparsedrive_model.navsim_train.scene_filter_loader import load_log_names, load_scene_filter_fields
@@ -157,6 +157,7 @@ def _build_dataset(dataset_cls, *, split, config, test_mode, max_scenes, log_nam
         "nuplan_maps_root": config["nuplan_maps_root"],
         "image_hw": (256, 704),
         "test_mode": test_mode,
+        "camera_order": get_camera_order(),
     }
     if max_scenes is not None:
         kwargs["max_scenes"] = max_scenes
@@ -282,6 +283,62 @@ def _build_sampler(dataset, *, shuffle: bool):
     return None
 
 
+def _log_nonfinite_grads(model, iteration, max_report=12):
+    """Report which parameters received NaN/inf gradients.
+
+    Called only on the rare step where clip_grad_norm reports a non-finite
+    norm, so the overhead is negligible. Pinpoints the offending module(s) by
+    parameter name, turning a generic 'NaN/inf gradients' message into an
+    actionable location.
+    """
+    offenders = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        g = param.grad
+        finite = torch.isfinite(g)
+        if not bool(finite.all()):
+            n_nan = int(torch.isnan(g).sum())
+            n_inf = int(torch.isinf(g).sum())
+            finite_vals = g[finite]
+            max_abs = float(finite_vals.abs().max()) if finite_vals.numel() else float("nan")
+            offenders.append((name, n_nan, n_inf, g.numel(), max_abs))
+    if not offenders:
+        tqdm.write(f"iter={iteration}: grad norm non-finite but no per-parameter NaN/inf found (possible overflow in norm reduction)")
+        _log_large_grads(model, iteration)
+        return
+    offenders.sort(key=lambda x: (x[1] + x[2]), reverse=True)
+    tqdm.write(f"iter={iteration}: {len(offenders)} parameter tensor(s) with non-finite grads. Top offenders:")
+    for name, n_nan, n_inf, numel, max_abs in offenders[:max_report]:
+        tqdm.write(
+            f"    {name}: nan={n_nan} inf={n_inf} / {numel} elems; max|finite grad|={max_abs:.3e}"
+        )
+
+
+def _log_large_grads(model, iteration, max_report=8):
+    """Report the parameters carrying the largest (finite) gradient norms.
+
+    Used on a gradient-explosion skip (or fp32 norm-reduction overflow) to
+    identify which module the explosion originates in. Cheap: one norm per
+    parameter tensor, only on the rare bad step.
+    """
+    ranked = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        g = param.grad
+        finite = g[torch.isfinite(g)]
+        if finite.numel() == 0:
+            continue
+        ranked.append((float(finite.norm()), float(finite.abs().max()), name))
+    if not ranked:
+        return
+    ranked.sort(reverse=True)
+    tqdm.write(f"iter={iteration}: largest finite grad-norm parameters:")
+    for gnorm, gmax, name in ranked[:max_report]:
+        tqdm.write(f"    {name}: |grad|_2={gnorm:.3e} max|grad|={gmax:.3e}")
+
+
 def _reset_temporal_state(model):
     """Reset all InstanceBank caches to break NaN propagation across iterations."""
     for module in model.modules():
@@ -302,9 +359,9 @@ def run(config: dict):
     _patch_cuda_calls_for_local_device(device)
     _patch_loss_weight_broadcasting()
     stage = config.get("stage", "stage1")
-    hyperparams, recipe = get_stage_hyperparams(stage, num_cams_override=8)
+    hyperparams, recipe = get_stage_hyperparams(stage)
 
-    for key in ("total_batch_size", "num_epochs", "ckpt_epoch_interval", "eval_epoch_interval", "log_interval"):
+    for key in ("total_batch_size", "num_epochs", "ckpt_epoch_interval", "eval_epoch_interval", "log_interval", "effective_batch_size", "grad_accum_steps"):
         if config.get(key) is not None:
             recipe[key] = config[key]
     if config.get("quick_smoke"):
@@ -316,10 +373,30 @@ def run(config: dict):
                 "log_interval": 1,
                 "ckpt_epoch_interval": 1,
                 "eval_epoch_interval": 1,
+                "grad_accum_steps": 1,
             }
         )
 
     total_batch_size = int(recipe["total_batch_size"])
+
+    # --- Resolve gradient-accumulation steps ---
+    # Effective batch = total_batch_size * world_size * grad_accum_steps.
+    micro_global_batch = total_batch_size * max(1, world_size)
+    grad_accum_steps = recipe.get("grad_accum_steps")
+    if not grad_accum_steps or int(grad_accum_steps) < 1:
+        target_eff = recipe.get("effective_batch_size")
+        if target_eff:
+            grad_accum_steps = max(1, round(int(target_eff) / micro_global_batch))
+        else:
+            grad_accum_steps = 1
+    grad_accum_steps = int(grad_accum_steps)
+    recipe["grad_accum_steps"] = grad_accum_steps
+    effective_batch_size = micro_global_batch * grad_accum_steps
+    if _is_main_process():
+        print(
+            f"[grad-accum] micro_batch={total_batch_size} x world_size={max(1, world_size)} "
+            f"x accum={grad_accum_steps} -> effective_batch={effective_batch_size}"
+        )
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -340,6 +417,10 @@ def run(config: dict):
         max_scenes=max_scenes,
         log_names=train_log_names,
         tokens=train_tokens,
+    )
+    assert len(train_dataset.camera_order) == hyperparams["num_cams"], (
+        f"Camera mismatch: dataset loaded {len(train_dataset.camera_order)} cameras "
+        f"but model num_cams={hyperparams['num_cams']}. Both must derive from CAMERA_ORDER."
     )
     val_dataset = _build_dataset(
         NavSimSparseDriveDataset,
@@ -397,7 +478,7 @@ def run(config: dict):
     raw_model = model.module if isinstance(model, DDP) else model
 
     optimizer = build_optimizer(raw_model, recipe["lr"], recipe["weight_decay"], recipe["backbone_lr_mult"])
-    num_iters_per_epoch = max(1, len(train_dataset) // total_batch_size)
+    num_iters_per_epoch = max(1, len(train_dataset) // (total_batch_size * grad_accum_steps))
     max_iters = num_iters_per_epoch * int(recipe["num_epochs"])
     scheduler = CosineWithLinearWarmup(
         optimizer,
@@ -428,6 +509,20 @@ def run(config: dict):
     ckpt_cadence = max(1, num_iters_per_epoch * int(recipe["ckpt_epoch_interval"]))
 
     iteration = start_iter
+    # Gradient-explosion guard state. skip_norm is an absolute emergency floor;
+    # the EMA-relative guard catches an explosion earlier (before it reaches the
+    # absolute floor) by rejecting any step whose pre-clip norm is a large
+    # multiple of the recent typical norm. Both are belt-and-suspenders around
+    # clip_grad_norm_, which bounds step magnitude but not direction.
+    skip_norm = recipe.get("grad_skip_norm")
+    if skip_norm is None:
+        skip_norm = float(recipe["grad_clip_max_norm"]) * 1000.0
+    skip_norm = float(skip_norm)
+    grad_ema_factor = float(recipe.get("grad_skip_ema_factor", 50.0))
+    grad_ema_beta = float(recipe.get("grad_skip_ema_beta", 0.99))
+    grad_norm_ema = None
+    grad_ema_warmup = 50  # accepted steps before the EMA guard activates
+    grad_ema_count = 0
     pbar = tqdm(
         total=max_iters,
         initial=start_iter,
@@ -440,6 +535,11 @@ def run(config: dict):
         for _epoch in range(int(recipe["num_epochs"])):
             if train_sampler is not None:
                 train_sampler.set_epoch(_epoch)
+            optimizer.zero_grad(set_to_none=True)
+            micro_step = 0
+            window_ok = True
+            window_loss_sum = 0.0
+            window_loss_components: dict[str, float] = {}
             for raw_batch in train_loader:
                 if iteration >= max_iters:
                     break
@@ -448,54 +548,101 @@ def run(config: dict):
                     raise KeyError("Training batches must be dicts containing an 'img' tensor.")
                 batch = _move_to_device(raw_batch, device)
                 img = batch.pop("img")
-                optimizer.zero_grad(set_to_none=True)
+
                 loss_dict = model(img=img, **batch)
                 loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
-                if not torch.isfinite(loss):
+
+                # Decide finiteness collectively so all DDP ranks take the same
+                # branch (otherwise mismatched backward() calls deadlock).
+                micro_finite = bool(torch.isfinite(loss))
+                if world_size > 1:
+                    flag = torch.tensor([1.0 if micro_finite else 0.0], device=device)
+                    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+                    micro_finite = flag.item() > 0.5
+
+                if micro_finite:
+                    # Scale by accum so the summed gradient equals the mean over
+                    # the full effective batch.
+                    (loss / grad_accum_steps).backward()
+                    window_loss_sum += float(loss.detach().cpu())
+                    for k, v in loss_dict.items():
+                        if torch.is_tensor(v):
+                            window_loss_components[k] = window_loss_components.get(k, 0.0) + float(v.detach().cpu())
+                else:
                     bad = {k: float(v) for k, v in loss_dict.items() if torch.is_tensor(v) and not torch.isfinite(v)}
-                    tqdm.write(f"iter={iteration + 1}: non-finite loss={float(loss):.4f}, skipping backward; bad_losses={bad}")
+                    tqdm.write(
+                        f"iter={iteration + 1} micro={micro_step + 1}/{grad_accum_steps}: "
+                        f"non-finite loss, discarding accumulation window; bad_losses={bad}"
+                    )
+                    window_ok = False
                     _reset_temporal_state(raw_model)
-                    optimizer.zero_grad(set_to_none=True)
-                    iteration += 1
-                    pbar.update(1)
-                    scheduler.step(iteration)
+
+                micro_step += 1
+                if micro_step < grad_accum_steps:
                     continue
 
-                loss.backward()
-                raw_model = model.module if isinstance(model, DDP) else model
+                # --- Accumulation window complete: take one optimizer step ---
+                step_done = False
+                grad_norm = None
+                if window_ok:
+                    grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
+                    gn = float(grad_norm)
+                    ema_limit = (
+                        grad_ema_factor * grad_norm_ema
+                        if grad_norm_ema is not None and grad_ema_count >= grad_ema_warmup
+                        else float("inf")
+                    )
+                    if not torch.isfinite(grad_norm):
+                        tqdm.write(f"iter={iteration + 1}: NaN/inf gradients detected, resetting temporal state")
+                        _log_nonfinite_grads(raw_model, iteration + 1)
+                        _reset_temporal_state(raw_model)
+                    elif gn > skip_norm or gn > ema_limit:
+                        # Pre-clip norm is finite but pathologically large (either
+                        # past the absolute floor or a large multiple of the
+                        # recent typical norm): the batch's gradient direction is
+                        # untrustworthy. Skip the step entirely -- clipping its
+                        # magnitude is not enough -- to avoid corrupting the
+                        # weights and diverging.
+                        limit = skip_norm if gn > skip_norm else ema_limit
+                        tqdm.write(
+                            f"iter={iteration + 1}: grad norm {gn:.3e} exceeds skip "
+                            f"threshold {limit:.3e}; skipping step (gradient-explosion guard)"
+                        )
+                        _log_large_grads(raw_model, iteration + 1)
+                        _reset_temporal_state(raw_model)
+                    else:
+                        optimizer.step()
+                        step_done = True
+                        # Track the typical accepted norm for the EMA guard.
+                        grad_norm_ema = (
+                            gn if grad_norm_ema is None
+                            else grad_ema_beta * grad_norm_ema + (1.0 - grad_ema_beta) * gn
+                        )
+                        grad_ema_count += 1
 
-                grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
-                if not torch.isfinite(grad_norm):
-                    tqdm.write(f"iter={iteration + 1}: NaN/inf gradients detected, resetting temporal state")
-                    _reset_temporal_state(raw_model)
-                    optimizer.zero_grad(set_to_none=True)
-                    iteration += 1
-                    pbar.update(1)
-                    scheduler.step(iteration)
-                    continue
-                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                scheduler.step(iteration + 1)
                 global_iter = iteration + 1
-
+                scheduler.step(global_iter)
                 pbar.update(1)
-                if global_iter % int(recipe["log_interval"]) == 0:
-                    losses_for_log = {k: float(v.detach().cpu()) for k, v in loss_dict.items() if torch.is_tensor(v)}
+
+                if step_done and global_iter % int(recipe["log_interval"]) == 0:
+                    avg_loss = window_loss_sum / grad_accum_steps
+                    losses_for_log = {k: v / grad_accum_steps for k, v in window_loss_components.items()}
                     lr = optimizer.param_groups[-1]["lr"]
                     pbar.set_description(f"Epoch [{_epoch + 1}/{int(recipe['num_epochs'])}]")
                     pbar.set_postfix(
-                        loss=f"{float(loss.detach().cpu()):.4f}",
+                        loss=f"{avg_loss:.4f}",
                         lr=f"{lr:.2e}",
                         grad_norm=f"{float(grad_norm):.3f}",
                     )
                     if _is_main_process():
-                        writer.add_scalar("train/loss_total", float(loss.detach().cpu()), global_iter)
+                        writer.add_scalar("train/loss_total", avg_loss, global_iter)
                         writer.add_scalar("train/lr", lr, global_iter)
                         writer.add_scalar("train/grad_norm", float(grad_norm), global_iter)
                         for key, value in losses_for_log.items():
                             writer.add_scalar(f"train/{key}", value, global_iter)
                         tqdm.write(
-                            f"iter={global_iter}/{max_iters} loss={float(loss.detach().cpu()):.6f} "
+                            f"iter={global_iter}/{max_iters} loss={avg_loss:.6f} "
                             f"lr={lr:.8f} grad_norm={float(grad_norm):.4f}"
                         )
 
@@ -506,6 +653,10 @@ def run(config: dict):
                     _checkpoint_if_needed(output_dir, model, optimizer, scheduler, global_iter, config)
 
                 iteration += 1
+                micro_step = 0
+                window_ok = True
+                window_loss_sum = 0.0
+                window_loss_components = {}
             if iteration >= max_iters:
                 break
 
@@ -524,7 +675,7 @@ def run(config: dict):
 
 
 def _standalone_smoke():
-    hyperparams, recipe = get_stage_hyperparams("stage1", num_cams_override=8)
+    hyperparams, recipe = get_stage_hyperparams("stage1")
     model = SparseDrive(_prepare_hyperparams_for_local_build(hyperparams))
     model.init_weights()
     optimizer = build_optimizer(model, recipe["lr"], recipe["weight_decay"], recipe["backbone_lr_mult"])

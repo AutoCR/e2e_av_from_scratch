@@ -61,14 +61,14 @@ RUNTIME_CONFIG = {
 
 TRAINING_SCHEDULE_STAGE1 = {
     "num_epochs": 100,
-    "total_batch_size": 4,
+    "total_batch_size": 12,
     "num_gpus": 8,                  # Reference GPU count (used only by derive_training_hyperparams)
     "ckpt_epoch_interval": 20,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
     "eval_mode": {
         "with_det": True,
         "with_tracking": True,
-        "with_map": True,
+        "with_map": False,
         "with_motion": False,
         "with_planning": False,
         "tracking_threshold": 0.2,
@@ -99,18 +99,61 @@ TRAINING_SCHEDULE_STAGE2 = {
 # Learning rate, weight decay, warmup schedule, gradient clipping, and logging.
 
 OPTIMIZER_CONFIG = {
-    "lr": 2e-4,
+    # LR is paired with ``effective_batch_size`` below. The official SparseDrive
+    # recipe trains at batch 64 with lr=4e-4; we reproduce that stable regime via
+    # gradient accumulation instead of a literal batch of 64 (see runner).
+    "lr": 4e-4,
     "weight_decay": 0.001,
     "backbone_lr_mult": 0.5,        # LR multiplier for backbone parameters
     "grad_clip_max_norm": 25.0,
     "grad_clip_norm_type": 2.0,
-    "warmup_iters": 1000,
+    # Gradient-explosion guard. clip_grad_norm_ bounds step *magnitude* but not
+    # *direction*: a pathological batch with an exploding pre-clip norm still
+    # produces a clipped-but-garbage-direction update that, repeated, walks the
+    # weights into a divergent regime (activations overflow -> softmax/matmul
+    # NaNs ->all-NaN grads). When the pre-clip grad norm exceeds this threshold
+    # the optimizer step is skipped entirely instead of applied. None -> derive
+    # as grad_clip_max_norm * 1000 (i.e. 25000); healthy post-warmup norms are
+    # O(1)-O(100), so this only rejects genuine explosions.
+    "grad_skip_norm": None,
+    # EMA-relative explosion guard: also skip a step whose pre-clip norm exceeds
+    # grad_skip_ema_factor x (EMA of recently accepted norms). Catches an
+    # explosion earlier than the absolute floor. Activates after enough accepted
+    # steps to warm the EMA.
+    "grad_skip_ema_factor": 50.0,
+    "grad_skip_ema_beta": 0.99,
+    # --- Gradient accumulation ---
+    # The dataloader yields micro-batches of ``total_batch_size``; the runner
+    # accumulates enough of them to reach ``effective_batch_size`` before each
+    # optimizer step. This restores the optimization regime the model was tuned
+    # for (effective batch 64) without needing GPU memory for a true batch of 64,
+    # and fixes the small-batch training instability (lr too hot for batch 4).
+    "effective_batch_size": 64,
+    "grad_accum_steps": None,       # None -> auto-derive from effective_batch_size; set an int to override
+    "warmup_iters": 500,            # In optimizer-step units (matches official batch-64 warmup)
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,           # Final LR = lr * min_lr_ratio
-    "log_interval": 20,             # Print/TensorBoard log every N iterations
-    # NAVSIM uses 8 cameras; overrides the model-architecture default of 6.
-    "num_cams": 8,
+    "log_interval": 20,             # Print/TensorBoard log every N optimizer steps
 }
+
+# =============================================================================
+# NAVSIM CAMERA CONFIGURATION
+# =============================================================================
+# SINGLE source of truth for which NAVSIM cameras, and therefore how many,
+# the NAVSIM training pipeline uses. num_cams is derived as len(CAMERA_ORDER).
+# To train with 4 cameras, edit this list to a 4-name subset of the 8 valid
+# NAVSIM cameras: CAM_F0, CAM_L0, CAM_L1, CAM_R0, CAM_R1, CAM_L2, CAM_R2,
+# CAM_B0. The default keeps all 8 cameras, preserving current behavior.
+CAMERA_ORDER = (
+    "CAM_F0",
+    "CAM_L0",
+    # "CAM_L1",
+    "CAM_R0",
+    # "CAM_R1",
+    # "CAM_L2",
+    # "CAM_R2",
+    # "CAM_B0",
+)
 
 # =============================================================================
 # SECTION 4: MODEL ARCHITECTURE
@@ -162,7 +205,7 @@ MODEL_ARCH = {
     "temporal_map": True,
     "decouple_attn_motion": True,
     "with_quality_estimation": True,
-    "task_config": {"with_det": True, "with_map": True, "with_motion_plan": False},
+    "task_config": {"with_det": True, "with_map": False, "with_motion_plan": False},
     # --- Paths ---
     "kmeans_dir": "./sparsedrive_model/data/kmeans",
     "backbone_pretrained": "model_weights/resnet50/resnet50-19c8e357.pth",
@@ -173,7 +216,7 @@ MODEL_ARCH = {
     "fpn_add_extra_convs": "on_output",
     "fpn_in_channels": [256, 512, 1024, 2048],
     # --- Camera / attention ---
-    "num_cams": 6,                  # Model default; overridden to 8 for NAVSIM via OPTIMIZER_CONFIG
+    "num_cams": 6,                  # Base/nuScenes default; the NAVSIM training path overrides this from CAMERA_ORDER via get_stage_hyperparams().
     "deformable_attn_drop": 0.15,
     "deformable_use_camera_embed": True,
     "deformable_residual_mode": "cat",
@@ -335,11 +378,22 @@ def get_stage2_hyperparams() -> dict:
     return _build_model_hyperparams(stage2=True)
 
 
-def get_stage_hyperparams(stage: str, num_cams_override: int = 8) -> tuple[dict, dict]:
+def get_camera_order() -> tuple[str, ...]:
+    """Return the configured NAVSIM camera order."""
+    return tuple(CAMERA_ORDER)
+
+
+def get_num_cams() -> int:
+    """Return the number of configured NAVSIM cameras."""
+    return len(CAMERA_ORDER)
+
+
+def get_stage_hyperparams(stage: str) -> tuple[dict, dict]:
     """Return ``(model_hyperparams, training_recipe)`` for the given stage.
 
     ``training_recipe`` is a flat dict consumed by the runner; it contains all
-    optimizer, scheduler, and training-schedule parameters.
+    optimizer, scheduler, and training-schedule parameters. num_cams is derived
+    from CAMERA_ORDER.
     """
     normalized = str(stage).lower().replace("_", "").replace("-", "")
     if normalized in {"1", "stage1"}:
@@ -353,8 +407,9 @@ def get_stage_hyperparams(stage: str, num_cams_override: int = 8) -> tuple[dict,
 
     recipe = deepcopy(OPTIMIZER_CONFIG)
     recipe.update(schedule)
-    recipe["num_cams"] = int(num_cams_override)
-    hyperparams["num_cams"] = int(num_cams_override)
+    n_cams = get_num_cams()
+    recipe["num_cams"] = n_cams
+    hyperparams["num_cams"] = n_cams
     return hyperparams, recipe
 
 

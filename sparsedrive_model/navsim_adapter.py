@@ -178,8 +178,11 @@ def _normalize_camera_name(camera_name: str) -> str:
 
 def normalize_camera_order(camera_order: Sequence[str] = DEFAULT_CAMERA_ORDER) -> tuple[str, ...]:
     normalized = tuple(_normalize_camera_name(camera) for camera in camera_order)
-    if len(normalized) not in {6, 8}:
-        raise ValueError(f"SparseDrive requires either six or eight cameras, got {len(normalized)}: {normalized}")
+    if not (1 <= len(normalized) <= len(VALID_NAVSIM_CAMERA_NAMES)):
+        raise ValueError(
+            f"SparseDrive requires between 1 and {len(VALID_NAVSIM_CAMERA_NAMES)} cameras, "
+            f"got {len(normalized)}: {normalized}"
+        )
     if len(set(normalized)) != len(normalized):
         raise ValueError(f"Camera order must not contain duplicates: {normalized}")
     return normalized

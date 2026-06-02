@@ -227,8 +227,15 @@ class DeformableFeatureAggregation(nn.Module):
             projection_mat[:, :, None, None],
             pts_extend[:, None, ..., None],
         ).squeeze(-1)
+        # Divide by camera-frame depth z. The backward of x/z is proportional to
+        # 1/z^2, so a tiny floor (the original 1e-4) creates a ~1e8 gradient
+        # cliff whenever an anchor drifts so its keypoint lands near/behind the
+        # camera plane (z->0). That cliff is the dominant source of gradient
+        # explosion -> divergence in from-scratch training. A 0.1 m floor caps
+        # the worst-case denominator gradient at ~1e2 and never affects valid
+        # points: nothing visible is within 10 cm of the camera.
         points_2d = points_2d[..., :2] / torch.clamp(
-            points_2d[..., 2:3], min=1e-4
+            points_2d[..., 2:3], min=1e-1
         )
         if image_wh is not None:
             points_2d = points_2d / image_wh[:, :, None, None]
