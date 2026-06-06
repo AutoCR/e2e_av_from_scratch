@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import torch
@@ -251,7 +251,11 @@ def _init_distributed():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    # The default NCCL collective timeout is 10 min. Rank 0 periodically leaves
+    # the collective path to run eval / write checkpoints, so the timeout must be
+    # long enough to cover the longest such gap or the other ranks' watchdogs fire.
+    timeout_min = int(os.environ.get("NCCL_TIMEOUT_MINUTES", "60"))
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout_min))
     return local_rank, world_size
 
 
@@ -509,20 +513,13 @@ def run(config: dict):
     ckpt_cadence = max(1, num_iters_per_epoch * int(recipe["ckpt_epoch_interval"]))
 
     iteration = start_iter
-    # Gradient-explosion guard state. skip_norm is an absolute emergency floor;
-    # the EMA-relative guard catches an explosion earlier (before it reaches the
-    # absolute floor) by rejecting any step whose pre-clip norm is a large
-    # multiple of the recent typical norm. Both are belt-and-suspenders around
-    # clip_grad_norm_, which bounds step magnitude but not direction.
+    # Gradient-explosion guard: skip any step whose pre-clip norm exceeds the
+    # absolute floor skip_norm. clip_grad_norm_ bounds step magnitude but not
+    # direction; skipping pathologically large-norm steps avoids corrupting weights.
     skip_norm = recipe.get("grad_skip_norm")
     if skip_norm is None:
         skip_norm = float(recipe["grad_clip_max_norm"]) * 1000.0
     skip_norm = float(skip_norm)
-    grad_ema_factor = float(recipe.get("grad_skip_ema_factor", 50.0))
-    grad_ema_beta = float(recipe.get("grad_skip_ema_beta", 0.99))
-    grad_norm_ema = None
-    grad_ema_warmup = 50  # accepted steps before the EMA guard activates
-    grad_ema_count = 0
     pbar = tqdm(
         total=max_iters,
         initial=start_iter,
@@ -587,38 +584,23 @@ def run(config: dict):
                 if window_ok:
                     grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
                     gn = float(grad_norm)
-                    ema_limit = (
-                        grad_ema_factor * grad_norm_ema
-                        if grad_norm_ema is not None and grad_ema_count >= grad_ema_warmup
-                        else float("inf")
-                    )
                     if not torch.isfinite(grad_norm):
                         tqdm.write(f"iter={iteration + 1}: NaN/inf gradients detected, resetting temporal state")
                         _log_nonfinite_grads(raw_model, iteration + 1)
                         _reset_temporal_state(raw_model)
-                    elif gn > skip_norm or gn > ema_limit:
-                        # Pre-clip norm is finite but pathologically large (either
-                        # past the absolute floor or a large multiple of the
-                        # recent typical norm): the batch's gradient direction is
-                        # untrustworthy. Skip the step entirely -- clipping its
-                        # magnitude is not enough -- to avoid corrupting the
-                        # weights and diverging.
-                        limit = skip_norm if gn > skip_norm else ema_limit
+                    elif gn > skip_norm:
+                        # Pre-clip norm is finite but pathologically large: the
+                        # batch's gradient direction is untrustworthy. Skip the
+                        # step entirely to avoid corrupting the weights.
                         tqdm.write(
                             f"iter={iteration + 1}: grad norm {gn:.3e} exceeds skip "
-                            f"threshold {limit:.3e}; skipping step (gradient-explosion guard)"
+                            f"threshold {skip_norm:.3e}; skipping step (gradient-explosion guard)"
                         )
                         _log_large_grads(raw_model, iteration + 1)
                         _reset_temporal_state(raw_model)
                     else:
                         optimizer.step()
                         step_done = True
-                        # Track the typical accepted norm for the EMA guard.
-                        grad_norm_ema = (
-                            gn if grad_norm_ema is None
-                            else grad_ema_beta * grad_norm_ema + (1.0 - grad_ema_beta) * gn
-                        )
-                        grad_ema_count += 1
 
                 optimizer.zero_grad(set_to_none=True)
                 global_iter = iteration + 1
@@ -646,11 +628,22 @@ def run(config: dict):
                             f"lr={lr:.8f} grad_norm={float(grad_norm):.4f}"
                         )
 
-                if global_iter % eval_cadence == 0 and _is_main_process():
-                    summary = run_eval(model, val_loader, device, output_dir, writer, global_iter, recipe["eval_mode"], "val")
-                    print(f"val@{global_iter}: {summary}")
-                if global_iter % ckpt_cadence == 0 and _is_main_process():
+                # In-loop validation is disabled: rank-0-only eval stalls the other
+                # DDP ranks and risks NCCL watchdog timeouts. Re-enable by
+                # uncommenting the block below (the barrier already covers it).
+                ran_eval = False  # global_iter % eval_cadence == 0
+                ran_ckpt = global_iter % ckpt_cadence == 0
+                # if ran_eval and _is_main_process():
+                #     summary = run_eval(model, val_loader, device, output_dir, writer, global_iter, recipe["eval_mode"], "val")
+                #     print(f"val@{global_iter}: {summary}")
+                if ran_ckpt and _is_main_process():
                     _checkpoint_if_needed(output_dir, model, optimizer, scheduler, global_iter, config)
+                # Hold every rank here until rank 0 finishes eval/checkpoint.
+                # Without this, the non-main ranks race into the next collective
+                # (all_reduce / DDP backward) while rank 0 is busy, and their NCCL
+                # watchdogs time out -> the whole job dies.
+                if world_size > 1 and (ran_eval or ran_ckpt):
+                    dist.barrier()
 
                 iteration += 1
                 micro_step = 0

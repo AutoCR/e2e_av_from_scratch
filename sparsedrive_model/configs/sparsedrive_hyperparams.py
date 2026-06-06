@@ -63,7 +63,7 @@ TRAINING_SCHEDULE_STAGE1 = {
     "num_epochs": 100,
     "total_batch_size": 12,
     "num_gpus": 8,                  # Reference GPU count (used only by derive_training_hyperparams)
-    "ckpt_epoch_interval": 20,      # Save a checkpoint every N epochs
+    "ckpt_epoch_interval": 2,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
     "eval_mode": {
         "with_det": True,
@@ -105,7 +105,7 @@ OPTIMIZER_CONFIG = {
     "lr": 4e-4,
     "weight_decay": 0.001,
     "backbone_lr_mult": 0.5,        # LR multiplier for backbone parameters
-    "grad_clip_max_norm": 25.0,
+    "grad_clip_max_norm": 1.0,
     "grad_clip_norm_type": 2.0,
     # Gradient-explosion guard. clip_grad_norm_ bounds step *magnitude* but not
     # *direction*: a pathological batch with an exploding pre-clip norm still
@@ -116,12 +116,6 @@ OPTIMIZER_CONFIG = {
     # as grad_clip_max_norm * 1000 (i.e. 25000); healthy post-warmup norms are
     # O(1)-O(100), so this only rejects genuine explosions.
     "grad_skip_norm": None,
-    # EMA-relative explosion guard: also skip a step whose pre-clip norm exceeds
-    # grad_skip_ema_factor x (EMA of recently accepted norms). Catches an
-    # explosion earlier than the absolute floor. Activates after enough accepted
-    # steps to warm the EMA.
-    "grad_skip_ema_factor": 50.0,
-    "grad_skip_ema_beta": 0.99,
     # --- Gradient accumulation ---
     # The dataloader yields micro-batches of ``total_batch_size``; the runner
     # accumulates enough of them to reach ``effective_batch_size`` before each
@@ -133,7 +127,7 @@ OPTIMIZER_CONFIG = {
     "warmup_iters": 500,            # In optimizer-step units (matches official batch-64 warmup)
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,           # Final LR = lr * min_lr_ratio
-    "log_interval": 20,             # Print/TensorBoard log every N optimizer steps
+    "log_interval": 5,             # Print/TensorBoard log every N optimizer steps
 }
 
 # =============================================================================
