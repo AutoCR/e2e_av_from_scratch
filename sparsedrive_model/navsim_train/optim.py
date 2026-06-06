@@ -104,9 +104,12 @@ def compute_grad_norm(parameters, norm_type=2.0):
     if not grads:
         return torch.zeros((), dtype=torch.float64)
     norm_type = float(norm_type)
+    # Accumulate on the grads' own device so this works under DDP (each rank's
+    # grads live on a distinct cuda:N) without host<->device syncs per parameter.
+    device = grads[0].device
     if norm_type == float("inf"):
         return max(g.detach().abs().max().to(torch.float64) for g in grads)
-    total = torch.zeros((), dtype=torch.float64)
+    total = torch.zeros((), dtype=torch.float64, device=device)
     for g in grads:
         # Per-parameter norm in fp32 is safe (one tensor rarely overflows); the
         # cross-parameter accumulation is what overflows, so accumulate in fp64.

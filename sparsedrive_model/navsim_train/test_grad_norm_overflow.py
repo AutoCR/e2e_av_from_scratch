@@ -128,9 +128,36 @@ def test_real_inf_still_detected():
     _assert(not torch.isfinite(norm), "Inf grad element -> non-finite norm (still caught by the guard)")
 
 
+def test_returns_on_grad_device():
+    """Regression: the fp64 accumulator must live on the grads' device.
+
+    Under DDP each rank's grads are on a distinct cuda:N. An accumulator built on
+    CPU made ``total += param_norm`` raise "Expected all tensors to be on the same
+    device, but found at least two devices, cuda:N and cpu". On a CUDA box this
+    runs the real check; on CPU it at least pins the contract that the returned
+    norm is on the same device as the grads.
+    """
+    print("test_returns_on_grad_device")
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda:0")
+    for dev in devices:
+        m = _Model([(10,)] * 3).to(dev)
+        m.set_grads(0.5)
+        norm = compute_grad_norm(list(m.parameters()), 2.0)
+        _assert(
+            norm.device == m.ps[0].grad.device,
+            f"[{dev}] norm returned on grads' device ({norm.device})",
+        )
+        # The clip path must also not raise across devices.
+        clipped = clip_grad_norm(m, max_norm=1.0, norm_type=2.0)
+        _assert(torch.isfinite(clipped), f"[{dev}] clip_grad_norm runs without device mismatch")
+
+
 if __name__ == "__main__":
     test_large_finite_grads_dont_overflow()
     test_normal_grads_unchanged()
     test_real_nan_still_detected()
     test_real_inf_still_detected()
+    test_returns_on_grad_device()
     print("\nAll grad-norm overflow regression tests passed.")
