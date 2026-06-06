@@ -238,6 +238,14 @@ DETECTION_HEAD = {
     "det_num_temp_instances": 600,
     "det_confidence_decay": 0.6,
     "det_feat_grad": False,
+    # The detection anchor is a kmeans prior. Leaving it trainable lets it drift
+    # over many iterations until projected keypoints cluster against the depth
+    # clamp (z>=0.1) and the 1/z^2 backward produces O(1e18) grads that overflow
+    # the grad-norm reduction -> the step is skipped every iteration. Freezing it
+    # (the standard SparseDrive setting) keeps the anchor at its kmeans prior and
+    # removes that drift-driven explosion. Set True only if you intend to learn
+    # the anchor and have verified it stays stable.
+    "det_anchor_grad": False,
     "det_anchor_file": "kmeans_det_900.npy",
     # Keypoint geometry
     "det_keypoint_num_learnable_pts": 6,
@@ -290,6 +298,12 @@ MAP_HEAD = {
     "map_num_anchor": 100,
     "map_confidence_decay": 0.6,
     "map_feat_grad": True,
+    # Freeze the map anchor (kmeans prior) for the same reason as the detection
+    # anchor: a trainable anchor drifts until projected keypoints hit the depth
+    # clamp and the 1/z^2 backward produces grads large enough to overflow the
+    # grad-norm reduction. Relevant in Stage 2 (with_map=True). See
+    # [det_anchor_grad] above. Set True only to learn the anchor deliberately.
+    "map_anchor_grad": False,
     "map_anchor_file": "kmeans_map_100.npy",
     # Keypoint geometry
     "map_keypoint_num_learnable_pts": 3,

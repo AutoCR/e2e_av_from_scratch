@@ -582,6 +582,10 @@ def run(config: dict):
                 step_done = False
                 grad_norm = None
                 if window_ok:
+                    # clip_grad_norm computes the total norm in fp64 (no fp32
+                    # reduction overflow) and only clips when the norm is finite,
+                    # leaving grads intact on a genuine NaN/inf so the diagnostic
+                    # below can inspect the real (pre-clip-zeroing) gradients.
                     grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
                     gn = float(grad_norm)
                     if not torch.isfinite(grad_norm):
@@ -589,9 +593,9 @@ def run(config: dict):
                         _log_nonfinite_grads(raw_model, iteration + 1)
                         _reset_temporal_state(raw_model)
                     elif gn > skip_norm:
-                        # Pre-clip norm is finite but pathologically large: the
-                        # batch's gradient direction is untrustworthy. Skip the
-                        # step entirely to avoid corrupting the weights.
+                        # Norm is finite but pathologically large: the batch's
+                        # gradient direction is untrustworthy. Skip the step
+                        # entirely to avoid corrupting the weights.
                         tqdm.write(
                             f"iter={iteration + 1}: grad norm {gn:.3e} exceeds skip "
                             f"threshold {skip_norm:.3e}; skipping step (gradient-explosion guard)"
@@ -607,25 +611,36 @@ def run(config: dict):
                 scheduler.step(global_iter)
                 pbar.update(1)
 
-                if step_done and global_iter % int(recipe["log_interval"]) == 0:
+                # Log on every completed window (not just successful steps) so the
+                # displayed/recorded grad_norm reflects the CURRENT iteration. The
+                # old `step_done`-gated path left tqdm showing a stale grad_norm
+                # from the last good step whenever a window was skipped, hiding
+                # ongoing explosions behind a healthy-looking number.
+                if grad_norm is not None and global_iter % int(recipe["log_interval"]) == 0:
                     avg_loss = window_loss_sum / grad_accum_steps
                     losses_for_log = {k: v / grad_accum_steps for k, v in window_loss_components.items()}
                     lr = optimizer.param_groups[-1]["lr"]
+                    gn_finite = bool(torch.isfinite(grad_norm))
+                    gn_str = f"{float(grad_norm):.3f}" if gn_finite else "non-finite"
                     pbar.set_description(f"Epoch [{_epoch + 1}/{int(recipe['num_epochs'])}]")
                     pbar.set_postfix(
                         loss=f"{avg_loss:.4f}",
                         lr=f"{lr:.2e}",
-                        grad_norm=f"{float(grad_norm):.3f}",
+                        grad_norm=gn_str,
+                        skipped="" if step_done else "1",
                     )
                     if _is_main_process():
                         writer.add_scalar("train/loss_total", avg_loss, global_iter)
                         writer.add_scalar("train/lr", lr, global_iter)
-                        writer.add_scalar("train/grad_norm", float(grad_norm), global_iter)
+                        if gn_finite:
+                            writer.add_scalar("train/grad_norm", float(grad_norm), global_iter)
+                        writer.add_scalar("train/step_skipped", 0 if step_done else 1, global_iter)
                         for key, value in losses_for_log.items():
                             writer.add_scalar(f"train/{key}", value, global_iter)
                         tqdm.write(
                             f"iter={global_iter}/{max_iters} loss={avg_loss:.6f} "
-                            f"lr={lr:.8f} grad_norm={float(grad_norm):.4f}"
+                            f"lr={lr:.8f} grad_norm={gn_str} "
+                            f"step={'ok' if step_done else 'SKIPPED'}"
                         )
 
                 # In-loop validation is disabled: rank-0-only eval stalls the other

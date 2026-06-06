@@ -85,5 +85,52 @@ class CosineWithLinearWarmup:
         self._apply_lr(self.last_iter)
 
 
+def compute_grad_norm(parameters, norm_type=2.0):
+    """Total gradient norm computed in fp64 to avoid fp32 reduction overflow.
+
+    ``torch.nn.utils.clip_grad_norm_`` squares-and-sums every parameter's grad
+    in the grads' own dtype. In pure fp32 a few large-but-finite gradients
+    (O(1e18)) make the global sum-of-squares exceed the fp32 max (3.4e38) and
+    saturate to ``inf`` even though *no individual grad element is non-finite*.
+    The old code then misread that ``inf`` as "NaN/inf gradients" and skipped the
+    step forever. Accumulating each per-parameter norm in float64 lifts the
+    overflow ceiling to ~1.8e308, so a genuinely finite (if large) gradient
+    yields a finite total norm and can be clipped normally.
+
+    Returns a 0-dim float64 tensor. It is non-finite only when some grad element
+    is actually NaN/Inf -- a true explosion -- not merely large.
+    """
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.zeros((), dtype=torch.float64)
+    norm_type = float(norm_type)
+    if norm_type == float("inf"):
+        return max(g.detach().abs().max().to(torch.float64) for g in grads)
+    total = torch.zeros((), dtype=torch.float64)
+    for g in grads:
+        # Per-parameter norm in fp32 is safe (one tensor rarely overflows); the
+        # cross-parameter accumulation is what overflows, so accumulate in fp64.
+        param_norm = g.detach().norm(norm_type).to(torch.float64)
+        total += param_norm ** norm_type
+    return total ** (1.0 / norm_type)
+
+
 def clip_grad_norm(model, max_norm, norm_type):
-    return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm, norm_type=norm_type)
+    """Clip grads to ``max_norm`` using an fp64 total-norm.
+
+    Mirrors ``clip_grad_norm_`` (scale every grad by ``max_norm/total_norm`` when
+    the total exceeds ``max_norm``) but computes the total in fp64 so a large yet
+    finite gradient is clipped instead of being mistaken for an explosion. When
+    the total norm is genuinely non-finite (real NaN/Inf grad element) the grads
+    are left untouched so the caller's guard can detect and skip the step.
+    """
+    parameters = [p for p in model.parameters() if p.grad is not None]
+    total_norm = compute_grad_norm(parameters, norm_type)
+    if not torch.isfinite(total_norm):
+        return total_norm
+    max_norm = float(max_norm)
+    clip_coef = max_norm / (float(total_norm) + 1e-6)
+    if clip_coef < 1.0:
+        for p in parameters:
+            p.grad.detach().mul_(clip_coef)
+    return total_norm

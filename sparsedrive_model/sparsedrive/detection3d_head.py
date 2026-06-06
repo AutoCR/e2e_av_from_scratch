@@ -192,6 +192,7 @@ class Sparse4DDetHead(nn.Module):
             ),
             confidence_decay=hyperparams["det_confidence_decay"],
             feat_grad=hyperparams["det_feat_grad"],
+            anchor_grad=hyperparams.get("det_anchor_grad", True),
         )
         self.anchor_encoder = SparseBox3DEncoder(
             vel_dims=hyperparams["det_encoder_vel_dims"],
@@ -903,6 +904,7 @@ class Sparse4DMap(nn.Module):
             ),
             confidence_decay=hyperparams["map_confidence_decay"],
             feat_grad=hyperparams["map_feat_grad"],
+            anchor_grad=hyperparams.get("map_anchor_grad", True),
         )
         self.anchor_encoder = SparsePoint3DEncoder(
             embed_dims=embed_dims,
