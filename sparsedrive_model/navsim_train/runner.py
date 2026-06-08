@@ -33,6 +33,17 @@ from sparsedrive_model.sparsedrive import SparseDrive
 from sparsedrive_model.sparsedrive import nn_utils as _sparsedrive_nn_utils
 
 
+class TrainingStalledError(RuntimeError):
+    """Raised when too many optimizer steps are skipped consecutively.
+
+    A sustained run of skipped steps means the model has diverged into a regime
+    where every batch produces a pathological (explosion-guard-tripping) gradient
+    and no weight update ever lands -- training is frozen but still consuming
+    compute. Aborting loudly turns ~1.5 days of wasted GPU time into a fast,
+    actionable failure. Tuned via recipe['grad_skip_abort_after'].
+    """
+
+
 def _set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -192,6 +203,20 @@ def _prepare_hyperparams_for_local_build(hyperparams):
     prepared = dict(hyperparams)
     pretrained = prepared.get("backbone_pretrained")
     if pretrained and not Path(pretrained).exists():
+        # Drop a missing pretrained-backbone path so a CPU/local smoke build can
+        # still construct the model. But warn LOUDLY: a typo'd or wrong-CWD path
+        # would otherwise silently train the backbone from RANDOM init instead of
+        # ImageNet, degrading a full run with no error. Only rank 0 prints (the
+        # message is identical across ranks).
+        if _is_main_process():
+            print(
+                f"WARNING: backbone_pretrained={pretrained!r} does not exist "
+                f"(cwd={Path.cwd()}); falling back to RANDOM backbone init. "
+                f"For a real training run this is almost certainly wrong -- fix "
+                f"the path so the ImageNet-pretrained ResNet actually loads.",
+                file=sys.stderr,
+                flush=True,
+            )
         prepared["backbone_pretrained"] = None
     return prepared
 
@@ -520,6 +545,12 @@ def run(config: dict):
     if skip_norm is None:
         skip_norm = float(recipe["grad_clip_max_norm"]) * 1000.0
     skip_norm = float(skip_norm)
+    # Stall guard: abort if this many optimizer steps are skipped consecutively
+    # (a frozen-but-running divergence). A successful step resets the counter, so
+    # one-off spikes never trip it. None/<=0 disables. See grad_skip_abort_after.
+    abort_after = recipe.get("grad_skip_abort_after")
+    abort_after = int(abort_after) if abort_after else 0
+    consecutive_skips = 0
     pbar = tqdm(
         total=max_iters,
         initial=start_iter,
@@ -610,6 +641,30 @@ def run(config: dict):
                 global_iter = iteration + 1
                 scheduler.step(global_iter)
                 pbar.update(1)
+
+                # Stall guard: a successful step resets the streak; any skipped
+                # window (explosion-guard, NaN/inf grads, or non-finite loss)
+                # extends it. A long streak means training is frozen in a
+                # divergent regime -- abort instead of burning compute. The
+                # decision is identical on every DDP rank (step_done derives from
+                # the collectively-decided loss/grads), so all ranks raise
+                # together and none hang in a later collective.
+                if step_done:
+                    consecutive_skips = 0
+                else:
+                    consecutive_skips += 1
+                    if abort_after and consecutive_skips >= abort_after:
+                        msg = (
+                            f"Training stalled: {consecutive_skips} consecutive optimizer "
+                            f"steps skipped (last grad_norm="
+                            f"{'non-finite' if grad_norm is None or not torch.isfinite(grad_norm) else f'{float(grad_norm):.3e}'}"
+                            f", skip_threshold={skip_norm:.3e}) at iter {global_iter}/{max_iters}. "
+                            f"The model has diverged and no weight update is landing. Restart from "
+                            f"the last pre-divergence checkpoint with a fix in place "
+                            f"(grad_skip_abort_after={abort_after})."
+                        )
+                        tqdm.write(msg)
+                        raise TrainingStalledError(msg)
 
                 # Log on every completed window (not just successful steps) so the
                 # displayed/recorded grad_norm reflects the CURRENT iteration. The

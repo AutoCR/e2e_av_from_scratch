@@ -135,9 +135,26 @@ class SparseBox3DRefinementModule(nn.Module):
         )
         feature = instance_feature_safe + anchor_embed_safe
         output = self.layers(feature)
-        output[..., self.refine_state] = (
+        # Bound the refined box centre to the metric scene range, folded into the
+        # single refine_state write (a *second* in-place advanced-index assignment
+        # on `output` trips autograd's version counter). The kmeans anchor prior
+        # is frozen (det/map_anchor_grad=False), but this MLP delta is NOT: it is
+        # added to X/Y/Z at every decoder layer with no bound. From scratch on
+        # NAVSIM it can drift the centre until a generated keypoint projects near
+        # the camera plane, where project_points' 1/z^2 backward (blocks.py:237)
+        # amplifies grads into the 1e7-1e17 range -> the explosion-guard skips
+        # every step and training stalls. Real NAVSIM objects sit well inside
+        # |x|,|y|<=100 m and |z|<=10 m, so clamping the *centre* never touches a
+        # valid box; only X/Y/Z are bounded (W/L/H/yaw use +/-inf = no clamp).
+        # Mirrors the size-exp clamp in SparseBox3DKeyPointsGenerator.
+        refined_state = (
             output[..., self.refine_state] + anchor_safe[..., self.refine_state]
         )
+        _centre_lo = {X: -100.0, Y: -100.0, Z: -10.0}
+        _centre_hi = {X: 100.0, Y: 100.0, Z: 10.0}
+        lo = output.new_tensor([_centre_lo.get(s, float("-inf")) for s in self.refine_state])
+        hi = output.new_tensor([_centre_hi.get(s, float("inf")) for s in self.refine_state])
+        output[..., self.refine_state] = refined_state.clamp(min=lo, max=hi)
         if self.normalize_yaw:
             output[..., [SIN_YAW, COS_YAW]] = torch.nn.functional.normalize(
                 output[..., [SIN_YAW, COS_YAW]], dim=-1

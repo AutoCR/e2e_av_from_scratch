@@ -116,6 +116,14 @@ OPTIMIZER_CONFIG = {
     # as grad_clip_max_norm * 1000 (i.e. 25000); healthy post-warmup norms are
     # O(1)-O(100), so this only rejects genuine explosions.
     "grad_skip_norm": None,
+    # Stall guard. The grad-explosion guard above skips a corrupted step, but if
+    # the model has walked into a divergent regime EVERY subsequent step explodes
+    # and is skipped -> training is frozen yet keeps burning compute (a real run
+    # skipped ~99k consecutive steps for ~1.5 days). Abort once this many
+    # optimizer steps are skipped in a row; a single successful step resets the
+    # counter, so transient one-off spikes never trip it. None disables the guard.
+    # With log_interval=5 a value of 200 catches a true stall within ~1000 iters.
+    "grad_skip_abort_after": 200,
     # --- Gradient accumulation ---
     # The dataloader yields micro-batches of ``total_batch_size``; the runner
     # accumulates enough of them to reach ``effective_batch_size`` before each
