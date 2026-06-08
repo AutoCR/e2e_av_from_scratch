@@ -9,6 +9,8 @@ from typing import Tuple
 import torch
 from torch import nn
 
+from .bev_pool import bev_pool as bev_pool_cuda, BEV_POOL_CUDA_AVAILABLE
+
 
 def gen_dx_bx(xbound, ybound, zbound):
     """Generate grid cell size, center offset, and grid dimensions.
@@ -188,19 +190,25 @@ class BaseTransform(nn.Module):
         x = x[kept]
         geom_feats = geom_feats[kept]
 
-        # scatter into BEV grid: shape (B, Nz, Nx, Ny, C)
         Nz = int(self.nx[2].item())
         Nx = int(self.nx[0].item())
         Ny = int(self.nx[1].item())
-        bev = torch.zeros(B, Nz, Nx, Ny, C, device=x.device, dtype=x.dtype)
 
-        xi, yi, zi, bi = geom_feats[:, 0], geom_feats[:, 1], geom_feats[:, 2], geom_feats[:, 3]
-        # scatter-add using index_put_
-        bev.index_put_((bi, zi, xi, yi), x, accumulate=True)
+        if BEV_POOL_CUDA_AVAILABLE and x.is_cuda:
+            # CUDA fast path: fused sort + scatter. geom_feats is (x, y, z, batch)
+            # and the kernel returns (B, C, Nz, Nx, Ny), matching the pure path.
+            bev = bev_pool_cuda(x, geom_feats, B, Nz, Nx, Ny)
+        else:
+            # Pure-PyTorch fallback: scatter into BEV grid (B, Nz, Nx, Ny, C).
+            bev = torch.zeros(B, Nz, Nx, Ny, C, device=x.device, dtype=x.dtype)
+            xi, yi, zi, bi = geom_feats[:, 0], geom_feats[:, 1], geom_feats[:, 2], geom_feats[:, 3]
+            # scatter-add using index_put_
+            bev.index_put_((bi, zi, xi, yi), x, accumulate=True)
+            # permute to (B, C, Nz, Nx, Ny)
+            bev = bev.permute(0, 4, 1, 2, 3)
 
-        # collapse Z dimension and permute to (B, C*Nz, Nx, Ny)
-        bev = bev.permute(0, 4, 1, 2, 3)  # (B, C, Nz, Nx, Ny)
-        final = torch.cat(bev.unbind(dim=2), 1)  # (B, C*Nz, Nx, Ny)
+        # collapse Z dimension → (B, C*Nz, Nx, Ny)
+        final = torch.cat(bev.unbind(dim=2), 1)
 
         return final
 

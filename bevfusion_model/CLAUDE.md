@@ -37,6 +37,7 @@ LiDAR points       → HardVoxelization → SparseEncoder/spconv_mac fallback �
 | `decoder.py` | `SECONDBackbone` + `SECONDNeck` | `mmdet3d/models/backbones/second.py` + neck |
 | `detection_head.py` | `TransFusionHead`, `TransFusionBBoxCoder`, transformer layers | `mmdet3d/models/heads/bbox/transfusion.py` |
 | `nuscenes_adapter.py` | Pure-JSON nuScenes loader (no nuscenes-devkit) | custom |
+| `bev_pool/` | CUDA-accelerated BEV pooling op (JIT-compiled when CUDA available) | `mmdet3d/ops/bev_pool/` |
 | `configs/bevfusion_hyperparams.py` | All hyperparameters in one dict file | extracted from yaml configs |
 | `test_nuscenes_mini.py` | End-to-end inference + visualization test | custom |
 
@@ -63,6 +64,12 @@ Load with `strict=False`. On platforms without `spconv`, the LiDAR backbone keys
 - D=118 depth bins (dbound=[2.0, 58.0, 0.5])
 - Camera BEV: 80ch, 128×128
 - Downsample=2 applied after scatter
+- **BEV pooling**: `bev_pool_pure` scatters frustum features into the BEV grid.
+  When a CUDA device is available it uses the JIT-compiled `bev_pool/` CUDA
+  kernel (fused sort + interval-sum, the official `bev_pool_v2` path); otherwise
+  it falls back to the pure-PyTorch `index_put_(accumulate=True)` scatter. Both
+  paths are numerically equivalent (verified to ~1e-6). The fast path activates
+  only when `BEV_POOL_CUDA_AVAILABLE and x.is_cuda`.
 
 ### SparseEncoder (LiDAR)
 - Uses spconv v2 (`spconv.pytorch`)
