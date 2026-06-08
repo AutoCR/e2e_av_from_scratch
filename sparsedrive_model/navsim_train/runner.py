@@ -27,7 +27,7 @@ if __package__ in {None, ""}:
 
 from sparsedrive_model.configs.sparsedrive_hyperparams import get_camera_order, get_stage_hyperparams
 from sparsedrive_model.navsim_train.eval_hook import run_eval
-from sparsedrive_model.navsim_train.optim import CosineWithLinearWarmup, build_optimizer, clip_grad_norm
+from sparsedrive_model.navsim_train.optim import CosineWithLinearWarmup, build_optimizer, clip_grad_norm, top_grad_norms
 from sparsedrive_model.navsim_train.scene_filter_loader import load_log_names, load_scene_filter_fields
 from sparsedrive_model.sparsedrive import SparseDrive
 from sparsedrive_model.sparsedrive import nn_utils as _sparsedrive_nn_utils
@@ -626,12 +626,20 @@ def run(config: dict):
                     elif gn > skip_norm:
                         # Norm is finite but pathologically large: the batch's
                         # gradient direction is untrustworthy. Skip the step
-                        # entirely to avoid corrupting the weights.
+                        # entirely to avoid corrupting the weights. clip_grad_norm
+                        # already scaled the grads by max_norm/gn (~1/gn), so undo
+                        # that scale before ranking offenders -- otherwise a true
+                        # 5e5 grad reads back as ~0.86 and the offender looks
+                        # innocent. The skip happens only on the rare bad step, so
+                        # this extra pass costs nothing on the healthy path.
+                        unclip = gn / float(recipe["grad_clip_max_norm"])
                         tqdm.write(
                             f"iter={iteration + 1}: grad norm {gn:.3e} exceeds skip "
                             f"threshold {skip_norm:.3e}; skipping step (gradient-explosion guard)"
                         )
-                        _log_large_grads(raw_model, iteration + 1)
+                        tqdm.write(f"iter={iteration + 1}: largest PRE-CLIP grad-norm parameters:")
+                        for name, gl2, gmax in top_grad_norms(raw_model, recipe["grad_clip_norm_type"]):
+                            tqdm.write(f"    {name}: |grad|_2={gl2 * unclip:.3e} max|grad|={gmax * unclip:.3e}")
                         _reset_temporal_state(raw_model)
                     else:
                         optimizer.step()

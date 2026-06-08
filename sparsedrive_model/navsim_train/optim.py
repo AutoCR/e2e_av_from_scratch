@@ -118,6 +118,28 @@ def compute_grad_norm(parameters, norm_type=2.0):
     return total ** (1.0 / norm_type)
 
 
+def top_grad_norms(model, norm_type=2.0, top_k=12):
+    """Snapshot the largest per-parameter grad norms BY NAME, pre-clip.
+
+    Must be called BEFORE ``clip_grad_norm`` scales the grads, otherwise it
+    reports post-clip residuals: on an explosion the clip coefficient is
+    ~max_norm/total_norm (e.g. 1/5.8e5), so a true 5e5 grad reads back as ~0.86
+    and the offender looks innocent. Returns a list of
+    ``(name, grad_l2, grad_absmax)`` sorted by grad_l2 desc, in fp64.
+    """
+    norm_type = float(norm_type)
+    ranked = []
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        gl2 = float(g.norm(norm_type).to(torch.float64))
+        gmax = float(g.abs().max().to(torch.float64))
+        ranked.append((name, gl2, gmax))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked[:top_k]
+
+
 def clip_grad_norm(model, max_norm, norm_type):
     """Clip grads to ``max_norm`` using an fp64 total-norm.
 

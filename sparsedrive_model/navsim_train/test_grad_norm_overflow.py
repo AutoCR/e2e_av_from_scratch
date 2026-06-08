@@ -35,7 +35,7 @@ for _p in (str(_THIS.parents[2]), str(_THIS.parents[1])):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from sparsedrive_model.navsim_train.optim import clip_grad_norm, compute_grad_norm
+from sparsedrive_model.navsim_train.optim import clip_grad_norm, compute_grad_norm, top_grad_norms
 
 
 class _Model(torch.nn.Module):
@@ -154,10 +154,56 @@ def test_returns_on_grad_device():
         _assert(torch.isfinite(clipped), f"[{dev}] clip_grad_norm runs without device mismatch")
 
 
+def test_top_grad_norms_ranks_offenders():
+    """top_grad_norms ranks parameters by pre-clip grad L2, with abs-max."""
+    print("test_top_grad_norms_ranks_offenders")
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = torch.nn.Parameter(torch.zeros(4))
+            self.y = torch.nn.Parameter(torch.zeros(4))
+
+    m = M()
+    m.x.grad = torch.tensor([3.0, 4.0, 0.0, 0.0])  # |x|_2 = 5, absmax = 4
+    m.y.grad = torch.full((4,), 0.01)
+    top = top_grad_norms(m, 2.0, top_k=2)
+    _assert(top[0][0] == "x", "largest-grad parameter ranks first")
+    _assert(abs(top[0][1] - 5.0) < 1e-6, f"reports true L2 norm (got {top[0][1]:.4f})")
+    _assert(abs(top[0][2] - 4.0) < 1e-6, f"reports abs-max (got {top[0][2]:.4f})")
+
+
+def test_pre_clip_reconstruction():
+    """The runner reconstructs true pre-clip grads from POST-clip norms via
+    unclip = total_norm / max_norm. This is the fix for the misleading log where
+    a real 5e5 grad printed as ~0.86 after clip_grad_norm scaled it down."""
+    print("test_pre_clip_reconstruction")
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = torch.nn.Parameter(torch.zeros(100))
+            self.b = torch.nn.Parameter(torch.zeros(100))
+
+    m = M()
+    m.a.grad = torch.full((100,), 5.0e5 / 10.0)  # |a|_2 = sqrt(100)*5e4 = 5e5
+    m.b.grad = torch.full((100,), 0.1)
+    true_a = float(m.a.grad.norm(2))
+    max_norm = 1.0
+    gn = float(clip_grad_norm(m, max_norm, 2.0))  # clips grads in place
+    unclip = gn / max_norm
+    post = top_grad_norms(m, 2.0)
+    recon_a = next(gl2 for name, gl2, _ in post if name == "a") * unclip
+    rel = abs(recon_a - true_a) / true_a
+    _assert(rel < 1e-4, f"unclip*post reconstructs the true 5e5 pre-clip grad (rel_err={rel:.2e})")
+
+
 if __name__ == "__main__":
     test_large_finite_grads_dont_overflow()
     test_normal_grads_unchanged()
     test_real_nan_still_detected()
     test_real_inf_still_detected()
     test_returns_on_grad_device()
+    test_top_grad_norms_ranks_offenders()
+    test_pre_clip_reconstruction()
     print("\nAll grad-norm overflow regression tests passed.")
