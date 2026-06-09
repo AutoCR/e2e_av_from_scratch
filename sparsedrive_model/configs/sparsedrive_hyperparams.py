@@ -61,15 +61,17 @@ RUNTIME_CONFIG = {
 
 TRAINING_SCHEDULE_STAGE1 = {
     "num_epochs": 100,
-    # Per-GPU micro-batch. Launch with `torchrun --nproc_per_node=4`: this gives
-    # micro_global_batch = 8*4 = 32, and the runner auto-derives grad_accum_steps
-    # = round(64/32) = 2 -> effective batch EXACTLY 64, matching the official
-    # lr=4e-4@batch-64 pairing. (6 GPUs cannot divide 64 cleanly -- 6 carries a
-    # factor of 3 -- so we run on 4 of the 6 cards to hit exactly 64. The earlier
-    # 8-GPU x batch-12 setup yielded effective batch 96, a hotter regime than the
-    # LR was tuned for, contributing to the repeated epoch-3 backbone divergence.)
-    "total_batch_size": 8,
-    "num_gpus": 4,                  # Reference GPU count (used only by derive_training_hyperparams)
+    # Per-GPU micro-batch. Launch with `torchrun --nproc_per_node=6`: this gives
+    # micro_global_batch = 12*6 = 72, and the runner auto-derives grad_accum_steps
+    # = round(64/72) = 1 -> effective batch 72, accum=1 (no accumulation, full
+    # throughput). 72 is ~12% hotter than the official batch-64 recipe, but that
+    # is acceptable now that backbone_lr_mult=0.25 halves the backbone LR: the
+    # earlier divergence ran effective batch 96 AND backbone lr 2e-4, and we have
+    # removed the larger risk factor. (6 GPUs cannot divide 64 cleanly -- 6 carries
+    # a factor of 3 -- so exact 64 is not reachable with all 6 cards; 72 is the
+    # closest full-hardware option.)
+    "total_batch_size": 12,
+    "num_gpus": 6,                  # Reference GPU count (used only by derive_training_hyperparams)
     "ckpt_epoch_interval": 2,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
     "eval_mode": {
