@@ -8,9 +8,14 @@ Checkpoint: model_weights/bevfusion/bevfusion-det.pth
 Config: swint_v0p075/convfuser.yaml (camera+lidar detection with TransFusionHead)
 """
 
+from copy import deepcopy
+
 # ==============================================================================
 # DATASET
 # ==============================================================================
+
+# NAVSIM 5-class object set (training only): order must match dataset label remap
+NAVSIM_OBJECT_CLASSES = ["car", "barrier", "bicycle", "pedestrian", "traffic_cone"]
 
 DATASET = {
     "name": "nuscenes",
@@ -241,13 +246,144 @@ DETECTION_HEAD = {
 }
 
 # ==============================================================================
+# TRAINING (NAVSIM 5-CLASS)
+# ==============================================================================
+
+# 5-class detection tasks for NAVSIM (single task group)
+DETECTION_TASKS_5CLASS = [
+    {"num_class": 5, "class_names": NAVSIM_OBJECT_CLASSES}
+]
+
+# Training head config for NAVSIM (5-class variant)
+DETECTION_HEAD_TRAIN_CFG_5 = {
+    "point_cloud_range": [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
+    "grid_size": [1440, 1440, 41],
+    "voxel_size": [0.075, 0.075, 0.2],
+    "out_size_factor": 8,
+    "gaussian_overlap": 0.1,
+    "min_radius": 2,
+    "dataset": "nuScenes",
+    "code_weights": [1.0]*8 + [0.2]*2,
+    "pos_weight": -1,
+    "loss_cls": {"gamma": 2.0, "alpha": 0.25, "loss_weight": 1.0},
+    "loss_heatmap": {"loss_weight": 1.0},
+    "loss_bbox": {"loss_weight": 0.25},
+    "assigner": {
+        "cls_cost": {"gamma": 2.0, "alpha": 0.25, "weight": 0.15},
+        "reg_cost": {"weight": 0.25},
+        "iou_cost": {"weight": 0.25},
+        "pc_range": [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
+    },
+}
+
+# 5-class detection head for NAVSIM training (to be dynamically created by get_training_hyperparams)
+# This dict is assembled per-call to avoid module-state mutation
+def _make_detection_head_train_5class():
+    """Create a fresh 5-class detection head for training."""
+    return {
+        "type": "TransFusionHead",
+        "num_proposals": 200,
+        "auxiliary": True,
+        "in_channels": 512,
+        "hidden_channel": 128,
+        "num_classes": 5,
+        "num_decoder_layers": 1,
+        "num_heads": 8,
+        "nms_kernel_size": 3,
+        "ffn_channel": 256,
+        "dropout": 0.1,
+        "activation": "relu",
+        "bn_momentum": 0.1,
+        "common_heads": {
+            "center": [2, 2],
+            "height": [1, 2],
+            "dim": [3, 2],
+            "rot": [2, 2],
+            "vel": [2, 2],
+        },
+        "num_heatmap_convs": 2,
+        "tasks": DETECTION_TASKS_5CLASS,
+        "train_cfg": DETECTION_HEAD_TRAIN_CFG_5,
+        "test_cfg": DETECTION_HEAD_TEST_CFG,
+        "bbox_coder": BBOX_CODER,
+    }
+
+# ==============================================================================
+# TRAINING RECIPE & RUNTIME CONFIG
+# ==============================================================================
+
+TRAINING_RECIPE = {
+    "lr": 1e-4,
+    "weight_decay": 0.01,
+    "backbone_lr_mult": 1.0,
+    "grad_clip_max_norm": 35.0,
+    "grad_clip_norm_type": 2.0,
+    "warmup_iters": 500,
+    "warmup_ratio": 1.0 / 3.0,
+    "min_lr_ratio": 1e-3,
+    "num_epochs": 6,
+    "total_batch_size": 4,
+    "num_workers": 4,
+    "fp16_loss_scale": 512.0,
+    "log_interval": 50,
+    "ckpt_epoch_interval": 1,
+    "eval_epoch_interval": 1,
+}
+
+RUNTIME_CONFIG = {
+    "splits": {
+        "train": {
+            "dir": "trainval",
+            "log_names_yaml": "navsim/planning/script/config/training/default_train_val_test_log_split.yaml",
+            "log_names_key": "train_logs",
+            "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml",
+            "tokens_key": "tokens",
+        },
+        "val": {
+            "dir": "trainval",
+            "log_names_yaml": "navsim/planning/script/config/training/default_train_val_test_log_split.yaml",
+            "log_names_key": "val_logs",
+            "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml",
+            "tokens_key": "tokens",
+        },
+        "test": {
+            "dir": "trainval",
+            "log_names_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
+            "log_names_key": "log_names",
+            "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
+            "tokens_key": "tokens",
+        },
+    },
+    "openscene_data_root": "/Users/chenran/Code/navsim/dataset",
+    "nuplan_maps_root": "/Users/chenran/Code/navsim/dataset/maps",
+    "output_dir": "bevfusion_model/outputs/train_navsim",
+    "resume_from": None,
+    "seed": 0,
+    "num_workers": 4,
+    "device": "auto",
+    "quick_smoke": False,
+    "camera_order": (
+        "CAM_F0",
+        "CAM_L0",
+        "CAM_L1",
+        "CAM_R0",
+        "CAM_R1",
+        "CAM_L2",
+        "CAM_R2",
+        "CAM_B0",
+    ),
+    "image_hw": [256, 704],
+}
+
+# ==============================================================================
 # MERGED HYPERPARAMS
 # ==============================================================================
 
 
 def get_fusion_hyperparams() -> dict:
     """
-    Returns merged hyperparameters dict for full camera+LiDAR fusion model.
+    Returns merged hyperparameters dict for full camera+LiDAR fusion model (inference).
+    Uses the 10-class NuScenes detection head unchanged.
 
     Returns:
         dict: Complete hyperparams with keys:
@@ -261,3 +397,37 @@ def get_fusion_hyperparams() -> dict:
         "decoder": DECODER,
         "detection_head": DETECTION_HEAD,
     }
+
+
+def get_training_hyperparams() -> dict:
+    """
+    Returns merged hyperparameters dict for BEVFusion training on NAVSIM.
+    Uses 5-class detection head (car, barrier, bicycle, pedestrian, traffic_cone).
+
+    Returns:
+        dict: Complete hyperparams with keys:
+              - dataset, camera_encoder, lidar_encoder, fuser, decoder, detection_head
+              Dataset has NAVSIM_OBJECT_CLASSES; detection_head is 5-class.
+    """
+    # Deep-copy to prevent callers from mutating module state
+    return {
+        "dataset": {
+            **deepcopy(DATASET),
+            "object_classes": deepcopy(NAVSIM_OBJECT_CLASSES),
+        },
+        "camera_encoder": deepcopy(CAMERA_ENCODER),
+        "lidar_encoder": deepcopy(LIDAR_ENCODER),
+        "fuser": deepcopy(FUSER),
+        "decoder": deepcopy(DECODER),
+        "detection_head": deepcopy(_make_detection_head_train_5class()),
+    }
+
+
+def get_training_recipe() -> dict:
+    """Return a deep-copy of the training recipe (optimizer, scheduler, batch config)."""
+    return deepcopy(TRAINING_RECIPE)
+
+
+def get_runtime_config() -> dict:
+    """Return a deep-copy of the runtime/environment configuration."""
+    return deepcopy(RUNTIME_CONFIG)

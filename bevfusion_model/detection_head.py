@@ -1,7 +1,24 @@
+import sys
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Handle both relative imports (when used as module) and direct execution
+try:
+    from .detection_losses_base import (FocalLoss, GaussianFocalLoss, L1Loss,
+        gaussian_radius, draw_heatmap_gaussian, clip_sigmoid, normalize_bbox)
+    from .detection_assigner import build_assigner
+except (ImportError, ValueError):
+    # For direct script execution, add parent to path
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from detection_losses_base import (FocalLoss, GaussianFocalLoss, L1Loss,
+        gaussian_radius, draw_heatmap_gaussian, clip_sigmoid, normalize_bbox)
+    from detection_assigner import build_assigner
 
 
 def _circle_nms(boxes, min_radius, post_max_size=83):
@@ -42,6 +59,34 @@ class TransFusionBBoxCoder(nn.Module):
         self.post_center_range = post_center_range
         self.score_threshold = score_threshold
         self.code_size = code_size
+
+    def encode(self, gt_bboxes):
+        """Encode ground-truth boxes to feature-space targets.
+
+        Args:
+            gt_bboxes: [G, 9] or [G, 10] world/lidar [cx,cy,cz,w,l,h,yaw,(vx,vy)]
+
+        Returns:
+            [G, code_size] feature-map-space targets [cx_f, cy_f, height, log_w, log_l, log_h, sin, cos, (vx, vy)]
+        """
+        targets = gt_bboxes.new_zeros((gt_bboxes.shape[0], self.code_size))
+        # Center in feature coordinates
+        targets[:, 0] = (gt_bboxes[:, 0] - self.pc_range[0]) / (self.out_size_factor * self.voxel_size[0])
+        targets[:, 1] = (gt_bboxes[:, 1] - self.pc_range[1]) / (self.out_size_factor * self.voxel_size[1])
+        # Log dimensions
+        targets[:, 3] = gt_bboxes[:, 3].log()  # log_w
+        targets[:, 4] = gt_bboxes[:, 4].log()  # log_l
+        targets[:, 5] = gt_bboxes[:, 5].log()  # log_h
+        # Height (center z + half-height, to invert decode's subtraction)
+        targets[:, 2] = gt_bboxes[:, 2] + gt_bboxes[:, 5] * 0.5
+        # Rotation as sin/cos
+        targets[:, 6] = torch.sin(gt_bboxes[:, 6])
+        targets[:, 7] = torch.cos(gt_bboxes[:, 6])
+        # Velocity (if present)
+        if self.code_size > 8 and gt_bboxes.shape[1] > 7:
+            targets[:, 8] = gt_bboxes[:, 7]
+            targets[:, 9] = gt_bboxes[:, 8]
+        return targets
 
     def decode(self, heatmap, rot, dim, center, height, vel, filter=False):
         """Decode bboxes.
@@ -260,7 +305,8 @@ class TransFusionHead(nn.Module):
                  activation="relu",
                  common_heads=None,
                  auxiliary=True,
-                 test_cfg=None):
+                 test_cfg=None,
+                 train_cfg=None):
         super().__init__()
 
         self.num_proposals = num_proposals
@@ -269,6 +315,7 @@ class TransFusionHead(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.nms_kernel_size = nms_kernel_size
         self.test_cfg = test_cfg or {}
+        self.train_cfg = train_cfg
         self.bn_momentum = bn_momentum
 
         self.shared_conv = nn.Conv2d(in_channels, hidden_channel, 3, padding=1)
@@ -322,6 +369,39 @@ class TransFusionHead(nn.Module):
 
         self.query_labels = None
 
+        # Initialize training components if train_cfg is provided with loss config
+        has_loss_cfg = train_cfg is not None and "loss_cls" in train_cfg and "assigner" in train_cfg
+        if has_loss_cfg:
+            lc = train_cfg.get("loss_cls", {})
+            lh = train_cfg.get("loss_heatmap", {})
+            lb = train_cfg.get("loss_bbox", {})
+            self.loss_cls = FocalLoss(use_sigmoid=True, gamma=lc.get("gamma", 2.0),
+                                     alpha=lc.get("alpha", 0.25), loss_weight=lc.get("loss_weight", 1.0))
+            self.loss_heatmap = GaussianFocalLoss(loss_weight=lh.get("loss_weight", 1.0))
+            self.loss_bbox = L1Loss(loss_weight=lb.get("loss_weight", 0.25))
+            self.bbox_assigner = build_assigner(train_cfg["assigner"])
+            self.train_pc_range = train_cfg["point_cloud_range"]
+            self.train_voxel_size = train_cfg["voxel_size"]
+            self.train_grid_size = train_cfg["grid_size"]
+            self.train_out_size_factor = train_cfg["out_size_factor"]
+            self.gaussian_overlap = train_cfg.get("gaussian_overlap", 0.1)
+            self.min_radius = train_cfg.get("min_radius", 2)
+            self.code_weights = train_cfg.get("code_weights", [1.0]*8 + [0.2]*2)
+            self.pos_weight = train_cfg.get("pos_weight", -1)
+        else:
+            self.loss_cls = None
+            self.loss_heatmap = None
+            self.loss_bbox = None
+            self.bbox_assigner = None
+            self.train_pc_range = None
+            self.train_voxel_size = None
+            self.train_grid_size = None
+            self.train_out_size_factor = None
+            self.gaussian_overlap = None
+            self.min_radius = None
+            self.code_weights = None
+            self.pos_weight = None
+
     def create_2D_grid(self, x_size, y_size):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
         batch_x, batch_y = torch.meshgrid(
@@ -353,10 +433,10 @@ class TransFusionHead(nn.Module):
         local_max_inner = F.max_pool2d(heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0)
         local_max[:, :, padding:(-padding) if padding > 0 else None, padding:(-padding) if padding > 0 else None] = local_max_inner
 
-        if self.test_cfg.get("dataset") == "nuScenes":
+        if self.test_cfg.get("dataset") == "nuScenes" and self.num_classes >= 10:
             local_max[:, 8] = F.max_pool2d(heatmap[:, 8], kernel_size=1, stride=1, padding=0)
             local_max[:, 9] = F.max_pool2d(heatmap[:, 9], kernel_size=1, stride=1, padding=0)
-        elif self.test_cfg.get("dataset") == "Waymo":
+        elif self.test_cfg.get("dataset") == "Waymo" and self.num_classes >= 3:
             local_max[:, 1] = F.max_pool2d(heatmap[:, 1], kernel_size=1, stride=1, padding=0)
             local_max[:, 2] = F.max_pool2d(heatmap[:, 2], kernel_size=1, stride=1, padding=0)
 
@@ -413,6 +493,160 @@ class TransFusionHead(nn.Module):
             feats = [feats]
         results = [self.forward_single(f, metas) for f in feats]
         return tuple(results)
+
+    def get_targets_single(self, gt_bboxes, gt_labels, pred_dict):
+        """Compute targets for a single sample.
+
+        Args:
+            gt_bboxes: [G, 9] ground-truth boxes in world coords.
+            gt_labels: [G] long labels in [0, num_classes).
+            pred_dict: Dict with one batch-element sliced predictions (each shape [1, C, P]).
+
+        Returns:
+            Tuple of:
+            - labels: [P] long tensor, num_classes for bg
+            - label_weights: [P] float tensor, all 1.0 (pos_weight=-1)
+            - bbox_targets: [P, code_size]
+            - bbox_weights: [P, code_size]
+            - num_pos: int, number of positive assignments
+            - heatmap_t: [num_classes, Hf, Wf] dense heatmap target
+        """
+        num_proposals = pred_dict["center"].shape[-1]
+
+        # Decode proposals to world coordinates (clone to avoid mutating input)
+        score = pred_dict["heatmap"].detach().sigmoid().clone()
+        center = pred_dict["center"].detach().clone()
+        height = pred_dict["height"].detach().clone()
+        dim = pred_dict["dim"].detach().clone()
+        rot = pred_dict["rot"].detach().clone()
+        vel = pred_dict["vel"].detach().clone()
+        boxes_dict = self.bbox_coder.decode(score, rot, dim, center, height, vel)
+        bbox_pred_world = boxes_dict[0]["bboxes"]  # [num_proposals, 9]
+
+        # Class logits per proposal
+        cls_pred = pred_dict["heatmap"][0].permute(1, 0)  # [num_proposals, num_classes]
+
+        # Run Hungarian assignment
+        assigned_gt_inds, assigned_labels, max_overlaps = self.bbox_assigner.assign(
+            bbox_pred_world, cls_pred, gt_bboxes, gt_labels)
+
+        # Extract positive indices
+        pos_inds = (assigned_gt_inds > 0).nonzero(as_tuple=False).squeeze(-1)
+        pos_gt_idx = assigned_gt_inds[pos_inds] - 1
+
+        # Initialize target tensors
+        labels = bbox_pred_world.new_full((num_proposals,), self.num_classes, dtype=torch.long)
+        label_weights = bbox_pred_world.new_ones(num_proposals)
+        bbox_targets = bbox_pred_world.new_zeros((num_proposals, self.bbox_coder.code_size))
+        bbox_weights = bbox_pred_world.new_zeros((num_proposals, self.bbox_coder.code_size))
+
+        # Fill in positive examples
+        if pos_inds.numel() > 0:
+            labels[pos_inds] = gt_labels[pos_gt_idx]
+            bbox_targets[pos_inds] = self.bbox_coder.encode(gt_bboxes[pos_gt_idx])
+            bbox_weights[pos_inds] = 1.0
+
+        # Dense heatmap target
+        feat_h = self.train_grid_size[1] // self.train_out_size_factor
+        feat_w = self.train_grid_size[0] // self.train_out_size_factor
+        heatmap_t = gt_bboxes.new_zeros((self.num_classes, feat_h, feat_w))
+
+        for k in range(gt_bboxes.shape[0]):
+            w = gt_bboxes[k, 3]
+            l = gt_bboxes[k, 4]
+            w_f = w / self.train_voxel_size[0] / self.train_out_size_factor
+            l_f = l / self.train_voxel_size[1] / self.train_out_size_factor
+
+            if w_f <= 0 or l_f <= 0:
+                continue
+
+            radius = gaussian_radius((l_f, w_f), min_overlap=self.gaussian_overlap)
+            radius = max(self.min_radius, int(radius))
+
+            cx = gt_bboxes[k, 0]
+            cy = gt_bboxes[k, 1]
+            coor_x = (cx - self.train_pc_range[0]) / self.train_voxel_size[0] / self.train_out_size_factor
+            coor_y = (cy - self.train_pc_range[1]) / self.train_voxel_size[1] / self.train_out_size_factor
+            ctr = torch.tensor([coor_x, coor_y], dtype=torch.float32, device=gt_bboxes.device)
+            ctr_int = ctr.to(torch.int32)
+
+            if not (0 <= ctr_int[0] < feat_w and 0 <= ctr_int[1] < feat_h):
+                continue
+
+            draw_heatmap_gaussian(heatmap_t[gt_labels[k]], ctr_int, radius)
+
+        return labels, label_weights, bbox_targets, bbox_weights, int(pos_inds.numel()), heatmap_t
+
+    def get_targets(self, gt_bboxes_list, gt_labels_list, preds_dict):
+        """Compute targets for all samples in a batch.
+
+        Args:
+            gt_bboxes_list: List[Tensor], each [G_i, 9] ground-truth boxes.
+            gt_labels_list: List[Tensor], each [G_i] long labels.
+            preds_dict: Dict with batched predictions [B, C, P].
+
+        Returns:
+            Tuple of:
+            - labels: [B, P] long
+            - label_weights: [B, P] float
+            - bbox_targets: [B, P, code_size]
+            - bbox_weights: [B, P, code_size]
+            - heatmap_t: [B, num_classes, Hf, Wf]
+            - num_pos: int, total positive count
+        """
+        B = preds_dict["center"].shape[0]
+        labels_l, lw_l, bt_l, bw_l, hm_l = [], [], [], [], []
+        num_pos = 0
+
+        for b in range(B):
+            single = {k: (v[b:b+1] if torch.is_tensor(v) else v) for k, v in preds_dict.items()}
+            labels, lw, bt, bw, npos, hm = self.get_targets_single(gt_bboxes_list[b], gt_labels_list[b], single)
+            labels_l.append(labels)
+            lw_l.append(lw)
+            bt_l.append(bt)
+            bw_l.append(bw)
+            hm_l.append(hm)
+            num_pos += npos
+
+        return (torch.stack(labels_l), torch.stack(lw_l), torch.stack(bt_l), torch.stack(bw_l),
+                torch.stack(hm_l), max(num_pos, 1))
+
+    def loss(self, gt_bboxes_3d, gt_labels_3d, preds_dicts, **kwargs):
+        """Compute training losses.
+
+        Args:
+            gt_bboxes_3d: List[Tensor], each [G_i, 9] ground-truth boxes.
+            gt_labels_3d: List[Tensor], each [G_i] long labels.
+            preds_dicts: Output from forward(), tuple([merged_dict]).
+
+        Returns:
+            Dict of loss scalars.
+        """
+        preds_dict = preds_dicts[0][0]
+        labels, label_weights, bbox_targets, bbox_weights, heatmap_t, num_pos = \
+            self.get_targets(gt_bboxes_3d, gt_labels_3d, preds_dict)
+
+        loss_dict = {}
+
+        # Heatmap loss (once)
+        loss_dict["loss_heatmap"] = self.loss_heatmap(
+            clip_sigmoid(preds_dict["dense_heatmap"]), heatmap_t,
+            avg_factor=max(heatmap_t.eq(1).float().sum().item(), 1))
+
+        # Classification loss
+        P = preds_dict["heatmap"].shape[-1]
+        cls_score = preds_dict["heatmap"].permute(0, 2, 1).reshape(-1, self.num_classes)
+        loss_dict["loss_cls"] = self.loss_cls(
+            cls_score, labels.reshape(-1), label_weights.reshape(-1), avg_factor=num_pos)
+
+        # Regression loss (concatenate preds in order: center, height, dim, rot, vel)
+        preds = torch.cat([preds_dict["center"], preds_dict["height"], preds_dict["dim"],
+                           preds_dict["rot"], preds_dict["vel"]], dim=1).permute(0, 2, 1)
+        code_weights = preds.new_tensor(self.code_weights)
+        reg_weights = bbox_weights * code_weights.view(1, 1, -1)
+        loss_dict["loss_bbox"] = self.loss_bbox(preds, bbox_targets, reg_weights, avg_factor=num_pos)
+
+        return loss_dict
 
     def get_bboxes(self, preds_dicts, metas):
         rets = []
@@ -496,3 +730,145 @@ class TransFusionHead(nn.Module):
             rets.append(ret_layer)
 
         return [rets[-1][i] for i in range(batch_size)]
+
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+
+    from bevfusion_model.configs.bevfusion_hyperparams import get_training_hyperparams
+
+    print("="*70)
+    print("TransFusionHead Loss Path Self-Test")
+    print("="*70)
+
+    # Get training hyperparams
+    hp = get_training_hyperparams()["detection_head"]
+
+    # Construct head with train_cfg
+    print("\n[1] Constructing TransFusionHead with train_cfg...")
+    head = TransFusionHead(
+        num_proposals=hp["num_proposals"],
+        in_channels=hp["in_channels"],
+        hidden_channel=hp["hidden_channel"],
+        num_classes=hp["num_classes"],
+        num_decoder_layers=hp["num_decoder_layers"],
+        num_heads=hp["num_heads"],
+        nms_kernel_size=hp["nms_kernel_size"],
+        ffn_channel=hp["ffn_channel"],
+        dropout=hp["dropout"],
+        bn_momentum=hp["bn_momentum"],
+        activation=hp["activation"],
+        common_heads=hp["common_heads"],
+        test_cfg=hp["test_cfg"],
+        train_cfg=hp["train_cfg"])
+    head.train()
+    print(f"    Created head with num_classes={hp['num_classes']}, train_cfg={'present' if hp['train_cfg'] else 'None'}")
+
+    # Verify inference construction still works (test_cfg only)
+    print("\n[2] Verifying inference construction (train_cfg=None)...")
+    head_inference = TransFusionHead(
+        num_proposals=hp["num_proposals"],
+        in_channels=hp["in_channels"],
+        hidden_channel=hp["hidden_channel"],
+        num_classes=hp["num_classes"],
+        num_decoder_layers=hp["num_decoder_layers"],
+        num_heads=hp["num_heads"],
+        nms_kernel_size=hp["nms_kernel_size"],
+        ffn_channel=hp["ffn_channel"],
+        dropout=hp["dropout"],
+        bn_momentum=hp["bn_momentum"],
+        activation=hp["activation"],
+        common_heads=hp["common_heads"],
+        test_cfg=hp["test_cfg"])
+    head_inference.eval()
+    assert head_inference.loss_cls is None, "Inference head should have loss_cls=None"
+    print("    Inference construction OK (loss components=None)")
+
+    # Forward pass
+    print("\n[3] Running forward pass...")
+    B = 2
+    bev = torch.randn(B, hp["in_channels"], 180, 180)
+    preds = head(bev, metas=[{} for _ in range(B)])
+    print(f"    Forward output shape: {type(preds)}, len={len(preds)}")
+    print(f"    preds[0] type: {type(preds[0])}, len={len(preds[0])}")
+    assert len(preds) == 1, "Should have 1 scale"
+    assert len(preds[0]) == 1, "Should have 1 auxiliary level"
+    merged_dict = preds[0][0]
+    print(f"    Merged dict keys: {list(merged_dict.keys())}")
+    assert "center" in merged_dict and "heatmap" in merged_dict, "Missing key predictions"
+    print(f"    center shape: {merged_dict['center'].shape}, heatmap shape: {merged_dict['heatmap'].shape}")
+
+    # Construct GT
+    print("\n[4] Constructing ground-truth boxes...")
+    gt_b = [
+        torch.tensor([[0., 0., -1., 4., 2., 1.5, 0.3, 0., 0.],
+                      [10., 5., -1., 2., 1., 1., 1.0, 0., 0.]], dtype=torch.float32),
+        torch.zeros(0, 9, dtype=torch.float32)
+    ]
+    gt_l = [
+        torch.tensor([0, 3], dtype=torch.long),
+        torch.zeros(0, dtype=torch.long)
+    ]
+    print(f"    Batch 0: {gt_b[0].shape[0]} boxes, labels {gt_l[0].tolist()}")
+    print(f"    Batch 1: {gt_b[1].shape[0]} boxes")
+
+    # Encode/decode round-trip test
+    print("\n[5] Testing encode/decode round-trip...")
+    world_box = torch.tensor([[0., 0., -1., 4., 2., 1.5, 0.3, 0., 0.]], dtype=torch.float32)
+    encoded = head.bbox_coder.encode(world_box)
+    print(f"    Encoded shape: {encoded.shape}, values: {encoded[0].tolist()}")
+
+    # Reconstruct via manual decode math
+    coder = head.bbox_coder
+    cx_f = encoded[0, 0].item()
+    cy_f = encoded[0, 1].item()
+    height_t = encoded[0, 2].item()
+    log_w = encoded[0, 3].item()
+    log_l = encoded[0, 4].item()
+    log_h = encoded[0, 5].item()
+    sin_yaw = encoded[0, 6].item()
+    cos_yaw = encoded[0, 7].item()
+
+    cx_world = cx_f * coder.out_size_factor * coder.voxel_size[0] + coder.pc_range[0]
+    cy_world = cy_f * coder.out_size_factor * coder.voxel_size[1] + coder.pc_range[1]
+    w_world = torch.tensor(log_w).exp().item()
+    l_world = torch.tensor(log_l).exp().item()
+    h_world = torch.tensor(log_h).exp().item()
+    cz_world = height_t - h_world * 0.5
+    yaw_world = torch.atan2(torch.tensor(sin_yaw), torch.tensor(cos_yaw)).item()
+
+    recovered = torch.tensor([[cx_world, cy_world, cz_world, w_world, l_world, h_world, yaw_world, 0., 0.]])
+    error = (recovered - world_box).abs().max().item()
+    print(f"    Original: {world_box[0].tolist()}")
+    print(f"    Recovered: {recovered[0].tolist()}")
+    print(f"    Max error: {error:.6e}")
+    assert error < 1e-4, f"Round-trip error too large: {error}"
+    print("    Encode/decode round-trip OK")
+
+    # Loss computation
+    print("\n[6] Computing losses...")
+    ld = head.loss(gt_b, gt_l, preds)
+    print(f"    Loss dict keys: {list(ld.keys())}")
+    loss_values = {k: float(v) for k, v in ld.items()}
+    print(f"    Loss values: {loss_values}")
+    for k, v in ld.items():
+        assert torch.isfinite(v), f"{k} is not finite: {v}"
+    print("    All losses are finite")
+
+    # Backward pass
+    print("\n[7] Testing backward pass...")
+    total = sum(ld.values())
+    total.backward()
+    assert head.shared_conv.weight.grad is not None, "shared_conv.weight.grad is None"
+    assert torch.isfinite(head.shared_conv.weight.grad).all(), "shared_conv.weight.grad contains NaN/Inf"
+    print(f"    Gradient on shared_conv.weight: max={head.shared_conv.weight.grad.abs().max().item():.6e}")
+    print("    Backward pass OK")
+
+    print("\n" + "="*70)
+    print("All self-tests PASSED!")
+    print("="*70)

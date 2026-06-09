@@ -153,6 +153,7 @@ class BEVFusion(nn.Module):
             activation=head_hp.get("activation", "relu"),
             common_heads=head_hp.get("common_heads", None),
             test_cfg=head_hp.get("test_cfg", None),
+            train_cfg=head_hp.get("train_cfg", None),
         )
 
     def extract_camera_features(
@@ -257,8 +258,7 @@ class BEVFusion(nn.Module):
         batch_size = len(points)
         return self.encoders["lidar"]["backbone"](feats, coords, batch_size)
 
-    @torch.no_grad()
-    def forward(
+    def _extract_bev(
         self,
         img,
         points,
@@ -271,29 +271,14 @@ class BEVFusion(nn.Module):
         img_aug_matrix,
         lidar_aug_matrix,
         metas=None,
-        **kwargs,
     ):
-        """Forward pass for 3D object detection.
+        """Shared encoder→fuser→decoder path producing the BEV feature map.
 
-        Args:
-            img: (B, N, 3, H, W) multi-camera images
-            points: list of (P_i, 5) lidar point clouds per sample
-            camera2ego: (B, N, 4, 4) camera to ego extrinsics
-            lidar2ego: (B, 4, 4) lidar to ego transform
-            lidar2camera: (B, N, 4, 4) lidar to camera transform
-            lidar2image: (B, N, 4, 4) lidar to image projection
-            camera_intrinsics: (B, N, 3, 4) or (B, N, 4, 4) camera intrinsics
-            camera2lidar: (B, N, 4, 4) camera to lidar transform
-            img_aug_matrix: (B, N, 4, 4) image augmentation (identity at test)
-            lidar_aug_matrix: (B, 4, 4) lidar augmentation (identity at test)
-            metas: list of metadata dicts
-            **kwargs: Additional keyword arguments
+        Used by both the training (grad-enabled) and inference (no_grad) forward
+        branches so the two paths cannot drift.
 
         Returns:
-            list of dicts, one per sample with keys:
-                - "boxes_3d": (N, 10) 3D bounding boxes
-                - "scores_3d": (N,) detection scores
-                - "labels_3d": (N,) class labels
+            torch.Tensor: (B, C, H, W) decoded BEV features fed to the head.
         """
         # Camera features → BEV
         camera_bev = self.extract_camera_features(
@@ -321,8 +306,113 @@ class BEVFusion(nn.Module):
         bev = self.decoder["neck"](bev)
         if isinstance(bev, (list, tuple)):
             bev = bev[0]
+        return bev
 
-        # 3D object detection head
+    def forward(self, *args, **kwargs):
+        """Dispatch to the training-loss path or the inference path.
+
+        DDP only synchronizes gradients through ``forward``, so the training
+        loss must be reached via ``forward`` (not a separate method). Inference
+        stays under ``torch.no_grad`` in ``_forward_test``.
+        """
+        if self.training:
+            return self._forward_train(*args, **kwargs)
+        return self._forward_test(*args, **kwargs)
+
+    def _forward_train(
+        self,
+        img,
+        points,
+        camera2ego,
+        lidar2ego,
+        lidar2camera,
+        lidar2image,
+        camera_intrinsics,
+        camera2lidar,
+        img_aug_matrix,
+        lidar_aug_matrix,
+        gt_bboxes_3d,
+        gt_labels_3d,
+        metas=None,
+        **kwargs,
+    ):
+        """Grad-enabled training forward returning the detection loss dict.
+
+        Args:
+            gt_bboxes_3d: list of (G_i, 9) [cx,cy,cz,w,l,h,yaw,vx,vy] lidar-frame GT boxes.
+            gt_labels_3d: list of (G_i,) long class labels in the head's class space.
+            (other args identical to the inference forward.)
+
+        Returns:
+            dict[str, torch.Tensor]: {loss_cls, loss_bbox, loss_heatmap}.
+        """
+        bev = self._extract_bev(
+            img,
+            points,
+            camera2ego,
+            lidar2ego,
+            lidar2camera,
+            lidar2image,
+            camera_intrinsics,
+            camera2lidar,
+            img_aug_matrix,
+            lidar_aug_matrix,
+            metas,
+        )
+        pred_dicts = self.heads["object"](bev, metas)
+        return self.heads["object"].loss(gt_bboxes_3d, gt_labels_3d, pred_dicts)
+
+    @torch.no_grad()
+    def _forward_test(
+        self,
+        img,
+        points,
+        camera2ego,
+        lidar2ego,
+        lidar2camera,
+        lidar2image,
+        camera_intrinsics,
+        camera2lidar,
+        img_aug_matrix,
+        lidar_aug_matrix,
+        metas=None,
+        **kwargs,
+    ):
+        """Inference forward for 3D object detection.
+
+        Args:
+            img: (B, N, 3, H, W) multi-camera images
+            points: list of (P_i, 5) lidar point clouds per sample
+            camera2ego: (B, N, 4, 4) camera to ego extrinsics
+            lidar2ego: (B, 4, 4) lidar to ego transform
+            lidar2camera: (B, N, 4, 4) lidar to camera transform
+            lidar2image: (B, N, 4, 4) lidar to image projection
+            camera_intrinsics: (B, N, 3, 4) or (B, N, 4, 4) camera intrinsics
+            camera2lidar: (B, N, 4, 4) camera to lidar transform
+            img_aug_matrix: (B, N, 4, 4) image augmentation (identity at test)
+            lidar_aug_matrix: (B, 4, 4) lidar augmentation (identity at test)
+            metas: list of metadata dicts
+
+        Returns:
+            list of dicts, one per sample with keys:
+                - "boxes_3d": (N, 10) 3D bounding boxes
+                - "scores_3d": (N,) detection scores
+                - "labels_3d": (N,) class labels
+        """
+        bev = self._extract_bev(
+            img,
+            points,
+            camera2ego,
+            lidar2ego,
+            lidar2camera,
+            lidar2image,
+            camera_intrinsics,
+            camera2lidar,
+            img_aug_matrix,
+            lidar_aug_matrix,
+            metas,
+        )
+
         batch_size = img.shape[0]
         pred_dicts = self.heads["object"](bev, metas)
         outputs_raw = self.heads["object"].get_bboxes(pred_dicts, metas)
