@@ -227,15 +227,18 @@ class DeformableFeatureAggregation(nn.Module):
             projection_mat[:, :, None, None],
             pts_extend[:, None, ..., None],
         ).squeeze(-1)
-        # Divide by camera-frame depth z. The backward of x/z is proportional to
-        # 1/z^2, so a tiny floor (the original 1e-4) creates a ~1e8 gradient
-        # cliff whenever an anchor drifts so its keypoint lands near/behind the
-        # camera plane (z->0). That cliff is the dominant source of gradient
-        # explosion -> divergence in from-scratch training. A 0.1 m floor caps
-        # the worst-case denominator gradient at ~1e2 and never affects valid
-        # points: nothing visible is within 10 cm of the camera.
+        # Divide by camera-frame depth z, flooring with torch.clamp(z, min=1e-5)
+        # EXACTLY as upstream SparseDrive / Sparse4D do (projects/mmdet3d_plugin/
+        # models/blocks.py, swc-17/SparseDrive @ main, blob 32cacdc4). A prior
+        # local change raised this to 1e-1 to "cap the 1/z^2 gradient cliff", but
+        # that is 1e4x LARGER than upstream and made things WORSE: real depths are
+        # in metres, so 1e-5 effectively never clamps (only true z~=0), whereas a
+        # 0.1 m floor zeroes the gradient for every keypoint with 0<z<0.1 (the
+        # clamp's flat region) and parks boundary keypoints on the cliff edge --
+        # the run still exploded at step ~9045 with this floor. Upstream trains
+        # stably at 1e-5, so we match it verbatim rather than invent a clamp.
         points_2d = points_2d[..., :2] / torch.clamp(
-            points_2d[..., 2:3], min=1e-1
+            points_2d[..., 2:3], min=1e-5
         )
         if image_wh is not None:
             points_2d = points_2d / image_wh[:, :, None, None]
