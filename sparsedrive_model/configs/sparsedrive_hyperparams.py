@@ -228,7 +228,17 @@ MODEL_ARCH = {
     "num_depth_layers": 3,
     "depth_loss_weight": 0.2,
     "drop_out": 0.1,
-    "temporal": True,
+    # DIAGNOSTIC (2026-06-09): temporarily disabled to isolate a temporal-memory
+    # NaN loop. A previous run was healthy through ~6260 steps (grad_norm ~20-250,
+    # loss ~25-30) then hit ONE genuine grad spike (1e9) at step 6265 that was
+    # correctly skipped+reset -- but afterward every other step went NaN in a
+    # self-sustaining 1-0-1-0 cadence (clean step re-caches temporal instance
+    # feature -> next step consumes it -> NaN -> skip+reset -> repeat) until the
+    # 200-skip stall guard aborted. Weights never diverged. temporal=False sets
+    # det num_temp_instances=-1, so InstanceBank.cache() returns early and the
+    # temporal queue is fully off. If this run trains past ~6300 steps cleanly,
+    # the cause is confirmed and the real fix is to finiteness-guard the cache.
+    "temporal": False,              # was True -- diagnostic; restore after confirming
     "temporal_map": True,
     "decouple_attn_motion": True,
     "with_quality_estimation": True,
