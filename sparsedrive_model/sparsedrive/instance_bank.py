@@ -236,6 +236,13 @@ class InstanceBank(nn.Module):
         return instance_id
 
     def update_instance_id(self, instance_id=None, confidence=None):
+        # When the temporal queue is disabled (num_temp_instances <= 0) there is
+        # no next-frame carry-over: get() resets every step and self.instance_id
+        # is never consumed. The temporal topk below would also be invalid
+        # (torch.topk with k=-1 -> "selected index k out of range"). Skip the
+        # temporal-ID bookkeeping entirely, mirroring cache()'s early return.
+        if self.num_temp_instances <= 0:
+            return
         if self.temp_confidence is None:
             if confidence.dim() == 3:  # bs, num_anchor, num_cls
                 temp_conf = confidence.max(dim=-1).values
