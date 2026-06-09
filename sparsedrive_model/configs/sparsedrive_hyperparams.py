@@ -61,7 +61,12 @@ RUNTIME_CONFIG = {
 
 TRAINING_SCHEDULE_STAGE1 = {
     "num_epochs": 100,
-    "total_batch_size": 12,
+    # Per-GPU micro-batch. With 8 GPUs this gives micro_global_batch = 8*8 = 64,
+    # which matches effective_batch_size=64 (accum auto-derives to 1) and the
+    # official lr=4e-4@batch-64 pairing. The previous value (12) yielded
+    # effective batch 96 with accum=1 -- a hotter regime than the LR was tuned
+    # for, contributing to the repeated epoch-3 backbone divergence.
+    "total_batch_size": 8,
     "num_gpus": 8,                  # Reference GPU count (used only by derive_training_hyperparams)
     "ckpt_epoch_interval": 2,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
@@ -104,7 +109,13 @@ OPTIMIZER_CONFIG = {
     # gradient accumulation instead of a literal batch of 64 (see runner).
     "lr": 4e-4,
     "weight_decay": 0.001,
-    "backbone_lr_mult": 0.5,        # LR multiplier for backbone parameters
+    # Backbone LR multiplier. The pretrained ResNet50 backbone (with gradient
+    # checkpointing, 3 cameras @ 704x256) diverged REPEATEDLY around epoch 3 at
+    # mult=0.5 (backbone lr=2e-4): img_backbone.conv1/layer1 grads blew up to
+    # O(5e4). Halving to 0.25 (backbone lr=1e-4) is the standard remedy for a
+    # diverging pretrained backbone -- it slows the layers that explode without
+    # touching the heads' lr. Raise back toward 0.5 only after a stable long run.
+    "backbone_lr_mult": 0.25,       # LR multiplier for backbone parameters
     "grad_clip_max_norm": 1.0,
     "grad_clip_norm_type": 2.0,
     # Gradient-explosion guard. clip_grad_norm_ bounds step *magnitude* but not
@@ -112,10 +123,18 @@ OPTIMIZER_CONFIG = {
     # produces a clipped-but-garbage-direction update that, repeated, walks the
     # weights into a divergent regime (activations overflow -> softmax/matmul
     # NaNs ->all-NaN grads). When the pre-clip grad norm exceeds this threshold
-    # the optimizer step is skipped entirely instead of applied. None -> derive
-    # as grad_clip_max_norm * 1000 (i.e. 25000); healthy post-warmup norms are
-    # O(1)-O(100), so this only rejects genuine explosions.
-    "grad_skip_norm": None,
+    # the optimizer step is skipped entirely instead of applied.
+    #
+    # IMPORTANT: this is an ABSOLUTE floor in grad-norm units, independent of
+    # grad_clip_max_norm. Set it explicitly. A previous run left it None, which
+    # the runner derived as grad_clip_max_norm * 1000 = 1.0 * 1000 = 1e3 (the
+    # stale comment claimed 25000, from when grad_clip_max_norm was 25). A 1e3
+    # floor is FAR too tight: clip_grad_norm already bounds the step magnitude to
+    # max_norm=1.0, so a pre-clip spike of ~1e3 is fully recoverable, yet it was
+    # being skipped -- and a string of such skips tripped the 200-skip abort. The
+    # backbone genuinely diverges at ~5e4, so 25000 cleanly separates "large but
+    # clippable" from "real explosion". Healthy post-warmup norms are O(1)-O(100).
+    "grad_skip_norm": 25000.0,
     # Stall guard. The grad-explosion guard above skips a corrupted step, but if
     # the model has walked into a divergent regime EVERY subsequent step explodes
     # and is skipped -> training is frozen yet keeps burning compute (a real run
@@ -132,7 +151,9 @@ OPTIMIZER_CONFIG = {
     # and fixes the small-batch training instability (lr too hot for batch 4).
     "effective_batch_size": 64,
     "grad_accum_steps": None,       # None -> auto-derive from effective_batch_size; set an int to override
-    "warmup_iters": 500,            # In optimizer-step units (matches official batch-64 warmup)
+    "warmup_iters": 1000,           # In optimizer-step units. Raised from 500 to
+                                    # ease the early backbone ramp after repeated
+                                    # epoch-3 divergences (see backbone_lr_mult).
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,           # Final LR = lr * min_lr_ratio
     "log_interval": 5,             # Print/TensorBoard log every N optimizer steps
