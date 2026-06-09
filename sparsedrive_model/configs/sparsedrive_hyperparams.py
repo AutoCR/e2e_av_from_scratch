@@ -61,13 +61,15 @@ RUNTIME_CONFIG = {
 
 TRAINING_SCHEDULE_STAGE1 = {
     "num_epochs": 100,
-    # Per-GPU micro-batch. With 8 GPUs this gives micro_global_batch = 8*8 = 64,
-    # which matches effective_batch_size=64 (accum auto-derives to 1) and the
-    # official lr=4e-4@batch-64 pairing. The previous value (12) yielded
-    # effective batch 96 with accum=1 -- a hotter regime than the LR was tuned
-    # for, contributing to the repeated epoch-3 backbone divergence.
+    # Per-GPU micro-batch. Launch with `torchrun --nproc_per_node=4`: this gives
+    # micro_global_batch = 8*4 = 32, and the runner auto-derives grad_accum_steps
+    # = round(64/32) = 2 -> effective batch EXACTLY 64, matching the official
+    # lr=4e-4@batch-64 pairing. (6 GPUs cannot divide 64 cleanly -- 6 carries a
+    # factor of 3 -- so we run on 4 of the 6 cards to hit exactly 64. The earlier
+    # 8-GPU x batch-12 setup yielded effective batch 96, a hotter regime than the
+    # LR was tuned for, contributing to the repeated epoch-3 backbone divergence.)
     "total_batch_size": 8,
-    "num_gpus": 8,                  # Reference GPU count (used only by derive_training_hyperparams)
+    "num_gpus": 4,                  # Reference GPU count (used only by derive_training_hyperparams)
     "ckpt_epoch_interval": 2,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
     "eval_mode": {
