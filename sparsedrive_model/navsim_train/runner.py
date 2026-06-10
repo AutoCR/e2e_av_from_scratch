@@ -301,6 +301,62 @@ def _is_main_process() -> bool:
     return _get_rank() == 0
 
 
+class _TeeStream:
+    """Mirror a stream (stdout/stderr) to a log file while still writing through.
+
+    Lets a bare ``torchrun ...`` (no shell ``| tee``) always produce a console
+    log next to the checkpoints/TB data, capturing tqdm output, the [SD_DEBUG]
+    probe lines, skip/grad dumps, and tracebacks. Line-buffered + flushed so the
+    log is current if the run is killed mid-explosion.
+    """
+
+    def __init__(self, original, file_handle):
+        self._original = original
+        self._file = file_handle
+
+    def write(self, data):
+        self._original.write(data)
+        try:
+            self._file.write(data)
+            self._file.flush()
+        except Exception:
+            pass
+        return len(data)
+
+    def flush(self):
+        self._original.flush()
+        try:
+            self._file.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        # Delegate isatty(), fileno(), encoding, etc. to the real stream so
+        # tqdm and libraries that introspect the terminal keep working.
+        return getattr(self._original, name)
+
+
+def _install_console_log(output_dir: Path):
+    """Tee rank-0 stdout+stderr to ``output_dir/console_<timestamp>.log``.
+
+    Returns the log path (or None on non-main ranks / failure). Idempotent-safe:
+    only the main process writes, so DDP workers don't clobber each other.
+    """
+    if not _is_main_process():
+        return None
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = Path(output_dir) / f"console_{ts}.log"
+        fh = open(log_path, "a", buffering=1, encoding="utf-8")
+        sys.stdout = _TeeStream(sys.stdout, fh)
+        sys.stderr = _TeeStream(sys.stderr, fh)
+        print(f"[console-log] mirroring stdout/stderr to {log_path}", flush=True)
+        return log_path
+    except Exception as exc:  # never let logging setup break training
+        print(f"[console-log] failed to set up file logging: {exc}", flush=True)
+        return None
+
+
 def _cleanup_distributed():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
@@ -438,6 +494,10 @@ def run(config: dict):
         )
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Auto-mirror the console to output_dir/console_<timestamp>.log on rank 0, so
+    # a bare `torchrun ...` always produces a log without a manual `| tee`. Uses
+    # the config's output_dir (same place as checkpoints + TB).
+    _install_console_log(output_dir)
 
     NavSimSparseDriveDataset, build_dataloader_fn, collate_fn_fn = _load_data_api()
     max_scenes = 2 if config.get("quick_smoke") else None
