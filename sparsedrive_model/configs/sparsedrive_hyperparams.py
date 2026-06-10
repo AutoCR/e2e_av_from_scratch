@@ -152,18 +152,19 @@ OPTIMIZER_CONFIG = {
     "grad_clip_max_norm": 25.0,
     "grad_clip_norm_type": 2.0,
     # Gradient-explosion SKIP guard: DISABLED (inf) to match upstream, which has
-    # no skip guard at all -- it clips and ALWAYS steps. The 2026-06-10
-    # instrumented run (console_20260610_104307.log) proved the skip guard was
-    # the reason explosions became PERMANENT: the blowup enters through
-    # project_points' x/z backward (1/z^2 amplification when the refinement MLP
-    # walks a keypoint near a camera's optical center; top offender
-    # sf_refines.0.layers.10.weight at 2.5e8) and the corrective direction --
-    # pushing keypoints AWAY from the camera plane -- is in that same gradient.
-    # Upstream clips it to norm 25, takes the step, and self-heals. Skipping the
-    # step instead FREEZES the weights in the exact configuration that explodes
-    # on every batch: 0/59 steps recovered after onset in both prior runs. The
-    # NaN/Inf skip path and the consecutive-skip stall abort remain active (a
-    # truly non-finite grad still skips; only the finite-but-large skip is gone).
+    # no skip guard at all -- it clips and ALWAYS steps. History (instrumented
+    # runs, 2026-06-10): skipping froze the weights in the exploding
+    # configuration (0/59 recovery, console_20260610_104307.log); but
+    # clip-through ALONE was then also falsified -- grads escalated 1e5 -> 1e34
+    # over ~15 landed steps and went NaN (console_20260610_152016.log). The
+    # explosion was structural: a 6-layer cascade of 1/z^2 perspective-division
+    # Jacobians in project_points, fed by ~500 keypoints permanently within
+    # 10 cm of a camera (frozen kmeans anchors x constant NAVSIM extrinsics).
+    # The ACTUAL fix is the bounded-Jacobian masked projection in
+    # sparsedrive/blocks.py (PROJECT_Z_MIN); with it, worst-case grad amplification
+    # is ~3/layer (~1e3 over 6 layers), so plain clip-at-25 suffices and no skip
+    # guard is needed. The NaN/Inf skip path and the consecutive-skip stall abort
+    # remain active as pure safety nets.
     "grad_skip_norm": float("inf"),
     # Stall guard. The grad-explosion guard above skips a corrupted step, but if
     # the model has walked into a divergent regime EVERY subsequent step explodes

@@ -21,6 +21,14 @@ __all__ = [
     "AsymmetricFFN",
 ]
 
+# Physical minimum camera-frame depth (metres) for keypoint feature sampling.
+# Points at/behind this plane are masked off-image in project_points (zero
+# forward contribution, zero gradient). See the comment in project_points for
+# the full empirical justification; raising/lowering this trades how close to
+# a lens a keypoint may sample against the 1/z^2 backward amplification bound
+# (max |du/dx| = 1/PROJECT_Z_MIN per decoder layer).
+PROJECT_Z_MIN = 0.5
+
 
 def linear_relu_ln(embed_dims, in_loops, out_loops, input_dims=None):
     if input_dims is None:
@@ -228,23 +236,45 @@ class DeformableFeatureAggregation(nn.Module):
             pts_extend[:, None, ..., None],
         ).squeeze(-1)
         # Forward probe (no-op unless SD_DEBUG>=1): log the camera-frame depth
-        # distribution before the divide. A keypoint with z near/below the floor
-        # is the leading indicator of the x/z^2 backward explosion.
+        # distribution before the divide.
         from .debug_probe import probe_projection_depth
 
-        probe_projection_depth(points_2d[..., 2:3], floor=1e-5)
-        # Divide by camera-frame depth z, flooring with torch.clamp(z, min=1e-5)
-        # EXACTLY as upstream SparseDrive / Sparse4D do (projects/mmdet3d_plugin/
-        # models/blocks.py, swc-17/SparseDrive @ main, blob 32cacdc4). A prior
-        # local change raised this to 1e-1 to "cap the 1/z^2 gradient cliff", but
-        # that is 1e4x LARGER than upstream and made things WORSE: real depths are
-        # in metres, so 1e-5 effectively never clamps (only true z~=0), whereas a
-        # 0.1 m floor zeroes the gradient for every keypoint with 0<z<0.1 (the
-        # clamp's flat region) and parks boundary keypoints on the cliff edge --
-        # the run still exploded at step ~9045 with this floor. Upstream trains
-        # stably at 1e-5, so we match it verbatim rather than invent a clamp.
+        probe_projection_depth(points_2d[..., 2:3], floor=PROJECT_Z_MIN)
+        # Bounded-Jacobian masked perspective division (deliberate deviation from
+        # upstream's bare `xy / clamp(z, min=1e-5)`), because upstream's exact
+        # numerics are empirically UNSTABLE in the NAVSIM regime. Evidence from
+        # three instrumented 6-GPU runs (2026-06-09/10): training explodes at
+        # iter ~7.3k-9.3k under floor=1e-1+skip, floor=1e-5+skip, AND
+        # floor=1e-5+clip-25-step-through (upstream's own policy) -- grad norms
+        # escalate 1e5 -> 1e34 within ~15 iters while the LOSS STAYS ~22 and the
+        # forward depth stats are static. Mechanism: NAVSIM has ONE vehicle
+        # (constant camera extrinsics) and the kmeans det anchors are frozen, so
+        # ~400-600 of 421k keypoints sit within 10 cm of a camera on EVERY
+        # forward pass; the backward of x/z scales as 1/z^2 there, and the
+        # 6-layer decoder chains six such divisions (each refined anchor feeds
+        # the next layer's projection, un-detached -- upstream-canonical), giving
+        # up to (1/z)^6 ~ 1e30 amplification into the refinement MLP. No
+        # clip/skip policy can manage that; the cliff itself must go.
+        #
+        # Fix: nothing visible can be feature-sampled closer than PROJECT_Z_MIN
+        # to a lens, so points at/behind it are pushed far off-image through a
+        # GRADIENT-LESS branch (torch.where on a binary depth test; the constant
+        # branch carries no graph). DAF / grid_sample then give them zero
+        # contribution AND zero gradient -- which upstream's behind-camera points
+        # got anyway via z=1e-5 -> coords ~1e6 off-image; the only behavioral
+        # change is removing the rare ON-image sample with z < 0.5 m, which is
+        # precisely the pathological population. For surviving points the
+        # Jacobian is bounded: |du/dx| = 1/z <= 2, and on-image |u|<=1 implies
+        # |du/dz| = |u|/z <= 2, so the 6-layer cascade is <= ~2^6 = 64 --
+        # trivially clippable.
+        depth = points_2d[..., 2:3]
         points_2d = points_2d[..., :2] / torch.clamp(
-            points_2d[..., 2:3], min=1e-5
+            depth, min=PROJECT_Z_MIN
+        )
+        points_2d = torch.where(
+            depth > PROJECT_Z_MIN,
+            points_2d,
+            torch.full_like(points_2d, -1e4),
         )
         if image_wh is not None:
             points_2d = points_2d / image_wh[:, :, None, None]
