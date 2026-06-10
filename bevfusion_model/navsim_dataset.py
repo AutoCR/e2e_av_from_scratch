@@ -133,6 +133,7 @@ class NavSimBEVFusionDataset(torch.utils.data.Dataset):
             nuplan_maps_root=nuplan_maps_root,
             num_history_frames=num_history_frames,
             num_future_frames=num_future_frames,
+            frame_interval=1,
             max_scenes=max_scenes,
             log_names=log_names,
             tokens=tokens,

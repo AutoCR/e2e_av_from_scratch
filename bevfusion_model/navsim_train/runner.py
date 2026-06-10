@@ -29,6 +29,7 @@ from sparsedrive_model.navsim_train.runner import (
     _get_rank,
     _get_world_size,
     _is_main_process,
+    _install_console_log,
     _cleanup_distributed,
 )
 
@@ -115,6 +116,9 @@ def run(config: dict):
     # Output directory
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Mirror rank-0 stdout/stderr to output_dir/console_<timestamp>.log so a bare
+    # `torchrun ...` always produces a log without a manual `| tee`.
+    _install_console_log(output_dir)
 
     # Resolve train split
     splits = config["splits"]
