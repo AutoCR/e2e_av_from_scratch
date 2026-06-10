@@ -67,6 +67,39 @@ def _save_ckpt(path, raw_model, optimizer, scheduler, scaler, iteration, config)
     )
 
 
+@torch.no_grad()
+def _run_loss_eval(raw_model, loader, device, scaler, max_batches):
+    """Average detection-loss components over (a prefix of) an eval split.
+
+    Runs the loss path (``_forward_train``) explicitly with the model in eval
+    mode, on the unwrapped model so no DDP collectives are involved — must be
+    called on rank 0 only. No mAP/NDS metrics exist in this port, so val/test
+    loss is the evaluation signal.
+    """
+    was_training = raw_model.training
+    raw_model.eval()
+    sums: dict = {}
+    count = 0
+    for batch_index, raw_batch in enumerate(loader):
+        if max_batches is not None and batch_index >= int(max_batches):
+            break
+        batch = _move_to_device(raw_batch, device)
+        img = batch.pop("img")
+        with scaler.autocast():
+            loss_dict = raw_model._forward_train(img=img, **batch)
+        total = sum(v for v in loss_dict.values() if torch.is_tensor(v))
+        sums["loss_total"] = sums.get("loss_total", 0.0) + float(total)
+        for key, value in loss_dict.items():
+            if torch.is_tensor(value):
+                sums[key] = sums.get(key, 0.0) + float(value)
+        count += 1
+    if was_training:
+        raw_model.train()
+    if count == 0:
+        return {}
+    return {key: value / count for key, value in sums.items()}
+
+
 def run(config: dict):
     """Train BEVFusion on NAVSIM (detection-only, 5 classes, from scratch).
 
@@ -91,7 +124,7 @@ def run(config: dict):
     # Hyperparameters and recipe
     recipe = get_training_recipe()
     # Override recipe from config if present
-    for key in ("total_batch_size", "num_epochs", "ckpt_epoch_interval", "log_interval", "fp16_loss_scale", "num_workers"):
+    for key in ("total_batch_size", "num_epochs", "ckpt_epoch_interval", "eval_epoch_interval", "eval_max_batches", "log_interval", "fp16_loss_scale", "num_workers"):
         if config.get(key) is not None:
             recipe[key] = config[key]
 
@@ -105,6 +138,8 @@ def run(config: dict):
                 "warmup_iters": 2,
                 "log_interval": 1,
                 "ckpt_epoch_interval": 1,
+                "eval_epoch_interval": 1,
+                "eval_max_batches": 1,
             }
         )
         max_scenes = 2
@@ -120,29 +155,36 @@ def run(config: dict):
     # `torchrun ...` always produces a log without a manual `| tee`.
     _install_console_log(output_dir)
 
-    # Resolve train split
+    # Resolve splits
     splits = config["splits"]
     train_dir, train_logs, train_tokens = _resolve_split_config(splits["train"], _REPO_ROOT)
+    val_dir, val_logs, val_tokens = _resolve_split_config(splits["val"], _REPO_ROOT)
+    test_dir, test_logs, test_tokens = _resolve_split_config(splits["test"], _REPO_ROOT)
 
-    # Build dataset
-    try:
-        train_dataset = NavSimBEVFusionDataset(
-            split=train_dir,
-            openscene_data_root=config["openscene_data_root"],
-            nuplan_maps_root=config["nuplan_maps_root"],
-            camera_order=config.get("camera_order"),
-            image_hw=tuple(config.get("image_hw", (256, 704))),
-            test_mode=False,
-            max_scenes=max_scenes,
-            log_names=train_logs,
-            tokens=train_tokens,
-        )
-    except (FileNotFoundError, RuntimeError) as e:
-        raise RuntimeError(
-            f"Failed to build NAVSIM dataset: {e}\n"
-            "NAVSIM sensor data not found at configured paths. "
-            "Please run training on the server with NAVSIM/OpenScene data available."
-        ) from e
+    # Build datasets (test_mode=False everywhere: eval computes loss, so GT is needed)
+    def _build_split_dataset(split_dir, log_names, tokens, name):
+        try:
+            return NavSimBEVFusionDataset(
+                split=split_dir,
+                openscene_data_root=config["openscene_data_root"],
+                nuplan_maps_root=config["nuplan_maps_root"],
+                camera_order=config.get("camera_order"),
+                image_hw=tuple(config.get("image_hw", (256, 704))),
+                test_mode=False,
+                max_scenes=max_scenes,
+                log_names=log_names,
+                tokens=tokens,
+            )
+        except (FileNotFoundError, RuntimeError) as e:
+            raise RuntimeError(
+                f"Failed to build NAVSIM {name} dataset: {e}\n"
+                "NAVSIM sensor data not found at configured paths. "
+                "Please run training on the server with NAVSIM/OpenScene data available."
+            ) from e
+
+    train_dataset = _build_split_dataset(train_dir, train_logs, train_tokens, "train")
+    val_dataset = _build_split_dataset(val_dir, val_logs, val_tokens, "val")
+    test_dataset = _build_split_dataset(test_dir, test_logs, test_tokens, "test")
 
     # Dataloader with DDP sampler if multi-GPU
     total_batch_size = int(recipe["total_batch_size"])
@@ -168,6 +210,24 @@ def run(config: dict):
             collate_fn_override=collate_fn,
             sampler=None,
         )
+
+    # Eval loaders: rank-0-only loss eval, no sampler, no shuffle
+    val_loader = build_dataloader(
+        val_dataset,
+        batch_size=total_batch_size,
+        num_workers=num_workers,
+        shuffle=False,
+        collate_fn_override=collate_fn,
+        sampler=None,
+    )
+    test_loader = build_dataloader(
+        test_dataset,
+        batch_size=total_batch_size,
+        num_workers=num_workers,
+        shuffle=False,
+        collate_fn_override=collate_fn,
+        sampler=None,
+    )
 
     # Model
     model = BEVFusion(hyperparams)
@@ -213,6 +273,9 @@ def run(config: dict):
         writer = SummaryWriter(log_dir=str(output_dir / "tb" / timestamp))
 
     # Training loop
+    ckpt_cadence = max(1, num_iters_per_epoch * int(recipe["ckpt_epoch_interval"]))
+    eval_cadence = max(1, num_iters_per_epoch * int(recipe["eval_epoch_interval"]))
+    eval_max_batches = recipe.get("eval_max_batches", 100)
     iteration = start_iter
     pbar = tqdm(
         total=max_iters,
@@ -269,10 +332,21 @@ def run(config: dict):
                     writer.add_scalar("train/grad_norm", float(grad_norm), iteration)
                     pbar.set_postfix(loss=f"{float(loss):.3f}", lr=f"{lr:.2e}")
 
-                # Checkpoint at epoch intervals
-                if _is_main_process() and iteration % (num_iters_per_epoch * int(recipe["ckpt_epoch_interval"])) == 0:
+                # Checkpoint + val loss eval at epoch intervals (rank 0 only)
+                ran_ckpt = iteration % ckpt_cadence == 0
+                ran_eval = iteration % eval_cadence == 0
+                if ran_ckpt and _is_main_process():
                     _save_ckpt(output_dir / f"iter_{iteration}.pth", raw_model, optimizer, scheduler, scaler, iteration, config)
                     _save_ckpt(output_dir / "last.pth", raw_model, optimizer, scheduler, scaler, iteration, config)
+                if ran_eval and _is_main_process():
+                    val_metrics = _run_loss_eval(raw_model, val_loader, device, scaler, eval_max_batches)
+                    for key, value in val_metrics.items():
+                        writer.add_scalar(f"val/{key}", value, iteration)
+                    tqdm.write(f"val@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+                # Hold every rank until rank 0 finishes eval/checkpoint; otherwise the
+                # other ranks race into the next DDP collective and NCCL watchdogs fire.
+                if world_size > 1 and (ran_ckpt or ran_eval):
+                    dist.barrier()
 
             if iteration >= max_iters:
                 break
@@ -280,6 +354,14 @@ def run(config: dict):
         pbar.close()
         if world_size > 1:
             dist.barrier()
+
+        # Final val/test loss eval (rank 0 only; raw_model avoids DDP collectives)
+        if _is_main_process():
+            for tag, loader in (("val_final", val_loader), ("test_final", test_loader)):
+                metrics = _run_loss_eval(raw_model, loader, device, scaler, eval_max_batches)
+                for key, value in metrics.items():
+                    writer.add_scalar(f"{tag}/{key}", value, iteration)
+                print(f"{tag}@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
 
     finally:
         if writer is not None:

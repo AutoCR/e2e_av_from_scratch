@@ -328,6 +328,9 @@ TRAINING_RECIPE = {
     "log_interval": 50,
     "ckpt_epoch_interval": 1,
     "eval_epoch_interval": 1,
+    # Cap on eval batches per split: val/test splits are huge (frame_interval=1),
+    # so loss-eval runs on a fixed-size prefix instead of the full split.
+    "eval_max_batches": 100,
 }
 
 RUNTIME_CONFIG = {
@@ -347,7 +350,7 @@ RUNTIME_CONFIG = {
             "tokens_key": "tokens",
         },
         "test": {
-            "dir": "trainval",
+            "dir": "test",
             "log_names_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
             "log_names_key": "log_names",
             "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
