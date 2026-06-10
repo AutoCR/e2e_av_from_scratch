@@ -49,16 +49,19 @@ class SparseBox3DEncoder(nn.Module):
             self.output_fc = None
 
     def forward(self, box_3d: torch.Tensor):
-        pos_feat = self.pos_fc(box_3d[..., [X, Y, Z]])
-        size_feat = self.size_fc(box_3d[..., [W, L, H]])
-        yaw_feat = self.yaw_fc(box_3d[..., [SIN_YAW, COS_YAW]])
+        box_3d_safe = torch.nan_to_num(
+            box_3d, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        pos_feat = self.pos_fc(box_3d_safe[..., [X, Y, Z]])
+        size_feat = self.size_fc(box_3d_safe[..., [W, L, H]])
+        yaw_feat = self.yaw_fc(box_3d_safe[..., [SIN_YAW, COS_YAW]])
         if self.mode == "add":
             output = pos_feat + size_feat + yaw_feat
         elif self.mode == "cat":
             output = torch.cat([pos_feat, size_feat, yaw_feat], dim=-1)
 
         if self.vel_dims > 0:
-            vel_feat = self.vel_fc(box_3d[..., VX : VX + self.vel_dims])
+            vel_feat = self.vel_fc(box_3d_safe[..., VX : VX + self.vel_dims])
             if self.mode == "add":
                 output = output + vel_feat
             elif self.mode == "cat":
@@ -121,11 +124,37 @@ class SparseBox3DRefinementModule(nn.Module):
         time_interval: torch.Tensor = 1.0,
         return_cls=True,
     ):
-        feature = instance_feature + anchor_embed
-        output = self.layers(feature)
-        output[..., self.refine_state] = (
-            output[..., self.refine_state] + anchor[..., self.refine_state]
+        instance_feature_safe = torch.nan_to_num(
+            instance_feature, nan=0.0, posinf=1e4, neginf=-1e4
         )
+        anchor_embed_safe = torch.nan_to_num(
+            anchor_embed, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        anchor_safe = torch.nan_to_num(
+            anchor, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        feature = instance_feature_safe + anchor_embed_safe
+        output = self.layers(feature)
+        # Bound the refined box centre to the metric scene range, folded into the
+        # single refine_state write (a *second* in-place advanced-index assignment
+        # on `output` trips autograd's version counter). The kmeans anchor prior
+        # is frozen (det/map_anchor_grad=False), but this MLP delta is NOT: it is
+        # added to X/Y/Z at every decoder layer with no bound. From scratch on
+        # NAVSIM it can drift the centre until a generated keypoint projects near
+        # the camera plane, where project_points' 1/z^2 backward (blocks.py:237)
+        # amplifies grads into the 1e7-1e17 range -> the explosion-guard skips
+        # every step and training stalls. Real NAVSIM objects sit well inside
+        # |x|,|y|<=100 m and |z|<=10 m, so clamping the *centre* never touches a
+        # valid box; only X/Y/Z are bounded (W/L/H/yaw use +/-inf = no clamp).
+        # Mirrors the size-exp clamp in SparseBox3DKeyPointsGenerator.
+        refined_state = (
+            output[..., self.refine_state] + anchor_safe[..., self.refine_state]
+        )
+        _centre_lo = {X: -100.0, Y: -100.0, Z: -10.0}
+        _centre_hi = {X: 100.0, Y: 100.0, Z: 10.0}
+        lo = output.new_tensor([_centre_lo.get(s, float("-inf")) for s in self.refine_state])
+        hi = output.new_tensor([_centre_hi.get(s, float("inf")) for s in self.refine_state])
+        output[..., self.refine_state] = refined_state.clamp(min=lo, max=hi)
         if self.normalize_yaw:
             output[..., [SIN_YAW, COS_YAW]] = torch.nn.functional.normalize(
                 output[..., [SIN_YAW, COS_YAW]], dim=-1
@@ -134,12 +163,12 @@ class SparseBox3DRefinementModule(nn.Module):
             if not isinstance(time_interval, torch.Tensor):
                 time_interval = instance_feature.new_tensor(time_interval)
             translation = torch.transpose(output[..., VX:], 0, -1)
-            velocity = torch.transpose(translation / time_interval, 0, -1)
-            output[..., VX:] = velocity + anchor[..., VX:]
+            velocity = torch.transpose(translation / time_interval.float(), 0, -1)
+            output[..., VX:] = velocity + anchor_safe[..., VX:]
 
         if return_cls:
             assert self.with_cls_branch, "Without classification layers !!!"
-            cls = self.cls_layers(instance_feature)
+            cls = self.cls_layers(instance_feature_safe)
         else:
             cls = None
         if return_cls and self.with_quality_estimation:
@@ -181,7 +210,14 @@ class SparseBox3DKeyPointsGenerator(nn.Module):
         temp_timestamps=None,
     ):
         bs, num_anchor = anchor.shape[:2]
-        size = anchor[..., None, [W, L, H]].exp()
+        # Clamp the log-size before exp. anchor[..., W/L/H] is stored undecoded
+        # (log space); exp() is differentiated as exp() itself, so an
+        # un-bounded log-size (which the upstream nan_to_num only caps at 1e4,
+        # still far above the fp32 exp overflow point ~88) yields exp -> inf and
+        # an inf gradient even while the sanitized forward loss stays finite.
+        # Real boxes have log-size in roughly [-3, 4], so clamping to [-10, 10]
+        # never affects valid anchors and only tames runaway divergence.
+        size = anchor[..., None, [W, L, H]].clamp(min=-10.0, max=10.0).exp()
         key_points = self.fix_scale * size
         if self.num_learnable_pts > 0 and instance_feature is not None:
             learnable_scale = (

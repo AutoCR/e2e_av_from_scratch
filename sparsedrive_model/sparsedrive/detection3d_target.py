@@ -92,7 +92,7 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
         for i in range(bs):
             if cls_cost[i] is not None and box_cost[i] is not None:
                 cost = (cls_cost[i] + box_cost[i]).detach().cpu().numpy()
-                cost = np.where(np.isneginf(cost) | np.isnan(cost), 1e8, cost)
+                cost = np.where(~np.isfinite(cost), 1e8, cost)
                 assign = linear_sum_assignment(cost)
                 indices.append(
                     [cls_pred.new_tensor(x, dtype=torch.int64) for x in assign]

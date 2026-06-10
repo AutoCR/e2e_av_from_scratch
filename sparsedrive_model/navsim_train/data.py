@@ -16,8 +16,8 @@ from PIL import Image
 from pyquaternion import Quaternion
 from torch.utils.data import DataLoader, Dataset, Sampler, SequentialSampler
 
+from sparsedrive_model.configs.sparsedrive_hyperparams import get_camera_order
 from sparsedrive_model.navsim_adapter import (
-    DEFAULT_CAMERA_ORDER_8,
     DEFAULT_MAP_VERSION,
     build_navsim_scene_loader,
     normalize_camera_order,
@@ -195,7 +195,7 @@ class NavSimSparseDriveDataset(Dataset):
         split: str,
         openscene_data_root: str | os.PathLike[str],
         nuplan_maps_root: str | os.PathLike[str],
-        camera_order: Sequence[str] = DEFAULT_CAMERA_ORDER_8,
+        camera_order: Optional[Sequence[str]] = None,
         num_history_frames: int = 4,
         num_future_frames: int = 12,
         image_hw: tuple[int, int] = (256, 704),
@@ -210,6 +210,8 @@ class NavSimSparseDriveDataset(Dataset):
         self.split = split
         self.openscene_data_root = Path(openscene_data_root)
         self.nuplan_maps_root = Path(nuplan_maps_root)
+        if camera_order is None:
+            camera_order = get_camera_order()
         self.camera_order = normalize_camera_order(camera_order)
         self.num_history_frames = int(num_history_frames)
         self.num_future_frames = int(num_future_frames)
@@ -231,6 +233,7 @@ class NavSimSparseDriveDataset(Dataset):
             nuplan_maps_root=self.nuplan_maps_root,
             num_history_frames=self.num_history_frames,
             num_future_frames=self.num_future_frames,
+            frame_interval=1,
             max_scenes=max_scenes,
             log_names=log_names,
             tokens=tokens,

@@ -36,22 +36,45 @@ RUNTIME_CONFIG = {
             "tokens_key": "tokens",
         },
         "test": {
-            "dir": "trainval",
+            "dir": "test",
             "log_names_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
             "log_names_key": "log_names",
             "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
             "tokens_key": "tokens",
         },
     },
-    "openscene_data_root": "/Users/chenran/Code/navsim/dataset",
-    "nuplan_maps_root": "/Users/chenran/Code/navsim/dataset/maps",
+    "openscene_data_root": "/prediction_database/navsim",
+    "nuplan_maps_root": "/prediction_database/nuplan/dataset/maps",
     "output_dir": "sparsedrive_model/outputs/train_navsim",
     "load_from": None,              # Path to a checkpoint to init weights (stage2: "ckpt/sparsedrive_stage1.pth")
-    "resume_from": None,            # Path to a full checkpoint to resume interrupted training
+    # Resume FULL state (weights + optimizer momentum + scheduler + iteration) to
+    # reproduce the gradient explosion fast: it replays from the last saved step
+    # (~near the divergence) instead of re-walking ~9000 steps from scratch, and
+    # keeps the exact optimizer/LR state that produced the bug. last.pth is always
+    # the most recent checkpoint (written every ckpt_epoch_interval epochs). Set
+    # to None for a clean from-the-fix run; point at last.pth to repro the bug.
+    "resume_from": None,
     "seed": 0,
     "num_workers": 4,
     "device": "auto",                # "auto", "cuda", "mps", or "cpu"
-    "quick_smoke": False,           # True → 1-iter smoke test with 2 scenes
+    "quick_smoke": False,
+    # --- Numerical debug probe (locating the gradient-explosion source) ---
+    # 0 = off (zero overhead, normal training).
+    # 1 = forward probes: log the camera-frame depth distribution entering
+    #     project_points (the x/z^2 cliff predictor) and finiteness summaries.
+    #     The runner also prints, on any skipped step, the FIRST parameter whose
+    #     grad is non-finite (with its module path), complementing the existing
+    #     magnitude-ranked top-grad dump. ~negligible overhead -- safe for a full run.
+    # 2 = everything in 1, PLUS torch.autograd.detect_anomaly() around the
+    #     forward+backward, which names the EXACT backward op that first produces
+    #     a NaN/Inf. ~2-3x slower -- use for a short repro run only.
+    # Output goes to stdout (prefix "[SD_DEBUG]"); rank 0 only unless
+    # debug_all_ranks=True. The runner exports these to the env the probe reads.
+    # NOTE (2026-06-10): the instrumented run proved the explosion is
+    # large-but-FINITE (never NaN), so level 2's detect_anomaly never fires and
+    # only costs 2-3x speed. Level 1 is sufficient.
+    "debug_level": 1,
+    "debug_all_ranks": False,
 }
 
 # =============================================================================
@@ -61,14 +84,23 @@ RUNTIME_CONFIG = {
 
 TRAINING_SCHEDULE_STAGE1 = {
     "num_epochs": 100,
-    "total_batch_size": 64,
-    "num_gpus": 8,                  # Reference GPU count (used only by derive_training_hyperparams)
-    "ckpt_epoch_interval": 20,      # Save a checkpoint every N epochs
+    # Per-GPU micro-batch. Launch with `torchrun --nproc_per_node=6`: this gives
+    # micro_global_batch = 12*6 = 72, and the runner auto-derives grad_accum_steps
+    # = round(64/72) = 1 -> effective batch 72, accum=1 (no accumulation, full
+    # throughput). 72 is ~12% hotter than the official batch-64 recipe, but that
+    # is acceptable now that backbone_lr_mult=0.25 halves the backbone LR: the
+    # earlier divergence ran effective batch 96 AND backbone lr 2e-4, and we have
+    # removed the larger risk factor. (6 GPUs cannot divide 64 cleanly -- 6 carries
+    # a factor of 3 -- so exact 64 is not reachable with all 6 cards; 72 is the
+    # closest full-hardware option.)
+    "total_batch_size": 6,
+    "num_gpus": 6,                  # Reference GPU count (used only by derive_training_hyperparams)
+    "ckpt_epoch_interval": 1,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
     "eval_mode": {
         "with_det": True,
         "with_tracking": True,
-        "with_map": True,
+        "with_map": False,
         "with_motion": False,
         "with_planning": False,
         "tracking_threshold": 0.2,
@@ -78,7 +110,7 @@ TRAINING_SCHEDULE_STAGE1 = {
 
 TRAINING_SCHEDULE_STAGE2 = {
     "num_epochs": 10,
-    "total_batch_size": 48,
+    "total_batch_size": 4,
     "num_gpus": 8,
     "ckpt_epoch_interval": 10,
     "eval_epoch_interval": 10,
@@ -99,19 +131,83 @@ TRAINING_SCHEDULE_STAGE2 = {
 # Learning rate, weight decay, warmup schedule, gradient clipping, and logging.
 
 OPTIMIZER_CONFIG = {
+    # LR is paired with ``effective_batch_size`` below. The official SparseDrive
+    # recipe trains at batch 64 with lr=4e-4; we reproduce that stable regime via
+    # gradient accumulation instead of a literal batch of 64 (see runner).
     "lr": 4e-4,
     "weight_decay": 0.001,
-    "backbone_lr_mult": 0.5,        # LR multiplier for backbone parameters
+    # Backbone LR multiplier. The pretrained ResNet50 backbone (with gradient
+    # checkpointing, 3 cameras @ 704x256) diverged REPEATEDLY around epoch 3 at
+    # mult=0.5 (backbone lr=2e-4): img_backbone.conv1/layer1 grads blew up to
+    # O(5e4). Halving to 0.25 (backbone lr=1e-4) is the standard remedy for a
+    # diverging pretrained backbone -- it slows the layers that explode without
+    # touching the heads' lr. Raise back toward 0.5 only after a stable long run.
+    "backbone_lr_mult": 0.25,       # LR multiplier for backbone parameters
+    # Gradient clipping: match upstream SparseDrive EXACTLY
+    # (projects/configs/sparsedrive_small_stage1.py: grad_clip=dict(max_norm=25,
+    # norm_type=2)). A local change had tightened this to 1.0 -- 25x tighter than
+    # the recipe -- which silently shrank EVERY healthy update ~25x (post-warmup
+    # norms run 20-30, so clip=1.0 clipped every single step) and is the likely
+    # reason loss plateaued ~22-25.
     "grad_clip_max_norm": 25.0,
     "grad_clip_norm_type": 2.0,
-    "warmup_iters": 500,
+    # Gradient-explosion SKIP guard: DISABLED (inf) to match upstream, which has
+    # no skip guard at all -- it clips and ALWAYS steps. History (instrumented
+    # runs, 2026-06-10): skipping froze the weights in the exploding
+    # configuration (0/59 recovery, console_20260610_104307.log); but
+    # clip-through ALONE was then also falsified -- grads escalated 1e5 -> 1e34
+    # over ~15 landed steps and went NaN (console_20260610_152016.log). The
+    # explosion was structural: a 6-layer cascade of 1/z^2 perspective-division
+    # Jacobians in project_points, fed by ~500 keypoints permanently within
+    # 10 cm of a camera (frozen kmeans anchors x constant NAVSIM extrinsics).
+    # The ACTUAL fix is the bounded-Jacobian masked projection in
+    # sparsedrive/blocks.py (PROJECT_Z_MIN); with it, worst-case grad amplification
+    # is ~3/layer (~1e3 over 6 layers), so plain clip-at-25 suffices and no skip
+    # guard is needed. The NaN/Inf skip path and the consecutive-skip stall abort
+    # remain active as pure safety nets.
+    "grad_skip_norm": float("inf"),
+    # Stall guard. The grad-explosion guard above skips a corrupted step, but if
+    # the model has walked into a divergent regime EVERY subsequent step explodes
+    # and is skipped -> training is frozen yet keeps burning compute (a real run
+    # skipped ~99k consecutive steps for ~1.5 days). Abort once this many
+    # optimizer steps are skipped in a row; a single successful step resets the
+    # counter, so transient one-off spikes never trip it. None disables the guard.
+    # With log_interval=5 a value of 200 catches a true stall within ~1000 iters.
+    "grad_skip_abort_after": 200,
+    # --- Gradient accumulation ---
+    # The dataloader yields micro-batches of ``total_batch_size``; the runner
+    # accumulates enough of them to reach ``effective_batch_size`` before each
+    # optimizer step. This restores the optimization regime the model was tuned
+    # for (effective batch 64) without needing GPU memory for a true batch of 64,
+    # and fixes the small-batch training instability (lr too hot for batch 4).
+    "effective_batch_size": 64,
+    "grad_accum_steps": None,       # None -> auto-derive from effective_batch_size; set an int to override
+    "warmup_iters": 1000,           # In optimizer-step units. Raised from 500 to
+                                    # ease the early backbone ramp after repeated
+                                    # epoch-3 divergences (see backbone_lr_mult).
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,           # Final LR = lr * min_lr_ratio
-    "fp16_loss_scale": 32.0,
-    "log_interval": 51,             # Print/TensorBoard log every N iterations
-    # NAVSIM uses 8 cameras; overrides the model-architecture default of 6.
-    "num_cams": 8,
+    "log_interval": 5,             # Print/TensorBoard log every N optimizer steps
 }
+
+# =============================================================================
+# NAVSIM CAMERA CONFIGURATION
+# =============================================================================
+# SINGLE source of truth for which NAVSIM cameras, and therefore how many,
+# the NAVSIM training pipeline uses. num_cams is derived as len(CAMERA_ORDER).
+# To train with 4 cameras, edit this list to a 4-name subset of the 8 valid
+# NAVSIM cameras: CAM_F0, CAM_L0, CAM_L1, CAM_R0, CAM_R1, CAM_L2, CAM_R2,
+# CAM_B0. The default keeps all 8 cameras, preserving current behavior.
+CAMERA_ORDER = (
+    "CAM_F0",
+    "CAM_L0",
+    "CAM_L1",
+    "CAM_R0",
+    "CAM_R1",
+    "CAM_L2",
+    "CAM_R2",
+    "CAM_B0",
+)
 
 # =============================================================================
 # SECTION 4: MODEL ARCHITECTURE
@@ -159,14 +255,24 @@ MODEL_ARCH = {
     "num_depth_layers": 3,
     "depth_loss_weight": 0.2,
     "drop_out": 0.1,
-    "temporal": True,
+    # DIAGNOSTIC (2026-06-09): temporarily disabled to isolate a temporal-memory
+    # NaN loop. A previous run was healthy through ~6260 steps (grad_norm ~20-250,
+    # loss ~25-30) then hit ONE genuine grad spike (1e9) at step 6265 that was
+    # correctly skipped+reset -- but afterward every other step went NaN in a
+    # self-sustaining 1-0-1-0 cadence (clean step re-caches temporal instance
+    # feature -> next step consumes it -> NaN -> skip+reset -> repeat) until the
+    # 200-skip stall guard aborted. Weights never diverged. temporal=False sets
+    # det num_temp_instances=-1, so InstanceBank.cache() returns early and the
+    # temporal queue is fully off. If this run trains past ~6300 steps cleanly,
+    # the cause is confirmed and the real fix is to finiteness-guard the cache.
+    "temporal": False,              # was True -- diagnostic; restore after confirming
     "temporal_map": True,
     "decouple_attn_motion": True,
     "with_quality_estimation": True,
-    "task_config": {"with_det": True, "with_map": True, "with_motion_plan": False},
+    "task_config": {"with_det": True, "with_map": False, "with_motion_plan": False},
     # --- Paths ---
-    "kmeans_dir": "./sparsedrive_model/data/kmeans_nuscenes",
-    "backbone_pretrained": "model_weights/resnet50-19c8e357.pth",
+    "kmeans_dir": "./sparsedrive_model/data/kmeans",
+    "backbone_pretrained": "model_weights/resnet50/resnet50-19c8e357.pth",
     # --- Backbone ---
     "backbone_with_cp": True,       # Use gradient checkpointing in backbone
     # --- FPN ---
@@ -174,7 +280,7 @@ MODEL_ARCH = {
     "fpn_add_extra_convs": "on_output",
     "fpn_in_channels": [256, 512, 1024, 2048],
     # --- Camera / attention ---
-    "num_cams": 6,                  # Model default; overridden to 8 for NAVSIM via OPTIMIZER_CONFIG
+    "num_cams": 6,                  # Base/nuScenes default; the NAVSIM training path overrides this from CAMERA_ORDER via get_stage_hyperparams().
     "deformable_attn_drop": 0.15,
     "deformable_use_camera_embed": True,
     "deformable_residual_mode": "cat",
@@ -202,6 +308,14 @@ DETECTION_HEAD = {
     "det_num_temp_instances": 600,
     "det_confidence_decay": 0.6,
     "det_feat_grad": False,
+    # The detection anchor is a kmeans prior. Leaving it trainable lets it drift
+    # over many iterations until projected keypoints cluster against the depth
+    # clamp (z>=0.1) and the 1/z^2 backward produces O(1e18) grads that overflow
+    # the grad-norm reduction -> the step is skipped every iteration. Freezing it
+    # (the standard SparseDrive setting) keeps the anchor at its kmeans prior and
+    # removes that drift-driven explosion. Set True only if you intend to learn
+    # the anchor and have verified it stays stable.
+    "det_anchor_grad": False,
     "det_anchor_file": "kmeans_det_900.npy",
     # Keypoint geometry
     "det_keypoint_num_learnable_pts": 6,
@@ -254,6 +368,12 @@ MAP_HEAD = {
     "map_num_anchor": 100,
     "map_confidence_decay": 0.6,
     "map_feat_grad": True,
+    # Freeze the map anchor (kmeans prior) for the same reason as the detection
+    # anchor: a trainable anchor drifts until projected keypoints hit the depth
+    # clamp and the 1/z^2 backward produces grads large enough to overflow the
+    # grad-norm reduction. Relevant in Stage 2 (with_map=True). See
+    # [det_anchor_grad] above. Set True only to learn the anchor deliberately.
+    "map_anchor_grad": False,
     "map_anchor_file": "kmeans_map_100.npy",
     # Keypoint geometry
     "map_keypoint_num_learnable_pts": 3,
@@ -336,11 +456,22 @@ def get_stage2_hyperparams() -> dict:
     return _build_model_hyperparams(stage2=True)
 
 
-def get_stage_hyperparams(stage: str, num_cams_override: int = 8) -> tuple[dict, dict]:
+def get_camera_order() -> tuple[str, ...]:
+    """Return the configured NAVSIM camera order."""
+    return tuple(CAMERA_ORDER)
+
+
+def get_num_cams() -> int:
+    """Return the number of configured NAVSIM cameras."""
+    return len(CAMERA_ORDER)
+
+
+def get_stage_hyperparams(stage: str) -> tuple[dict, dict]:
     """Return ``(model_hyperparams, training_recipe)`` for the given stage.
 
     ``training_recipe`` is a flat dict consumed by the runner; it contains all
-    optimizer, scheduler, and training-schedule parameters.
+    optimizer, scheduler, and training-schedule parameters. num_cams is derived
+    from CAMERA_ORDER.
     """
     normalized = str(stage).lower().replace("_", "").replace("-", "")
     if normalized in {"1", "stage1"}:
@@ -354,8 +485,9 @@ def get_stage_hyperparams(stage: str, num_cams_override: int = 8) -> tuple[dict,
 
     recipe = deepcopy(OPTIMIZER_CONFIG)
     recipe.update(schedule)
-    recipe["num_cams"] = int(num_cams_override)
-    hyperparams["num_cams"] = int(num_cams_override)
+    n_cams = get_num_cams()
+    recipe["num_cams"] = n_cams
+    hyperparams["num_cams"] = n_cams
     return hyperparams, recipe
 
 
