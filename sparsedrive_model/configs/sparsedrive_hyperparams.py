@@ -53,7 +53,7 @@ RUNTIME_CONFIG = {
     # keeps the exact optimizer/LR state that produced the bug. last.pth is always
     # the most recent checkpoint (written every ckpt_epoch_interval epochs). Set
     # to None for a clean from-the-fix run; point at last.pth to repro the bug.
-    "resume_from": "sparsedrive_model/outputs/train_navsim/ckpt/last.pth",
+    "resume_from": None,
     "seed": 0,
     "num_workers": 4,
     "device": "auto",                # "auto", "cuda", "mps", or "cpu"
@@ -93,9 +93,9 @@ TRAINING_SCHEDULE_STAGE1 = {
     # removed the larger risk factor. (6 GPUs cannot divide 64 cleanly -- 6 carries
     # a factor of 3 -- so exact 64 is not reachable with all 6 cards; 72 is the
     # closest full-hardware option.)
-    "total_batch_size": 12,
+    "total_batch_size": 6,
     "num_gpus": 6,                  # Reference GPU count (used only by derive_training_hyperparams)
-    "ckpt_epoch_interval": 2,      # Save a checkpoint every N epochs
+    "ckpt_epoch_interval": 1,      # Save a checkpoint every N epochs
     "eval_epoch_interval": 20,      # Run validation every N epochs
     "eval_mode": {
         "with_det": True,
@@ -201,12 +201,12 @@ OPTIMIZER_CONFIG = {
 CAMERA_ORDER = (
     "CAM_F0",
     "CAM_L0",
-    # "CAM_L1",
+    "CAM_L1",
     "CAM_R0",
-    # "CAM_R1",
-    # "CAM_L2",
-    # "CAM_R2",
-    # "CAM_B0",
+    "CAM_R1",
+    "CAM_L2",
+    "CAM_R2",
+    "CAM_B0",
 )
 
 # =============================================================================
