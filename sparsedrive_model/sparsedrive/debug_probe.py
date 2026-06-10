@@ -118,16 +118,22 @@ def probe_projection_depth(z: torch.Tensor, floor: float) -> None:
             zmin = zmax = float("nan")
         n_nonpos = int((zf <= 0).sum())
         n_danger = int(((zf > 0) & (zf < 0.1)).sum())
-        if n_danger or n_nonfinite:
+        # Healthy baseline (measured on the 2026-06-10 resumed run): ~400-600 of
+        # 421k keypoints sit in the 0<z<0.1 band at ALL times -- anchors near the
+        # ego whose keypoints pass close to the camera positions. Printing on any
+        # non-empty band spams 6 lines/iter, so only alert on a genuine surge
+        # (several times baseline) or non-finite depths; otherwise fold the count
+        # into a periodic heartbeat so drift remains visible in the log.
+        if n_danger >= 2000 or n_nonfinite:
             _emit(
                 f"project_points depth: n={n} zmin={zmin:.4g} zmax={zmax:.4g} "
                 f"n(0<z<0.1)={n_danger} n(z<=0)={n_nonpos} "
-                f"n_nonfinite={n_nonfinite}  <<< near-plane keypoints (1/z^2 cliff)"
+                f"n_nonfinite={n_nonfinite}  <<< near-plane SURGE (1/z^2 cliff)"
             )
         elif _STEP % 100 == 1:
             _emit(
                 f"project_points depth heartbeat: n={n} zmin={zmin:.4g} "
-                f"zmax={zmax:.4g} n(z<=0)={n_nonpos} n(0<z<0.1)=0"
+                f"zmax={zmax:.4g} n(z<=0)={n_nonpos} n(0<z<0.1)={n_danger}"
             )
 
 
