@@ -227,6 +227,12 @@ class DeformableFeatureAggregation(nn.Module):
             projection_mat[:, :, None, None],
             pts_extend[:, None, ..., None],
         ).squeeze(-1)
+        # Forward probe (no-op unless SD_DEBUG>=1): log the camera-frame depth
+        # distribution before the divide. A keypoint with z near/below the floor
+        # is the leading indicator of the x/z^2 backward explosion.
+        from .debug_probe import probe_projection_depth
+
+        probe_projection_depth(points_2d[..., 2:3], floor=1e-5)
         # Divide by camera-frame depth z, flooring with torch.clamp(z, min=1e-5)
         # EXACTLY as upstream SparseDrive / Sparse4D do (projects/mmdet3d_plugin/
         # models/blocks.py, swc-17/SparseDrive @ main, blob 32cacdc4). A prior

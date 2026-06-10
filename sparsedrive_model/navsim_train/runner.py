@@ -31,6 +31,7 @@ from sparsedrive_model.navsim_train.optim import CosineWithLinearWarmup, build_o
 from sparsedrive_model.navsim_train.scene_filter_loader import load_log_names, load_scene_filter_fields
 from sparsedrive_model.sparsedrive import SparseDrive
 from sparsedrive_model.sparsedrive import nn_utils as _sparsedrive_nn_utils
+from sparsedrive_model.sparsedrive import debug_probe
 
 
 class TrainingStalledError(RuntimeError):
@@ -379,6 +380,15 @@ def _reset_temporal_state(model):
 
 
 def run(config: dict):
+    # Wire the config debug knobs into the env vars the probe reads. A value
+    # already present in the environment wins, so a command-line `SD_DEBUG=2 ...`
+    # override (e.g. to escalate to anomaly mode for one run) still takes effect
+    # without editing the config.
+    if "SD_DEBUG" not in os.environ and config.get("debug_level") is not None:
+        os.environ["SD_DEBUG"] = str(int(config["debug_level"]))
+    if "SD_DEBUG_ALL_RANKS" not in os.environ and config.get("debug_all_ranks"):
+        os.environ["SD_DEBUG_ALL_RANKS"] = "1"
+
     local_rank, world_size = _init_distributed()
     _set_seed(int(config.get("seed", 0)))
     if world_size > 1:
@@ -577,6 +587,9 @@ def run(config: dict):
                 batch = _move_to_device(raw_batch, device)
                 img = batch.pop("img")
 
+                # Debug step counter for the forward probes (no-op when SD_DEBUG=0).
+                debug_probe.set_step(iteration + 1)
+
                 loss_dict = model(img=img, **batch)
                 loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
 
@@ -590,8 +603,15 @@ def run(config: dict):
 
                 if micro_finite:
                     # Scale by accum so the summed gradient equals the mean over
-                    # the full effective batch.
-                    (loss / grad_accum_steps).backward()
+                    # the full effective batch. Under SD_DEBUG=2, run the backward
+                    # inside autograd anomaly detection so the FIRST backward op
+                    # that produces a NaN/Inf is named in the traceback -- the
+                    # definitive locator for the x/z^2-style explosion.
+                    if debug_probe.anomaly_enabled():
+                        with torch.autograd.detect_anomaly():
+                            (loss / grad_accum_steps).backward()
+                    else:
+                        (loss / grad_accum_steps).backward()
                     window_loss_sum += float(loss.detach().cpu())
                     for k, v in loss_dict.items():
                         if torch.is_tensor(v):
@@ -622,6 +642,7 @@ def run(config: dict):
                     if not torch.isfinite(grad_norm):
                         tqdm.write(f"iter={iteration + 1}: NaN/inf gradients detected, resetting temporal state")
                         _log_nonfinite_grads(raw_model, iteration + 1)
+                        debug_probe.first_nonfinite_param(raw_model)
                         _reset_temporal_state(raw_model)
                     elif gn > skip_norm:
                         # Norm is finite but pathologically large: the batch's
@@ -640,6 +661,7 @@ def run(config: dict):
                         tqdm.write(f"iter={iteration + 1}: largest PRE-CLIP grad-norm parameters:")
                         for name, gl2, gmax in top_grad_norms(raw_model, recipe["grad_clip_norm_type"]):
                             tqdm.write(f"    {name}: |grad|_2={gl2 * unclip:.3e} max|grad|={gmax * unclip:.3e}")
+                        debug_probe.first_nonfinite_param(raw_model)
                         _reset_temporal_state(raw_model)
                     else:
                         optimizer.step()

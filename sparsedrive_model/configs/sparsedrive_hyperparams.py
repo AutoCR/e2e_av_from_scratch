@@ -47,11 +47,31 @@ RUNTIME_CONFIG = {
     "nuplan_maps_root": "/prediction_database/nuplan/dataset/maps",
     "output_dir": "sparsedrive_model/outputs/train_navsim",
     "load_from": None,              # Path to a checkpoint to init weights (stage2: "ckpt/sparsedrive_stage1.pth")
-    "resume_from": None,            # Path to a full checkpoint to resume interrupted training
+    # Resume FULL state (weights + optimizer momentum + scheduler + iteration) to
+    # reproduce the gradient explosion fast: it replays from the last saved step
+    # (~near the divergence) instead of re-walking ~9000 steps from scratch, and
+    # keeps the exact optimizer/LR state that produced the bug. last.pth is always
+    # the most recent checkpoint (written every ckpt_epoch_interval epochs). Set
+    # to None for a clean from-the-fix run; point at last.pth to repro the bug.
+    "resume_from": "sparsedrive_model/outputs/train_navsim/ckpt/last.pth",
     "seed": 0,
     "num_workers": 4,
     "device": "auto",                # "auto", "cuda", "mps", or "cpu"
     "quick_smoke": False,
+    # --- Numerical debug probe (locating the gradient-explosion source) ---
+    # 0 = off (zero overhead, normal training).
+    # 1 = forward probes: log the camera-frame depth distribution entering
+    #     project_points (the x/z^2 cliff predictor) and finiteness summaries.
+    #     The runner also prints, on any skipped step, the FIRST parameter whose
+    #     grad is non-finite (with its module path), complementing the existing
+    #     magnitude-ranked top-grad dump. ~negligible overhead -- safe for a full run.
+    # 2 = everything in 1, PLUS torch.autograd.detect_anomaly() around the
+    #     forward+backward, which names the EXACT backward op that first produces
+    #     a NaN/Inf. ~2-3x slower -- use for a short repro run only.
+    # Output goes to stdout (prefix "[SD_DEBUG]"); rank 0 only unless
+    # debug_all_ranks=True. The runner exports these to the env the probe reads.
+    "debug_level": 1,
+    "debug_all_ranks": False,
 }
 
 # =============================================================================
