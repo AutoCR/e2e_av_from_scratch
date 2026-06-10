@@ -98,6 +98,14 @@ def probe_projection_depth(z: torch.Tensor, floor: float) -> None:
     """
     if not _should_print():
         return
+    # The 2026-06-10 run showed ~50% of keypoints are behind the camera on EVERY
+    # step (normal geometry with 3 front cameras: anchors behind the ego have
+    # z<0 for all cams), so "any z below floor" fired 6 lines per iteration and
+    # produced a 49k-line log. The genuinely dangerous population is the
+    # NEAR-PLANE band 0 < z < 0.1 (on-image with a huge 1/z^2 Jacobian);
+    # behind-camera points project far off-image and get zero sampling gradient.
+    # Report the band every iteration it is non-empty, plus a rate-limited
+    # heartbeat of the full distribution for context.
     with torch.no_grad():
         zf = z.detach().reshape(-1)
         n = zf.numel()
@@ -108,15 +116,18 @@ def probe_projection_depth(z: torch.Tensor, floor: float) -> None:
             zmax = float(finite.max())
         else:
             zmin = zmax = float("nan")
-        n_below_floor = int((zf < floor).sum())
         n_nonpos = int((zf <= 0).sum())
-        # Only shout when something is actually in the danger zone, so healthy
-        # steps stay quiet and the log is dominated by the interesting moments.
-        if n_below_floor or n_nonpos or n_nonfinite:
+        n_danger = int(((zf > 0) & (zf < 0.1)).sum())
+        if n_danger or n_nonfinite:
             _emit(
                 f"project_points depth: n={n} zmin={zmin:.4g} zmax={zmax:.4g} "
-                f"n(z<{floor:g})={n_below_floor} n(z<=0)={n_nonpos} "
-                f"n_nonfinite={n_nonfinite}  <<< near-camera keypoints (1/z^2 cliff)"
+                f"n(0<z<0.1)={n_danger} n(z<=0)={n_nonpos} "
+                f"n_nonfinite={n_nonfinite}  <<< near-plane keypoints (1/z^2 cliff)"
+            )
+        elif _STEP % 100 == 1:
+            _emit(
+                f"project_points depth heartbeat: n={n} zmin={zmin:.4g} "
+                f"zmax={zmax:.4g} n(z<=0)={n_nonpos} n(0<z<0.1)=0"
             )
 
 

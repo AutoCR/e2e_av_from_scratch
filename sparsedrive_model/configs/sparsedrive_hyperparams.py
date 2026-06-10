@@ -70,6 +70,9 @@ RUNTIME_CONFIG = {
     #     a NaN/Inf. ~2-3x slower -- use for a short repro run only.
     # Output goes to stdout (prefix "[SD_DEBUG]"); rank 0 only unless
     # debug_all_ranks=True. The runner exports these to the env the probe reads.
+    # NOTE (2026-06-10): the instrumented run proved the explosion is
+    # large-but-FINITE (never NaN), so level 2's detect_anomaly never fires and
+    # only costs 2-3x speed. Level 1 is sufficient.
     "debug_level": 1,
     "debug_all_ranks": False,
 }
@@ -140,25 +143,28 @@ OPTIMIZER_CONFIG = {
     # diverging pretrained backbone -- it slows the layers that explode without
     # touching the heads' lr. Raise back toward 0.5 only after a stable long run.
     "backbone_lr_mult": 0.25,       # LR multiplier for backbone parameters
-    "grad_clip_max_norm": 1.0,
+    # Gradient clipping: match upstream SparseDrive EXACTLY
+    # (projects/configs/sparsedrive_small_stage1.py: grad_clip=dict(max_norm=25,
+    # norm_type=2)). A local change had tightened this to 1.0 -- 25x tighter than
+    # the recipe -- which silently shrank EVERY healthy update ~25x (post-warmup
+    # norms run 20-30, so clip=1.0 clipped every single step) and is the likely
+    # reason loss plateaued ~22-25.
+    "grad_clip_max_norm": 25.0,
     "grad_clip_norm_type": 2.0,
-    # Gradient-explosion guard. clip_grad_norm_ bounds step *magnitude* but not
-    # *direction*: a pathological batch with an exploding pre-clip norm still
-    # produces a clipped-but-garbage-direction update that, repeated, walks the
-    # weights into a divergent regime (activations overflow -> softmax/matmul
-    # NaNs ->all-NaN grads). When the pre-clip grad norm exceeds this threshold
-    # the optimizer step is skipped entirely instead of applied.
-    #
-    # IMPORTANT: this is an ABSOLUTE floor in grad-norm units, independent of
-    # grad_clip_max_norm. Set it explicitly. A previous run left it None, which
-    # the runner derived as grad_clip_max_norm * 1000 = 1.0 * 1000 = 1e3 (the
-    # stale comment claimed 25000, from when grad_clip_max_norm was 25). A 1e3
-    # floor is FAR too tight: clip_grad_norm already bounds the step magnitude to
-    # max_norm=1.0, so a pre-clip spike of ~1e3 is fully recoverable, yet it was
-    # being skipped -- and a string of such skips tripped the 200-skip abort. The
-    # backbone genuinely diverges at ~5e4, so 25000 cleanly separates "large but
-    # clippable" from "real explosion". Healthy post-warmup norms are O(1)-O(100).
-    "grad_skip_norm": 25000.0,
+    # Gradient-explosion SKIP guard: DISABLED (inf) to match upstream, which has
+    # no skip guard at all -- it clips and ALWAYS steps. The 2026-06-10
+    # instrumented run (console_20260610_104307.log) proved the skip guard was
+    # the reason explosions became PERMANENT: the blowup enters through
+    # project_points' x/z backward (1/z^2 amplification when the refinement MLP
+    # walks a keypoint near a camera's optical center; top offender
+    # sf_refines.0.layers.10.weight at 2.5e8) and the corrective direction --
+    # pushing keypoints AWAY from the camera plane -- is in that same gradient.
+    # Upstream clips it to norm 25, takes the step, and self-heals. Skipping the
+    # step instead FREEZES the weights in the exact configuration that explodes
+    # on every batch: 0/59 steps recovered after onset in both prior runs. The
+    # NaN/Inf skip path and the consecutive-skip stall abort remain active (a
+    # truly non-finite grad still skips; only the finite-but-large skip is gone).
+    "grad_skip_norm": float("inf"),
     # Stall guard. The grad-explosion guard above skips a corrupted step, but if
     # the model has walked into a divergent regime EVERY subsequent step explodes
     # and is skipped -> training is frozen yet keeps burning compute (a real run

@@ -111,9 +111,12 @@ def compute_grad_norm(parameters, norm_type=2.0):
         return max(g.detach().abs().max().to(torch.float64) for g in grads)
     total = torch.zeros((), dtype=torch.float64, device=device)
     for g in grads:
-        # Per-parameter norm in fp32 is safe (one tensor rarely overflows); the
-        # cross-parameter accumulation is what overflows, so accumulate in fp64.
-        param_norm = g.detach().norm(norm_type).to(torch.float64)
+        # Compute the per-parameter norm in fp64 as well: the 2026-06-10 run
+        # produced finite grads ~1e20 in a single refinement-layer weight, whose
+        # fp32 sum-of-squares overflows (1e40 > 3.4e38) -> a false "non-finite"
+        # norm with no non-finite element ("possible overflow in norm reduction"
+        # in the log). fp64 lifts the per-parameter ceiling to ~1.8e308.
+        param_norm = g.detach().to(torch.float64).norm(norm_type)
         total += param_norm ** norm_type
     return total ** (1.0 / norm_type)
 
@@ -133,7 +136,9 @@ def top_grad_norms(model, norm_type=2.0, top_k=12):
         if p.grad is None:
             continue
         g = p.grad.detach()
-        gl2 = float(g.norm(norm_type).to(torch.float64))
+        # fp64 norm: a finite ~1e20 grad overflows the fp32 sum-of-squares and
+        # would report inf here (same fix as compute_grad_norm).
+        gl2 = float(g.to(torch.float64).norm(norm_type))
         gmax = float(g.abs().max().to(torch.float64))
         ranked.append((name, gl2, gmax))
     ranked.sort(key=lambda x: x[1], reverse=True)
