@@ -5,11 +5,12 @@ import torch.nn as nn
 
 try:
     import spconv.pytorch as spconv
-    from spconv.pytorch import SparseConvTensor, SparseSequential, SubMConv3d, SparseConv3d
+    from spconv.pytorch import SparseConvTensor, SparseSequential, SubMConv3d, SparseConv3d, SparseModule
     SPCONV_AVAILABLE = True
 except ImportError:
     SPCONV_AVAILABLE = False
     spconv = None
+    SparseModule = nn.Module
 
 
 class HardVoxelization(nn.Module):
@@ -127,7 +128,7 @@ class HardVoxelization(nn.Module):
         return voxels, coords_out, num_points_per_voxel
 
 
-class _SparseResBlock(nn.Module):
+class _SparseResBlock(SparseModule):
     """Minimal sparse residual block compatible with spconv v2."""
 
     def __init__(self, in_channels, out_channels, norm_eps=1e-3, norm_momentum=0.01, indice_key="subm"):
@@ -152,12 +153,12 @@ class _SparseResBlock(nn.Module):
     def forward(self, x):
         identity = x.features
         out = self.conv1(x)
-        out.features = self.relu(self.bn1(out.features))
+        out = out.replace_feature(self.relu(self.bn1(out.features)))
         out = self.conv2(out)
-        out.features = self.bn2(out.features)
+        out = out.replace_feature(self.bn2(out.features))
         if self.shortcut is not None:
             identity = self.shortcut(x).features
-        out.features = self.relu(out.features + identity)
+        out = out.replace_feature(self.relu(out.features + identity))
         return out
 
 

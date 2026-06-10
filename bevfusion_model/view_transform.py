@@ -516,7 +516,7 @@ class DepthLSSTransform(BaseTransform):
         # build depth map from LiDAR points projected to camera
         iH, iW = self.image_size
         N = img.shape[1]
-        depth = torch.zeros(B, N, 1, iH, iW, device=img.device)
+        depth = torch.zeros(B, N, 1, iH, iW, device=img.device, dtype=img.dtype)
 
         for b in range(B):
             cur_points = points[b][:, :3]  # (P, 3)

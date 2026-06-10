@@ -239,6 +239,7 @@ def run(config: dict):
                 if not torch.isfinite(loss):
                     tqdm.write(f"iter {iteration + 1}: non-finite loss, skipping")
                     optimizer.zero_grad(set_to_none=True)
+                    del loss, loss_dict
                     iteration += 1
                     pbar.update(1)
                     scheduler.step(iteration)
