@@ -634,7 +634,18 @@ class TransFusionHead(nn.Module):
         Returns:
             Dict of loss scalars.
         """
-        preds_dict = preds_dicts[0][0]
+        # fp32 fence mirroring upstream @force_fp32 on TransFusionHead.loss:
+        # under fp16 autocast the raw L1 sum over [B, P, code_size] overflows
+        # fp16's max (65504) at init, making the total loss inf on every batch.
+        with torch.cuda.amp.autocast(enabled=False):
+            preds_dict = {
+                k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v)
+                for k, v in preds_dicts[0][0].items()
+            }
+            gt_bboxes_3d = [b.float() for b in gt_bboxes_3d]
+            return self._loss_fp32(gt_bboxes_3d, gt_labels_3d, preds_dict, metas=metas)
+
+    def _loss_fp32(self, gt_bboxes_3d, gt_labels_3d, preds_dict, metas=None):
         labels, label_weights, bbox_targets, bbox_weights, heatmap_t, num_pos = \
             self.get_targets(gt_bboxes_3d, gt_labels_3d, preds_dict, metas=metas)
 

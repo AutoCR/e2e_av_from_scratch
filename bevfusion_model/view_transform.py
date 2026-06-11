@@ -470,7 +470,23 @@ class DepthLSSTransform(BaseTransform):
         x = x.permute(0, 1, 3, 4, 5, 2)
         return x
 
-    def forward(
+    def forward(self, img, points, *args, **kwargs):
+        # fp32 fence mirroring upstream @force_fp32 on the vtransform forward:
+        # under fp16 autocast the lidar->image projection (focal * x can reach
+        # ~1e5) overflows fp16's max of 65504 and silently drops depth points.
+        def _to_fp32(v):
+            if torch.is_tensor(v) and v.is_floating_point():
+                return v.float()
+            if isinstance(v, (list, tuple)):
+                return type(v)(_to_fp32(x) for x in v)
+            return v
+
+        with torch.cuda.amp.autocast(enabled=False):
+            args = [_to_fp32(a) for a in args]
+            kwargs = {k: _to_fp32(v) for k, v in kwargs.items()}
+            return self._forward_impl(_to_fp32(img), _to_fp32(points), *args, **kwargs)
+
+    def _forward_impl(
         self,
         img,
         points,

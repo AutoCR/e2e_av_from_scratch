@@ -136,6 +136,11 @@ def bev_pool(feats, coords, B, D, H, W):
         (B, C, D, H, W) BEV features (Z dim kept; caller collapses it).
     """
     assert feats.shape[0] == coords.shape[0]
+    # The CUDA kernel reads data_ptr<float>; fp16 features (e.g. under
+    # autocast) would raise a dtype error here rather than pool correctly.
+    assert feats.dtype == torch.float32, (
+        f"bev_pool CUDA kernel requires fp32 features, got {feats.dtype}"
+    )
 
     ranks = (
         coords[:, 0] * (W * D * B)

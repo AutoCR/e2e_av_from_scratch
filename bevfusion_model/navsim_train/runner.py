@@ -299,20 +299,29 @@ def run(config: dict):
                     loss_dict = model(img=img, **batch)
                     loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
 
-                if not torch.isfinite(loss):
-                    tqdm.write(f"iter {iteration + 1}: non-finite loss, skipping")
-                    optimizer.zero_grad(set_to_none=True)
-                    del loss, loss_dict
-                    iteration += 1
-                    pbar.update(1)
-                    scheduler.step(iteration)
-                    continue
-
+                # Always run backward: skipping it on a subset of ranks desyncs
+                # the DDP collectives (buffer broadcasts pair with other ranks'
+                # grad allreduces), which corrupts reducer state and crashes
+                # with device-side index asserts. On non-finite loss the grads
+                # come out non-finite and scaler.step() skips the update on
+                # every rank consistently (found_inf is recorded at unscale_).
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 grad_norm = clip_grad_norm(raw_model, recipe["grad_clip_max_norm"], recipe["grad_clip_norm_type"])
-                scaler.step(optimizer)
-                scaler.update()
+
+                if not bool(torch.isfinite(loss.detach())) and is_main_process():
+                    components = {
+                        k: float(v) for k, v in loss_dict.items() if torch.is_tensor(v)
+                    }
+                    tqdm.write(
+                        f"iter {iteration + 1}: non-finite loss {components}, update skipped"
+                    )
+
+                if scaler.enabled:
+                    scaler.step(optimizer)
+                    scaler.update()
+                elif torch.isfinite(grad_norm):
+                    optimizer.step()
                 scheduler.step(iteration + 1)
 
                 iteration += 1

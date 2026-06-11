@@ -79,17 +79,17 @@ def boxes_overlap_bev(boxes_a, boxes_b):
     N = boxes_a.shape[0]
     M = boxes_b.shape[0]
 
+    # The CUDA kernel reads data_ptr<float>; cast so fp16 inputs (e.g. under
+    # autocast) cannot raise a dtype error mid-training.
+    boxes_a = boxes_a.float().contiguous()
+    boxes_b = boxes_b.float().contiguous()
     ans = boxes_a.new_zeros((N, M))
 
     ext = load_iou3d_ext()
     if ext is None:
         return ans
 
-    ext.boxes_overlap_bev_gpu(
-        boxes_a.contiguous(),
-        boxes_b.contiguous(),
-        ans,
-    )
+    ext.boxes_overlap_bev_gpu(boxes_a, boxes_b, ans)
     return ans
 
 
