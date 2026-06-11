@@ -1,7 +1,6 @@
 """Iter-based training runner for BEVFusion on NAVSIM.
 
 Simplified detection-only training (5 NAVSIM classes, no map/motion eval, from scratch).
-Reuses distributed and device helpers from sparsedrive runner.
 """
 
 from __future__ import annotations
@@ -18,19 +17,16 @@ from torch.utils.data import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-# Reuse helpers from sparsedrive runner (pure generic utilities, no sparsedrive model deps)
-from sparsedrive_model.navsim_train.runner import (
-    _set_seed,
-    _choose_device,
-    _patch_cuda_calls_for_local_device,
-    _move_to_device,
-    _resolve_split_config,
-    _init_distributed,
-    _get_rank,
-    _get_world_size,
-    _is_main_process,
-    _install_console_log,
-    _cleanup_distributed,
+from bevfusion_model.navsim_train.runner_utils import (
+    set_seed,
+    choose_device,
+    patch_cuda_calls_for_local_device,
+    move_to_device,
+    resolve_split_config,
+    init_distributed,
+    is_main_process,
+    install_console_log,
+    cleanup_distributed,
 )
 
 # BEVFusion modules
@@ -83,7 +79,7 @@ def _run_loss_eval(raw_model, loader, device, scaler, max_batches):
     for batch_index, raw_batch in enumerate(loader):
         if max_batches is not None and batch_index >= int(max_batches):
             break
-        batch = _move_to_device(raw_batch, device)
+        batch = move_to_device(raw_batch, device)
         img = batch.pop("img")
         with scaler.autocast():
             loss_dict = raw_model._forward_train(img=img, **batch)
@@ -113,13 +109,13 @@ def run(config: dict):
             - camera_order, image_hw (optional)
     """
     # Distributed setup
-    local_rank, world_size = _init_distributed()
-    _set_seed(int(config.get("seed", 0)))
+    local_rank, world_size = init_distributed()
+    set_seed(int(config.get("seed", 0)))
     if world_size > 1:
         device = torch.device(f"cuda:{local_rank}")
     else:
-        device = _choose_device(config.get("device", "auto"))
-    _patch_cuda_calls_for_local_device(device)
+        device = choose_device(config.get("device", "auto"))
+    patch_cuda_calls_for_local_device(device)
 
     # Hyperparameters and recipe
     recipe = get_training_recipe()
@@ -153,13 +149,13 @@ def run(config: dict):
     output_dir.mkdir(parents=True, exist_ok=True)
     # Mirror rank-0 stdout/stderr to output_dir/console_<timestamp>.log so a bare
     # `torchrun ...` always produces a log without a manual `| tee`.
-    _install_console_log(output_dir)
+    install_console_log(output_dir)
 
     # Resolve splits
     splits = config["splits"]
-    train_dir, train_logs, train_tokens = _resolve_split_config(splits["train"], _REPO_ROOT)
-    val_dir, val_logs, val_tokens = _resolve_split_config(splits["val"], _REPO_ROOT)
-    test_dir, test_logs, test_tokens = _resolve_split_config(splits["test"], _REPO_ROOT)
+    train_dir, train_logs, train_tokens = resolve_split_config(splits["train"], _REPO_ROOT)
+    val_dir, val_logs, val_tokens = resolve_split_config(splits["val"], _REPO_ROOT)
+    test_dir, test_logs, test_tokens = resolve_split_config(splits["test"], _REPO_ROOT)
 
     # Build datasets (test_mode=False everywhere: eval computes loss, so GT is needed)
     def _build_split_dataset(split_dir, log_names, tokens, name):
@@ -263,12 +259,12 @@ def run(config: dict):
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
         start_iter = int(checkpoint.get("iter", 0))
-        if _is_main_process():
+        if is_main_process():
             print(f"Resumed full training state from {config['resume_from']} at iter {start_iter}")
 
     # TensorBoard writer (main process only)
     writer = None
-    if _is_main_process():
+    if is_main_process():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         writer = SummaryWriter(log_dir=str(output_dir / "tb" / timestamp))
 
@@ -280,7 +276,7 @@ def run(config: dict):
     pbar = tqdm(
         total=max_iters,
         initial=start_iter,
-        disable=not _is_main_process(),
+        disable=not is_main_process(),
         desc="BEVFusion Training",
         unit="iter",
     )
@@ -295,7 +291,7 @@ def run(config: dict):
                     break
 
                 model.train()
-                batch = _move_to_device(raw_batch, device)
+                batch = move_to_device(raw_batch, device)
                 img = batch.pop("img")
 
                 optimizer.zero_grad(set_to_none=True)
@@ -322,7 +318,7 @@ def run(config: dict):
                 iteration += 1
                 pbar.update(1)
 
-                if _is_main_process() and iteration % int(recipe["log_interval"]) == 0:
+                if is_main_process() and iteration % int(recipe["log_interval"]) == 0:
                     lr = optimizer.param_groups[-1]["lr"]
                     writer.add_scalar("train/loss_total", float(loss), iteration)
                     for k, v in loss_dict.items():
@@ -335,10 +331,10 @@ def run(config: dict):
                 # Checkpoint + val loss eval at epoch intervals (rank 0 only)
                 ran_ckpt = iteration % ckpt_cadence == 0
                 ran_eval = iteration % eval_cadence == 0
-                if ran_ckpt and _is_main_process():
+                if ran_ckpt and is_main_process():
                     _save_ckpt(output_dir / f"iter_{iteration}.pth", raw_model, optimizer, scheduler, scaler, iteration, config)
                     _save_ckpt(output_dir / "last.pth", raw_model, optimizer, scheduler, scaler, iteration, config)
-                if ran_eval and _is_main_process():
+                if ran_eval and is_main_process():
                     val_metrics = _run_loss_eval(raw_model, val_loader, device, scaler, eval_max_batches)
                     for key, value in val_metrics.items():
                         writer.add_scalar(f"val/{key}", value, iteration)
@@ -356,7 +352,7 @@ def run(config: dict):
             dist.barrier()
 
         # Final val/test loss eval (rank 0 only; raw_model avoids DDP collectives)
-        if _is_main_process():
+        if is_main_process():
             for tag, loader in (("val_final", val_loader), ("test_final", test_loader)):
                 metrics = _run_loss_eval(raw_model, loader, device, scaler, eval_max_batches)
                 for key, value in metrics.items():
@@ -367,4 +363,4 @@ def run(config: dict):
         if writer is not None:
             writer.flush()
             writer.close()
-        _cleanup_distributed()
+        cleanup_distributed()

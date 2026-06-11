@@ -14,7 +14,7 @@ from copy import deepcopy
 # DATASET
 # ==============================================================================
 
-# NAVSIM 5-class object set (training only): order must match dataset label remap
+# NAVSIM 5-class object set (training only): order defines compact dataset labels
 NAVSIM_OBJECT_CLASSES = ["car", "barrier", "bicycle", "pedestrian", "traffic_cone"]
 
 DATASET = {

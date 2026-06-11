@@ -53,6 +53,14 @@ class FocalLossCost:
             cost tensor [num_query, num_gt] where cost[i, j] is the focal loss cost
             of query i matching to gt j.
         """
+        num_classes = cls_pred.shape[-1]
+        if gt_labels.numel() > 0 and not ((gt_labels >= 0) & (gt_labels < num_classes)).all():
+            bad = gt_labels[(gt_labels < 0) | (gt_labels >= num_classes)].detach().cpu().tolist()
+            raise ValueError(
+                f"gt_labels must be in [0, {num_classes - 1}] for matching; "
+                f"found invalid labels {bad[:10]}"
+            )
+
         cls_pred_sigmoid = cls_pred.sigmoid()  # [num_query, num_classes]
 
         # Negative cost: cost of predicting background (class-agnostic)

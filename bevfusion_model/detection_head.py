@@ -494,7 +494,7 @@ class TransFusionHead(nn.Module):
         results = [self.forward_single(f, metas) for f in feats]
         return tuple(results)
 
-    def get_targets_single(self, gt_bboxes, gt_labels, pred_dict):
+    def get_targets_single(self, gt_bboxes, gt_labels, pred_dict, meta=None):
         """Compute targets for a single sample.
 
         Args:
@@ -511,6 +511,16 @@ class TransFusionHead(nn.Module):
             - num_pos: int, number of positive assignments
             - heatmap_t: [num_classes, Hf, Wf] dense heatmap target
         """
+        if gt_labels.numel() > 0 and not ((gt_labels >= 0) & (gt_labels < self.num_classes)).all():
+            bad = gt_labels[(gt_labels < 0) | (gt_labels >= self.num_classes)].detach().cpu().tolist()
+            token = meta.get("token") if isinstance(meta, dict) else None
+            where = f" for token {token}" if token else ""
+            raise ValueError(
+                f"gt_labels must be in [0, {self.num_classes - 1}] for "
+                f"TransFusionHead(num_classes={self.num_classes}){where}; "
+                f"found invalid labels {bad[:10]}"
+            )
+
         num_proposals = pred_dict["center"].shape[-1]
 
         # Decode proposals to world coordinates (clone to avoid mutating input)
@@ -577,7 +587,7 @@ class TransFusionHead(nn.Module):
 
         return labels, label_weights, bbox_targets, bbox_weights, int(pos_inds.numel()), heatmap_t
 
-    def get_targets(self, gt_bboxes_list, gt_labels_list, preds_dict):
+    def get_targets(self, gt_bboxes_list, gt_labels_list, preds_dict, metas=None):
         """Compute targets for all samples in a batch.
 
         Args:
@@ -600,7 +610,9 @@ class TransFusionHead(nn.Module):
 
         for b in range(B):
             single = {k: (v[b:b+1] if torch.is_tensor(v) else v) for k, v in preds_dict.items()}
-            labels, lw, bt, bw, npos, hm = self.get_targets_single(gt_bboxes_list[b], gt_labels_list[b], single)
+            meta = metas[b] if metas is not None and b < len(metas) else None
+            labels, lw, bt, bw, npos, hm = self.get_targets_single(
+                gt_bboxes_list[b], gt_labels_list[b], single, meta=meta)
             labels_l.append(labels)
             lw_l.append(lw)
             bt_l.append(bt)
@@ -611,7 +623,7 @@ class TransFusionHead(nn.Module):
         return (torch.stack(labels_l), torch.stack(lw_l), torch.stack(bt_l), torch.stack(bw_l),
                 torch.stack(hm_l), max(num_pos, 1))
 
-    def loss(self, gt_bboxes_3d, gt_labels_3d, preds_dicts, **kwargs):
+    def loss(self, gt_bboxes_3d, gt_labels_3d, preds_dicts, metas=None, **kwargs):
         """Compute training losses.
 
         Args:
@@ -624,7 +636,7 @@ class TransFusionHead(nn.Module):
         """
         preds_dict = preds_dicts[0][0]
         labels, label_weights, bbox_targets, bbox_weights, heatmap_t, num_pos = \
-            self.get_targets(gt_bboxes_3d, gt_labels_3d, preds_dict)
+            self.get_targets(gt_bboxes_3d, gt_labels_3d, preds_dict, metas=metas)
 
         loss_dict = {}
 

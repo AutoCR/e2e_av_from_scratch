@@ -360,7 +360,7 @@ class BEVFusion(nn.Module):
             metas,
         )
         pred_dicts = self.heads["object"](bev, metas)
-        return self.heads["object"].loss(gt_bboxes_3d, gt_labels_3d, pred_dicts)
+        return self.heads["object"].loss(gt_bboxes_3d, gt_labels_3d, pred_dicts, metas=metas)
 
     @torch.no_grad()
     def _forward_test(

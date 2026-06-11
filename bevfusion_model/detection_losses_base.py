@@ -1,10 +1,8 @@
 """
 Pure PyTorch/NumPy loss and helper primitives for BEVFusion training.
 
-Ported from:
-  - sparsedrive_model/sparsedrive/nn_utils.py (loss classes & weighted_loss helper)
-  - bevfusion/mmdet3d/core/utils/gaussian.py (gaussian heatmap drawing)
-  - bevfusion/mmdet3d/core/bbox/util.py (bbox normalization)
+Ported from common detection loss, gaussian heatmap, and bbox-normalization
+helpers used by the original BEVFusion training stack.
 
 No mmdet/mmcv imports; self-contained for standalone BEVFusion training.
 """
@@ -29,7 +27,7 @@ __all__ = [
 
 
 # ============================================================================
-# Loss helpers and loss classes (from sparsedrive nn_utils.py)
+# Loss helpers and loss classes
 # ============================================================================
 
 def weighted_loss(loss, weight=None, reduction="mean", avg_factor=None):

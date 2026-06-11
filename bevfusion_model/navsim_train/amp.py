@@ -1,4 +1,4 @@
-"""AMP wrapper matching SparseDrive's fixed fp16 loss-scale recipe."""
+"""AMP wrapper with fixed fp16 loss-scale support."""
 
 from __future__ import annotations
 

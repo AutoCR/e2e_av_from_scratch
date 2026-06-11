@@ -26,31 +26,24 @@ import torch.utils.data
 from PIL import Image
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "sparsedrive_model")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from sparsedrive_model.navsim_adapter import (
+from bevfusion_model.navsim_train.navsim_adapter import (
     DEFAULT_CAMERA_ORDER_8,
     normalize_camera_order,
     build_navsim_scene_loader,
 )
-from sparsedrive_model.navsim_train.targets import (
+from bevfusion_model.navsim_train.targets import (
     build_gt_bboxes_3d,
     _frame_global_to_lidar,
 )
-from sparsedrive_model.navsim_train.data import _load_lidar_points
+from bevfusion_model.navsim_train.data_utils import load_lidar_points
 
 
 DEFAULT_IMAGE_HW = (256, 704)
 DEFAULT_IMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DEFAULT_IMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-# 10-class to 5-class label remap: {10-class index -> 5-class index}
-# SPARSEDRIVE_CLASSES indices: car=0, barrier=5, bicycle=7, pedestrian=8, traffic_cone=9
-# NAVSIM_OBJECT_CLASSES order: ["car", "barrier", "bicycle", "pedestrian", "traffic_cone"]
-_TEN_TO_FIVE = {0: 0, 5: 1, 7: 2, 8: 3, 9: 4}
-
 
 def _resize_crop_image(
     image: Image.Image,
@@ -231,7 +224,7 @@ class NavSimBEVFusionDataset(torch.utils.data.Dataset):
         img_aug_matrix = torch.stack(img_aug_matrix_list, dim=0)
 
         # Load LiDAR points (single keyframe sweep)
-        pts = _load_lidar_points(current_frame, self.sensor_root)
+        pts = load_lidar_points(current_frame, self.sensor_root)
         pts[:, 4] = 0.0  # Set rel_timestamp = 0 for keyframe
 
         # Build GT (skip if test_mode)
@@ -241,17 +234,7 @@ class NavSimBEVFusionDataset(torch.utils.data.Dataset):
         else:
             global_to_lidar = _frame_global_to_lidar(current_frame)
             ann = current_frame.get("anns", current_frame.get("annotations"))
-            boxes_10class, labels_10class, _ = build_gt_bboxes_3d(ann, global_to_lidar, range_threshold=55.0)
-
-            # Remap 10-class labels to 5-class
-            keep_mask = torch.tensor(
-                [label.item() in _TEN_TO_FIVE for label in labels_10class],
-                dtype=torch.bool,
-            )
-            boxes_5class = boxes_10class[keep_mask]
-            labels_5class_list = [_TEN_TO_FIVE[label.item()] for label in labels_10class[keep_mask]]
-            gt_bboxes_3d = boxes_5class
-            gt_labels_3d = torch.tensor(labels_5class_list, dtype=torch.long)
+            gt_bboxes_3d, gt_labels_3d, _ = build_gt_bboxes_3d(ann, global_to_lidar, range_threshold=55.0)
 
         # LiDAR and identity transforms
         lidar2ego = torch.eye(4, dtype=torch.float32)
@@ -326,7 +309,7 @@ def build_dataloader(
 
 if __name__ == "__main__":
     # Smoke test
-    from sparsedrive_model.configs.sparsedrive_hyperparams import RUNTIME_CONFIG
+    from bevfusion_model.configs.bevfusion_hyperparams import RUNTIME_CONFIG
 
     runtime = RUNTIME_CONFIG
     openscene_root = runtime["openscene_data_root"]

@@ -13,7 +13,7 @@ def build_optimizer(model, lr, weight_decay, backbone_lr_mult=1.0):
 
 
 class CosineWithLinearWarmup:
-    """Per-iteration LR schedule matching SparseDrive's MMCV cosine recipe."""
+    """Per-iteration LR schedule matching the original MMCV cosine recipe."""
 
     def __init__(self, optimizer, max_iters, warmup_iters, warmup_ratio, min_lr_ratio, last_iter=0):
         self.optimizer = optimizer
