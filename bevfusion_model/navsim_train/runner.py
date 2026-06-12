@@ -47,8 +47,13 @@ from bevfusion_model.bevfusion import BEVFusion
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _save_ckpt(path, raw_model, optimizer, scheduler, scaler, iteration, config):
-    """Save training checkpoint."""
+def _save_ckpt(path, raw_model, optimizer, scheduler, scaler, iteration, samples_per_iter, config):
+    """Save training checkpoint.
+
+    samples_seen is the portable progress measure: iterations are only
+    meaningful for a fixed batch size × world size, so resuming under a
+    different one converts through samples.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -57,6 +62,7 @@ def _save_ckpt(path, raw_model, optimizer, scheduler, scaler, iteration, config)
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "iter": iteration,
+            "samples_seen": int(iteration) * int(samples_per_iter),
             "config": dict(config),
         },
         path,
@@ -265,14 +271,26 @@ def run(config: dict):
     model = BEVFusion(hyperparams)
     model.to(device)
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        # gradient_as_bucket_view: grads live inside the reducer buckets
+        # instead of being duplicated — saves a full gradient copy per GPU.
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+        )
     raw_model = model.module if isinstance(model, DDP) else model
 
     # Optimizer, scheduler, scaler
     optimizer = build_optimizer(
         raw_model, recipe["lr"], recipe["weight_decay"], recipe.get("backbone_lr_mult", 1.0)
     )
-    num_iters_per_epoch = max(1, len(train_dataset) // total_batch_size)
+    # Each iteration consumes total_batch_size samples PER RANK (the
+    # DistributedSampler shards the dataset), so epoch/schedule accounting
+    # must include world_size or multi-GPU runs get a 6-8x too-long cosine
+    # and ckpt/eval cadences that never fire.
+    samples_per_iter = total_batch_size * world_size
+    num_iters_per_epoch = max(1, len(train_dataset) // samples_per_iter)
     max_iters = num_iters_per_epoch * int(recipe["num_epochs"])
     scheduler = CosineWithLinearWarmup(
         optimizer,
@@ -295,16 +313,34 @@ def run(config: dict):
         raw_model.load_state_dict(checkpoint.get("model", checkpoint), strict=False)
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
-        if "scheduler" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler"])
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
-        start_iter = int(checkpoint.get("iter", 0))
+        # Progress is tracked in samples so a checkpoint can be resumed under
+        # a different batch size or GPU count. Precedence: explicit config
+        # override > samples_seen stored in the checkpoint > legacy fallback
+        # (old checkpoints stored only "iter"; assume they came from a
+        # single-process run at the current batch size — set
+        # resume_samples_seen in the config when that guess is wrong).
+        samples_seen = config.get("resume_samples_seen")
+        if samples_seen is None:
+            samples_seen = checkpoint.get("samples_seen")
+        if samples_seen is None:
+            samples_seen = int(checkpoint.get("iter", 0)) * total_batch_size
+        start_iter = int(samples_seen) // samples_per_iter
+        # The scheduler state is deliberately NOT loaded: lr is a pure
+        # function of (absolute iteration, max_iters), and both are in the
+        # current run's units; a stored max_iters from a different batch
+        # size / world size would mis-pace the cosine.
+        scheduler.step(start_iter)
         del checkpoint
         if device.type == "cuda":
             torch.cuda.empty_cache()
         if is_main_process():
-            print(f"Resumed full training state from {config['resume_from']} at iter {start_iter}")
+            print(
+                f"Resumed from {config['resume_from']}: samples_seen={int(samples_seen)} "
+                f"-> start iter {start_iter}/{max_iters} "
+                f"(batch {total_batch_size} x {world_size} ranks)"
+            )
 
     # TensorBoard writer (main process only)
     writer = None
@@ -385,8 +421,8 @@ def run(config: dict):
                 ran_ckpt = iteration % ckpt_cadence == 0
                 ran_eval = iteration % eval_cadence == 0
                 if ran_ckpt and is_main_process():
-                    _save_ckpt(output_dir / f"iter_{iteration}.pth", raw_model, optimizer, scheduler, scaler, iteration, config)
-                    _save_ckpt(output_dir / "last.pth", raw_model, optimizer, scheduler, scaler, iteration, config)
+                    _save_ckpt(output_dir / f"iter_{iteration}.pth", raw_model, optimizer, scheduler, scaler, iteration, samples_per_iter, config)
+                    _save_ckpt(output_dir / "last.pth", raw_model, optimizer, scheduler, scaler, iteration, samples_per_iter, config)
                 if ran_eval and is_main_process():
                     val_metrics = _try_loss_eval(raw_model, val_loader, device, scaler, eval_max_batches, optimizer, f"val@{iteration}")
                     for key, value in val_metrics.items():

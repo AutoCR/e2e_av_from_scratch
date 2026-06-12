@@ -322,7 +322,10 @@ TRAINING_RECIPE = {
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,
     "num_epochs": 6,
-    "total_batch_size": 4,
+    # PER-RANK batch size (each DDP rank loads this many samples per iter).
+    # 4 fits a 24 GB GPU single-process but OOMs under DDP (reducer buckets +
+    # NCCL buffers eat the headroom); 3 leaves ~3 GiB for the backward spike.
+    "total_batch_size": 3,
     "num_workers": 4,
     "fp16_loss_scale": 512.0,
     "log_interval": 50,
@@ -361,6 +364,11 @@ RUNTIME_CONFIG = {
     "nuplan_maps_root": "/prediction_database/nuplan/dataset/maps",
     "output_dir": "bevfusion_model/outputs/train_navsim",
     "resume_from": None,
+    # Training progress in samples, for resuming a checkpoint that was saved
+    # under a different batch size / GPU count. New checkpoints store this
+    # themselves; only needed for legacy checkpoints that stored just "iter".
+    # E.g. iter_21199.pth came from a single-GPU batch-4 run: 21199*4 = 84796.
+    "resume_samples_seen": None,
     "seed": 0,
     "num_workers": 4,
     "device": "auto",
