@@ -349,8 +349,10 @@ def run(config: dict):
         writer = SummaryWriter(log_dir=str(output_dir / "tb" / timestamp))
 
     # Training loop
-    ckpt_cadence = max(1, num_iters_per_epoch * int(recipe["ckpt_epoch_interval"]))
-    eval_cadence = max(1, num_iters_per_epoch * int(recipe["eval_epoch_interval"]))
+    # Intervals may be fractional (e.g. 0.25 = 4 checkpoints per epoch) so a
+    # crash never costs more than a fraction of an epoch of training.
+    ckpt_cadence = max(1, int(num_iters_per_epoch * float(recipe["ckpt_epoch_interval"])))
+    eval_cadence = max(1, int(num_iters_per_epoch * float(recipe["eval_epoch_interval"])))
     eval_max_batches = recipe.get("eval_max_batches", 100)
     iteration = start_iter
     pbar = tqdm(

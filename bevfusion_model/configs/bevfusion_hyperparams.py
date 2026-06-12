@@ -324,12 +324,14 @@ TRAINING_RECIPE = {
     "num_epochs": 6,
     # PER-RANK batch size (each DDP rank loads this many samples per iter).
     # 4 fits a 24 GB GPU single-process but OOMs under DDP (reducer buckets +
-    # NCCL buffers eat the headroom); 3 leaves ~3 GiB for the backward spike.
-    "total_batch_size": 3,
+    # NCCL buffers eat the headroom); 2 leaves ample room for backward spikes.
+    "total_batch_size": 2,
     "num_workers": 4,
     "fp16_loss_scale": 512.0,
     "log_interval": 50,
-    "ckpt_epoch_interval": 1,
+    # Fractions allowed: 0.25 = 4 checkpoints per epoch, so a crash costs at
+    # most a quarter epoch (checkpoints from this runner resume exactly).
+    "ckpt_epoch_interval": 0.25,
     "eval_epoch_interval": 1,
     # Cap on eval batches per split: val/test splits are huge (frame_interval=1),
     # so loss-eval runs on a fixed-size prefix instead of the full split.
