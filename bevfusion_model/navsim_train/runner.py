@@ -286,7 +286,12 @@ def run(config: dict):
     # Resume from checkpoint if provided
     start_iter = 0
     if config.get("resume_from"):
-        checkpoint = torch.load(config["resume_from"], map_location=device)
+        # Load to CPU: map_location=device would pin a second full copy of the
+        # model weights + AdamW moments on the GPU for the lifetime of run()
+        # (the dict stays referenced), which is enough to OOM the first
+        # backward after resume. load_state_dict moves state to the params'
+        # device on its own.
+        checkpoint = torch.load(config["resume_from"], map_location="cpu")
         raw_model.load_state_dict(checkpoint.get("model", checkpoint), strict=False)
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -295,6 +300,9 @@ def run(config: dict):
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
         start_iter = int(checkpoint.get("iter", 0))
+        del checkpoint
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         if is_main_process():
             print(f"Resumed full training state from {config['resume_from']} at iter {start_iter}")
 
