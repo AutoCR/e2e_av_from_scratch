@@ -16,14 +16,16 @@ from __future__ import annotations
 
 import os
 
-# Allocator note (must be set before torch initializes CUDA):
-# expandable_segments is rejected by torch 2.2.1+cu121 on the server ("not
-# supported on this platform"), and max_split_size_mb hurts here — the LSS
-# frustum's multi-GiB activations vary in size per scene, and capping splits
-# restricts reuse of those cached blocks. The default allocator ran 21k iters
-# stably; only add GC of fully-free cached blocks past 80% reserved so cumm's
-# raw cudaMalloc (spconv tuning) can find driver memory.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.8")
+# Allocator note (must be set before torch initializes CUDA): the LSS
+# frustum's multi-GiB activations vary in size per scene and fragment the
+# default caching allocator — OOMs with GiBs "reserved but unallocated"
+# trapped in partially-used segments. expandable_segments is rejected by
+# torch 2.2.1+cu121 on the server ("not supported on this platform"), so use
+# the CUDA driver's pool allocator instead: it maps physical pages on demand
+# (same mechanism), so big variable-size allocations don't strand fragments.
+# torch.cuda.empty_cache() still trims the pool (used before spconv-heavy
+# evals, whose tuning allocates with raw cudaMalloc outside the pool).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
 import sys
 from pathlib import Path
