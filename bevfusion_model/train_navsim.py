@@ -19,7 +19,13 @@ import os
 # Reduce CUDA allocator fragmentation (must be set before torch initializes
 # CUDA): the 8-camera LSS frustum allocates multi-GiB activations whose sizes
 # vary per scene, which otherwise strands GiBs as reserved-but-unallocated.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# expandable_segments would be ideal, but torch 2.2.1+cu121 on the server
+# rejects it ("not supported on this platform"); cap block splitting and let
+# the allocator GC fully-free blocks instead.
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "max_split_size_mb:512,garbage_collection_threshold:0.8",
+)
 
 import sys
 from pathlib import Path

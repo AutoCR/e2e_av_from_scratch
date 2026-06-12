@@ -63,6 +63,42 @@ def _save_ckpt(path, raw_model, optimizer, scheduler, scaler, iteration, config)
     )
 
 
+def _release_cuda_memory_for_eval(optimizer, device):
+    """Return cached GPU memory to the driver before an eval pass.
+
+    spconv's implicit_gemm allocates its tuning workspace with raw cudaMalloc
+    (cumm TensorStorage), outside PyTorch's caching allocator. After a long
+    training stretch the allocator has reserved nearly the whole GPU, so that
+    raw allocation OOMs even though the memory is "free" inside the cache.
+    Dropping the already-applied grads and emptying the cache (cudaFree of
+    every fully-free cached segment) returns that memory to the driver.
+    """
+    if device.type != "cuda":
+        return
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+
+
+def _try_loss_eval(raw_model, loader, device, scaler, max_batches, optimizer, tag):
+    """Run _run_loss_eval, but never let an eval-time CUDA OOM kill training.
+
+    Eval is an auxiliary signal; on OOM we free the cache, restore train mode
+    (the normal restore in _run_loss_eval is skipped when it raises mid-loop)
+    and return {} so the caller logs nothing for this round.
+    """
+    _release_cuda_memory_for_eval(optimizer, device)
+    try:
+        return _run_loss_eval(raw_model, loader, device, scaler, max_batches)
+    except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower():
+            raise
+        raw_model.train()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        tqdm.write(f"{tag}: eval skipped (CUDA OOM during eval): {exc}")
+        return {}
+
+
 @torch.no_grad()
 def _run_loss_eval(raw_model, loader, device, scaler, max_batches):
     """Average detection-loss components over (a prefix of) an eval split.
@@ -344,10 +380,11 @@ def run(config: dict):
                     _save_ckpt(output_dir / f"iter_{iteration}.pth", raw_model, optimizer, scheduler, scaler, iteration, config)
                     _save_ckpt(output_dir / "last.pth", raw_model, optimizer, scheduler, scaler, iteration, config)
                 if ran_eval and is_main_process():
-                    val_metrics = _run_loss_eval(raw_model, val_loader, device, scaler, eval_max_batches)
+                    val_metrics = _try_loss_eval(raw_model, val_loader, device, scaler, eval_max_batches, optimizer, f"val@{iteration}")
                     for key, value in val_metrics.items():
                         writer.add_scalar(f"val/{key}", value, iteration)
-                    tqdm.write(f"val@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+                    if val_metrics:
+                        tqdm.write(f"val@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
                 # Hold every rank until rank 0 finishes eval/checkpoint; otherwise the
                 # other ranks race into the next DDP collective and NCCL watchdogs fire.
                 if world_size > 1 and (ran_ckpt or ran_eval):
@@ -363,10 +400,11 @@ def run(config: dict):
         # Final val/test loss eval (rank 0 only; raw_model avoids DDP collectives)
         if is_main_process():
             for tag, loader in (("val_final", val_loader), ("test_final", test_loader)):
-                metrics = _run_loss_eval(raw_model, loader, device, scaler, eval_max_batches)
+                metrics = _try_loss_eval(raw_model, loader, device, scaler, eval_max_batches, optimizer, f"{tag}@{iteration}")
                 for key, value in metrics.items():
                     writer.add_scalar(f"{tag}/{key}", value, iteration)
-                print(f"{tag}@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+                if metrics:
+                    print(f"{tag}@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
 
     finally:
         if writer is not None:
