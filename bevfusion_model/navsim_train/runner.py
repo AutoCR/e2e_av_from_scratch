@@ -355,6 +355,62 @@ def run(config: dict):
     eval_cadence = max(1, int(num_iters_per_epoch * float(recipe["eval_epoch_interval"])))
     eval_max_batches = recipe.get("eval_max_batches", 100)
     iteration = start_iter
+    if is_main_process():
+        print(
+            "Training setup:\n"
+            f"  dataset_size: train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}\n"
+            f"  world_size={world_size} per_rank_batch_size={total_batch_size} "
+            f"global_batch_size={samples_per_iter}\n"
+            f"  num_epochs={int(recipe['num_epochs'])} iters_per_epoch={num_iters_per_epoch} "
+            f"max_iters={max_iters} start_iter={start_iter}\n"
+            f"  lr={recipe['lr']} weight_decay={recipe['weight_decay']} "
+            f"backbone_lr_mult={recipe.get('backbone_lr_mult', 1.0)}\n"
+            f"  warmup_iters={int(recipe['warmup_iters'])} warmup_ratio={recipe['warmup_ratio']} "
+            f"min_lr_ratio={recipe['min_lr_ratio']}\n"
+            f"  ckpt_epoch_interval={recipe['ckpt_epoch_interval']} ckpt_cadence_iters={ckpt_cadence} "
+            f"eval_epoch_interval={recipe['eval_epoch_interval']} eval_cadence_iters={eval_cadence} "
+            f"eval_max_batches={eval_max_batches}"
+        )
+        if writer is not None:
+            writer.add_text(
+                "training/setup",
+                "\n".join(
+                    [
+                        f"dataset_size/train: {len(train_dataset)}",
+                        f"dataset_size/val: {len(val_dataset)}",
+                        f"dataset_size/test: {len(test_dataset)}",
+                        f"world_size: {world_size}",
+                        f"per_rank_batch_size: {total_batch_size}",
+                        f"global_batch_size: {samples_per_iter}",
+                        f"num_epochs: {int(recipe['num_epochs'])}",
+                        f"iters_per_epoch: {num_iters_per_epoch}",
+                        f"max_iters: {max_iters}",
+                        f"start_iter: {start_iter}",
+                        f"lr: {recipe['lr']}",
+                        f"weight_decay: {recipe['weight_decay']}",
+                        f"warmup_iters: {int(recipe['warmup_iters'])}",
+                        f"ckpt_cadence_iters: {ckpt_cadence}",
+                        f"eval_cadence_iters: {eval_cadence}",
+                    ]
+                ),
+                0,
+            )
+            for tag, value in {
+                "setup/dataset_size_train": len(train_dataset),
+                "setup/dataset_size_val": len(val_dataset),
+                "setup/dataset_size_test": len(test_dataset),
+                "setup/world_size": world_size,
+                "setup/per_rank_batch_size": total_batch_size,
+                "setup/global_batch_size": samples_per_iter,
+                "setup/num_epochs": int(recipe["num_epochs"]),
+                "setup/iters_per_epoch": num_iters_per_epoch,
+                "setup/max_iters": max_iters,
+                "setup/start_iter": start_iter,
+                "setup/warmup_iters": int(recipe["warmup_iters"]),
+                "setup/ckpt_cadence_iters": ckpt_cadence,
+                "setup/eval_cadence_iters": eval_cadence,
+            }.items():
+                writer.add_scalar(tag, value, 0)
     pbar = tqdm(
         total=max_iters,
         initial=start_iter,
