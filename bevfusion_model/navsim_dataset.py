@@ -98,8 +98,8 @@ class NavSimBEVFusionDataset(torch.utils.data.Dataset):
         max_scenes: Optional[int] = None,
         log_names: Optional[Sequence[str]] = None,
         tokens: Optional[Sequence[str]] = None,
-        num_history_frames: int = 4,
-        num_future_frames: int = 12,
+        num_history_frames: int = 1,
+        num_future_frames: int = 0,
     ):
         """
         Args:
@@ -112,8 +112,8 @@ class NavSimBEVFusionDataset(torch.utils.data.Dataset):
             max_scenes: limit number of scenes (for smoke testing)
             log_names: filter by log names
             tokens: filter by scene tokens
-            num_history_frames: number of history frames (not used for single-sweep keyframe)
-            num_future_frames: number of future frames (not used for detection)
+            num_history_frames: number of history frames in each NAVSIM sample window
+            num_future_frames: number of future frames in each NAVSIM sample window
         """
         self.camera_order = normalize_camera_order(camera_order)
         self.image_hw = image_hw

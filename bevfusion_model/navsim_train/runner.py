@@ -212,6 +212,8 @@ def run(config: dict):
                 max_scenes=max_scenes,
                 log_names=log_names,
                 tokens=tokens,
+                num_history_frames=int(config.get("num_history_frames", 1)),
+                num_future_frames=int(config.get("num_future_frames", 0)),
             )
         except (FileNotFoundError, RuntimeError) as e:
             raise RuntimeError(
@@ -359,6 +361,9 @@ def run(config: dict):
         print(
             "Training setup:\n"
             f"  dataset_size: train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}\n"
+            f"  sample_window: history_frames={int(config.get('num_history_frames', 1))} "
+            f"future_frames={int(config.get('num_future_frames', 0))} "
+            f"frames_per_sample={int(config.get('num_history_frames', 1)) + int(config.get('num_future_frames', 0))}\n"
             f"  world_size={world_size} per_rank_batch_size={total_batch_size} "
             f"global_batch_size={samples_per_iter}\n"
             f"  num_epochs={int(recipe['num_epochs'])} iters_per_epoch={num_iters_per_epoch} "
@@ -379,6 +384,9 @@ def run(config: dict):
                         f"dataset_size/train: {len(train_dataset)}",
                         f"dataset_size/val: {len(val_dataset)}",
                         f"dataset_size/test: {len(test_dataset)}",
+                        f"sample_window/history_frames: {int(config.get('num_history_frames', 1))}",
+                        f"sample_window/future_frames: {int(config.get('num_future_frames', 0))}",
+                        f"sample_window/frames_per_sample: {int(config.get('num_history_frames', 1)) + int(config.get('num_future_frames', 0))}",
                         f"world_size: {world_size}",
                         f"per_rank_batch_size: {total_batch_size}",
                         f"global_batch_size: {samples_per_iter}",
@@ -399,6 +407,9 @@ def run(config: dict):
                 "setup/dataset_size_train": len(train_dataset),
                 "setup/dataset_size_val": len(val_dataset),
                 "setup/dataset_size_test": len(test_dataset),
+                "setup/history_frames": int(config.get("num_history_frames", 1)),
+                "setup/future_frames": int(config.get("num_future_frames", 0)),
+                "setup/frames_per_sample": int(config.get("num_history_frames", 1)) + int(config.get("num_future_frames", 0)),
                 "setup/world_size": world_size,
                 "setup/per_rank_batch_size": total_batch_size,
                 "setup/global_batch_size": samples_per_iter,

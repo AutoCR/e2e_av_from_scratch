@@ -375,6 +375,10 @@ RUNTIME_CONFIG = {
     "num_workers": 4,
     "device": "auto",
     "quick_smoke": False,
+    # Detection uses only the current frame, so keep each NAVSIM sample as a
+    # single-frame window instead of requiring history/future context.
+    "num_history_frames": 1,
+    "num_future_frames": 0,
     "camera_order": (
         "CAM_F0",
         "CAM_L0",
