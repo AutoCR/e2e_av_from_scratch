@@ -47,7 +47,6 @@ def _build_dataset(config: dict, split_name: str, split_dir: str, log_names, tok
         max_scenes=args.max_scenes,
         log_names=log_names,
         tokens=tokens,
-        has_route=bool(config["splits"][split_name].get("has_route", config.get("has_route", True))),
         num_history_frames=args.num_history_frames,
         num_future_frames=args.num_future_frames,
     )
@@ -61,7 +60,6 @@ def _report_split(config: dict, split_name: str, args) -> None:
     print(f"split_dir: {split_dir}")
     print(f"log_names_count: {_count(log_names)}")
     print(f"configured_tokens_count: {_count(tokens)}")
-    print(f"has_route: {bool(split_cfg.get('has_route', config.get('has_route', True)))}")
     print(
         "sample_window: "
         f"history={args.num_history_frames} future={args.num_future_frames} "

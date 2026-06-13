@@ -344,12 +344,8 @@ RUNTIME_CONFIG = {
             "dir": "trainval",
             "log_names_yaml": "navsim/planning/script/config/training/default_train_val_test_log_split.yaml",
             "log_names_key": "train_logs",
-            # Use every frame from the configured training logs. The curated
-            # navtrain token list is much smaller than the available train-log
-            # frame set, so leave token filtering disabled for detection.
-            "tokens_yaml": None,
-            "tokens_key": None,
-            "has_route": False,
+            "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml",
+            "tokens_key": "tokens",
         },
         "val": {
             "dir": "trainval",
@@ -357,7 +353,6 @@ RUNTIME_CONFIG = {
             "log_names_key": "val_logs",
             "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml",
             "tokens_key": "tokens",
-            "has_route": True,
         },
         "test": {
             "dir": "test",
@@ -365,7 +360,6 @@ RUNTIME_CONFIG = {
             "log_names_key": "log_names",
             "tokens_yaml": "navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
             "tokens_key": "tokens",
-            "has_route": True,
         },
     },
     "openscene_data_root": "/prediction_database/navsim",

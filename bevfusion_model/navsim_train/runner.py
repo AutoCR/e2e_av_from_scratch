@@ -200,9 +200,6 @@ def run(config: dict):
     test_dir, test_logs, test_tokens = resolve_split_config(splits["test"], _REPO_ROOT)
 
     # Build datasets (test_mode=False everywhere: eval computes loss, so GT is needed)
-    def _split_has_route(name):
-        return bool(splits[name].get("has_route", config.get("has_route", True)))
-
     def _build_split_dataset(split_dir, log_names, tokens, name):
         try:
             return NavSimBEVFusionDataset(
@@ -215,7 +212,6 @@ def run(config: dict):
                 max_scenes=max_scenes,
                 log_names=log_names,
                 tokens=tokens,
-                has_route=_split_has_route(name),
                 num_history_frames=int(config.get("num_history_frames", 1)),
                 num_future_frames=int(config.get("num_future_frames", 0)),
             )
@@ -365,10 +361,6 @@ def run(config: dict):
         print(
             "Training setup:\n"
             f"  dataset_size: train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}\n"
-            f"  filters: train_tokens={'on' if train_tokens is not None else 'off'} "
-            f"train_has_route={_split_has_route('train')} "
-            f"val_tokens={'on' if val_tokens is not None else 'off'} val_has_route={_split_has_route('val')} "
-            f"test_tokens={'on' if test_tokens is not None else 'off'} test_has_route={_split_has_route('test')}\n"
             f"  sample_window: history_frames={int(config.get('num_history_frames', 1))} "
             f"future_frames={int(config.get('num_future_frames', 0))} "
             f"frames_per_sample={int(config.get('num_history_frames', 1)) + int(config.get('num_future_frames', 0))}\n"
@@ -392,12 +384,6 @@ def run(config: dict):
                         f"dataset_size/train: {len(train_dataset)}",
                         f"dataset_size/val: {len(val_dataset)}",
                         f"dataset_size/test: {len(test_dataset)}",
-                        f"filters/train_tokens: {train_tokens is not None}",
-                        f"filters/train_has_route: {_split_has_route('train')}",
-                        f"filters/val_tokens: {val_tokens is not None}",
-                        f"filters/val_has_route: {_split_has_route('val')}",
-                        f"filters/test_tokens: {test_tokens is not None}",
-                        f"filters/test_has_route: {_split_has_route('test')}",
                         f"sample_window/history_frames: {int(config.get('num_history_frames', 1))}",
                         f"sample_window/future_frames: {int(config.get('num_future_frames', 0))}",
                         f"sample_window/frames_per_sample: {int(config.get('num_history_frames', 1)) + int(config.get('num_future_frames', 0))}",
