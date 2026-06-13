@@ -98,6 +98,7 @@ class NavSimBEVFusionDataset(torch.utils.data.Dataset):
         max_scenes: Optional[int] = None,
         log_names: Optional[Sequence[str]] = None,
         tokens: Optional[Sequence[str]] = None,
+        has_route: bool = True,
         num_history_frames: int = 1,
         num_future_frames: int = 0,
     ):
@@ -112,6 +113,7 @@ class NavSimBEVFusionDataset(torch.utils.data.Dataset):
             max_scenes: limit number of scenes (for smoke testing)
             log_names: filter by log names
             tokens: filter by scene tokens
+            has_route: if True, drop frames without route roadblock ids
             num_history_frames: number of history frames in each NAVSIM sample window
             num_future_frames: number of future frames in each NAVSIM sample window
         """
@@ -127,6 +129,7 @@ class NavSimBEVFusionDataset(torch.utils.data.Dataset):
             num_history_frames=num_history_frames,
             num_future_frames=num_future_frames,
             frame_interval=1,
+            has_route=has_route,
             max_scenes=max_scenes,
             log_names=log_names,
             tokens=tokens,

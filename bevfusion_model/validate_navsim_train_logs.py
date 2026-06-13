@@ -107,6 +107,7 @@ def main() -> None:
     split_cfg = config["splits"][args.split]
     split_dir, log_names, configured_tokens = resolve_split_config(split_cfg, _REPO_ROOT)
     configured_token_set = set(configured_tokens) if configured_tokens is not None else None
+    current_has_route = bool(split_cfg.get("has_route", config.get("has_route", True)))
 
     data_path = Path(config["openscene_data_root"]) / "navsim_logs" / split_dir
     if not data_path.exists():
@@ -153,6 +154,8 @@ def main() -> None:
     print(f"existing_selected_log_files_count: {len(selected_log_files)}")
     print(f"missing_configured_log_files_count: {len(missing_logs)}")
     print(f"configured_tokens_count: {0 if configured_tokens is None else len(configured_tokens)}")
+    print(f"current_config_tokens_filter_enabled: {configured_tokens is not None}")
+    print(f"current_config_has_route: {current_has_route}")
     print(
         "sample_window: "
         f"history={args.num_history_frames} future={args.num_future_frames} "
@@ -172,6 +175,10 @@ def main() -> None:
     print("\nExpected Dataset Sizes From These Logs")
     print(f"tokens=None, has_route=False: {len(window_tokens)}")
     print(f"tokens=None, has_route=True:  {len(route_window_tokens)}")
+    current_token_pool = configured_token_set if configured_token_set is not None else window_tokens
+    current_route_pool = route_window_tokens if current_has_route else window_tokens
+    current_dataset_tokens = current_route_pool & current_token_pool
+    print(f"current config:             {len(current_dataset_tokens)}")
     if configured_token_set is not None:
         print(f"tokens=configured, has_route=False: {_count_intersection(window_tokens, configured_token_set)}")
         print(f"tokens=configured, has_route=True:  {_count_intersection(route_window_tokens, configured_token_set)}")
@@ -195,9 +202,11 @@ def main() -> None:
         print(f"raw_log_tokens_not_in_configured_tokens_count: {len(raw_not_configured)}")
         print(f"window_candidate_tokens_not_in_configured_tokens_count: {len(windows_not_configured)}")
 
-        only_configured_in_dataset = len(route_window_tokens - configured_token_set) == 0
+        current_training_dataset_tokens = current_dataset_tokens
+        only_configured_in_dataset = current_training_dataset_tokens <= configured_token_set
         all_configured_log_windows_in_configured_dataset = window_tokens <= configured_token_set
         print("\nAnswers")
+        print(f"current_training_dataset_token_count: {len(current_training_dataset_tokens)}")
         print(
             "current_training_dataset_contains_only_configured_tokens: "
             f"{only_configured_in_dataset}"
@@ -212,6 +221,9 @@ def main() -> None:
         missing_due_to_route = []
         raw_not_configured = []
         windows_not_configured = []
+        print("\nAnswers")
+        print(f"current_training_dataset_token_count: {len(current_dataset_tokens)}")
+        print("current_training_dataset_contains_only_configured_tokens: no token filter configured")
 
     if args.show_examples:
         print("\nExamples")
