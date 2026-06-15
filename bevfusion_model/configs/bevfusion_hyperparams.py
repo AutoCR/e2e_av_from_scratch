@@ -8,6 +8,7 @@ Checkpoint: model_weights/bevfusion/bevfusion-det.pth
 Config: swint_v0p075/convfuser.yaml (camera+lidar detection with TransFusionHead)
 """
 
+import os
 from copy import deepcopy
 
 # ==============================================================================
@@ -446,5 +447,16 @@ def get_training_recipe() -> dict:
 
 
 def get_runtime_config() -> dict:
-    """Return a deep-copy of the runtime/environment configuration."""
-    return deepcopy(RUNTIME_CONFIG)
+    """Return a deep-copy of the runtime/environment configuration.
+
+    If BEVFUSION_DATA_ROOT is set, override openscene_data_root so training runs
+    against a mini subset (built by bevfusion_model/tools/build_mini_subset.py).
+    The token/log_name yaml filters are left unchanged: filter_scenes intersects
+    them with the files physically present in the subset, which is all that limits
+    the loaded set. nuplan_maps_root is unchanged (maps are not part of the subset).
+    """
+    cfg = deepcopy(RUNTIME_CONFIG)
+    data_root = os.environ.get("BEVFUSION_DATA_ROOT")
+    if data_root:
+        cfg["openscene_data_root"] = data_root
+    return cfg

@@ -309,9 +309,11 @@ def build_dataloader(
 
 if __name__ == "__main__":
     # Smoke test
-    from bevfusion_model.configs.bevfusion_hyperparams import RUNTIME_CONFIG
+    # Use get_runtime_config() (not RUNTIME_CONFIG directly) so the
+    # BEVFUSION_DATA_ROOT env switch points this at the mini subset too.
+    from bevfusion_model.configs.bevfusion_hyperparams import get_runtime_config
 
-    runtime = RUNTIME_CONFIG
+    runtime = get_runtime_config()
     openscene_root = runtime["openscene_data_root"]
     maps_root = runtime["nuplan_maps_root"]
     splits = runtime["splits"]
