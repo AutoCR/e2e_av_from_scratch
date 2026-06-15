@@ -488,16 +488,17 @@ def run(config: dict):
 
                 # Checkpoint + val loss eval at epoch intervals (rank 0 only)
                 ran_ckpt = iteration % ckpt_cadence == 0
-                ran_eval = iteration % eval_cadence == 0
+                ran_eval = False  # periodic val eval disabled (was: iteration % eval_cadence == 0)
                 if ran_ckpt and is_main_process():
                     _save_ckpt(output_dir / f"iter_{iteration}.pth", raw_model, optimizer, scheduler, scaler, iteration, samples_per_iter, config)
                     _save_ckpt(output_dir / "last.pth", raw_model, optimizer, scheduler, scaler, iteration, samples_per_iter, config)
-                if ran_eval and is_main_process():
-                    val_metrics = _try_loss_eval(raw_model, val_loader, device, scaler, eval_max_batches, optimizer, f"val@{iteration}")
-                    for key, value in val_metrics.items():
-                        writer.add_scalar(f"val/{key}", value, iteration)
-                    if val_metrics:
-                        tqdm.write(f"val@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+                # Periodic val loss eval disabled.
+                # if ran_eval and is_main_process():
+                #     val_metrics = _try_loss_eval(raw_model, val_loader, device, scaler, eval_max_batches, optimizer, f"val@{iteration}")
+                #     for key, value in val_metrics.items():
+                #         writer.add_scalar(f"val/{key}", value, iteration)
+                #     if val_metrics:
+                #         tqdm.write(f"val@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
                 # Hold every rank until rank 0 finishes eval/checkpoint; otherwise the
                 # other ranks race into the next DDP collective and NCCL watchdogs fire.
                 if world_size > 1 and (ran_ckpt or ran_eval):
@@ -510,14 +511,14 @@ def run(config: dict):
         if world_size > 1:
             dist.barrier()
 
-        # Final val/test loss eval (rank 0 only; raw_model avoids DDP collectives)
-        if is_main_process():
-            for tag, loader in (("val_final", val_loader), ("test_final", test_loader)):
-                metrics = _try_loss_eval(raw_model, loader, device, scaler, eval_max_batches, optimizer, f"{tag}@{iteration}")
-                for key, value in metrics.items():
-                    writer.add_scalar(f"{tag}/{key}", value, iteration)
-                if metrics:
-                    print(f"{tag}@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+        # Final val/test loss eval disabled.
+        # if is_main_process():
+        #     for tag, loader in (("val_final", val_loader), ("test_final", test_loader)):
+        #         metrics = _try_loss_eval(raw_model, loader, device, scaler, eval_max_batches, optimizer, f"{tag}@{iteration}")
+        #         for key, value in metrics.items():
+        #             writer.add_scalar(f"{tag}/{key}", value, iteration)
+        #         if metrics:
+        #             print(f"{tag}@{iteration}: " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
 
     finally:
         if writer is not None:
