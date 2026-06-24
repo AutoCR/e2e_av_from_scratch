@@ -223,3 +223,4 @@ sparsedrive_model/vis/*
 sparsedrive_model/data/*
 .vscode/*
 bevfusion_model/outputs/*
+bevfusion_model/data/*

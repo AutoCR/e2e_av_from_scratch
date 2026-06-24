@@ -322,17 +322,17 @@ TRAINING_RECIPE = {
     "warmup_iters": 500,
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,
-    "num_epochs": 6,
+    "num_epochs": 100,
     # PER-RANK batch size (each DDP rank loads this many samples per iter).
     # 4 fits a 24 GB GPU single-process but OOMs under DDP (reducer buckets +
-    # NCCL buffers eat the headroom); 2 leaves ample room for backward spikes.
-    "total_batch_size": 2,
+    # NCCL buffers eat the headroom); 3 leaves ~3 GiB for the backward spike.
+    "total_batch_size": 4,
     "num_workers": 4,
     "fp16_loss_scale": 512.0,
     "log_interval": 50,
     # Fractions allowed: 0.25 = 4 checkpoints per epoch, so a crash costs at
     # most a quarter epoch (checkpoints from this runner resume exactly).
-    "ckpt_epoch_interval": 0.25,
+    "ckpt_epoch_interval": 1,
     "eval_epoch_interval": 1,
     # Cap on eval batches per split: val/test splits are huge (frame_interval=1),
     # so loss-eval runs on a fixed-size prefix instead of the full split.
@@ -366,7 +366,7 @@ RUNTIME_CONFIG = {
     "openscene_data_root": "/prediction_database/navsim",
     "nuplan_maps_root": "/prediction_database/nuplan/dataset/maps",
     "output_dir": "bevfusion_model/outputs/train_navsim",
-    "resume_from": None,
+    "resume_from": "/home/pnc/Code/e2e_av_from_scratch/bevfusion_model/outputs/train_navsim/iter_131202.pth",
     # Training progress in samples, for resuming a checkpoint that was saved
     # under a different batch size / GPU count. New checkpoints store this
     # themselves; only needed for legacy checkpoints that stored just "iter".
