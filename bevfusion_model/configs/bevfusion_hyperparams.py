@@ -314,7 +314,7 @@ def _make_detection_head_train_5class():
 # ==============================================================================
 
 TRAINING_RECIPE = {
-    "lr": 1e-4,
+    "lr": 2e-4,
     "weight_decay": 0.01,
     "backbone_lr_mult": 1.0,
     "grad_clip_max_norm": 35.0,
@@ -322,7 +322,7 @@ TRAINING_RECIPE = {
     "warmup_iters": 500,
     "warmup_ratio": 1.0 / 3.0,
     "min_lr_ratio": 1e-3,
-    "num_epochs": 100,
+    "num_epochs": 36,
     # PER-RANK batch size (each DDP rank loads this many samples per iter).
     # 4 fits a 24 GB GPU single-process but OOMs under DDP (reducer buckets +
     # NCCL buffers eat the headroom); 3 leaves ~3 GiB for the backward spike.
@@ -366,7 +366,11 @@ RUNTIME_CONFIG = {
     "openscene_data_root": "/prediction_database/navsim",
     "nuplan_maps_root": "/prediction_database/nuplan/dataset/maps",
     "output_dir": "bevfusion_model/outputs/train_navsim",
-    "resume_from": "/home/pnc/Code/e2e_av_from_scratch/bevfusion_model/outputs/train_navsim/iter_131202.pth",
+    "resume_from": None,
+    # Warm-starts the camera+lidar+decoder+fuser from the official 10-class
+    # nuScenes checkpoint, dropping the 5-class-mismatched head tensors, and
+    # starts training at iter 0. No-op when resume_from is set (resume wins).
+    "pretrained_from": "/home/pnc/Code/e2e_av_from_scratch/model_weights/bevfusion/bevfusion-det.pth",
     # Training progress in samples, for resuming a checkpoint that was saved
     # under a different batch size / GPU count. New checkpoints store this
     # themselves; only needed for legacy checkpoints that stored just "iter".

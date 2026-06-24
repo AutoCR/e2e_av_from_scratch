@@ -6,7 +6,28 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
-## <pending> — Harness bootstrap (docs only, no training change)
+## 2026-06-24 — Warm-start from official checkpoint + recipe fix + autostart wrapper
+- **Commit:** <this commit>
+- **Why:** The prior 100-epoch from-scratch run barely converged (heatmap loss flat
+  ~2.9, bbox plateaued ~8.5 by epoch 30, then 70 epochs wasted on a near-zero cosine LR).
+  Root cause: no warm-start + too-low LR (1e-4) for from-scratch + too many epochs.
+- **What:**
+  - `runner.py`: new warm-start block after `model.to(device)` (before DDP wrap). Loads an
+    external checkpoint, keeps only keys present in the model with matching shape, drops the
+    rest, loads `strict=False`, logs loaded/dropped/missing on rank 0. Guarded by
+    `pretrained_from and not resume_from` (resume wins). Path resolved vs `_REPO_ROOT`.
+  - `bevfusion_hyperparams.py`: `lr` 1e-4→2e-4; `num_epochs` 100→36; `resume_from`→None;
+    added `pretrained_from` = absolute path to `model_weights/bevfusion/bevfusion-det.pth`.
+  - `autostart_train.sh` (new): idempotent `/bin/sh` wrapper for a `@reboot` cron — sets
+    cron-safe env (uv abs path, CUDA), skips if already running, launches 6-GPU DDP detached.
+- **Effect / how to verify:** Verified offline that exactly 578/583 keys load identically and
+  only 5 class-dependent head tensors mismatch (10→5 classes) and are dropped. Startup will
+  print `Warm-start ...: loaded 578 keys, dropped 5, 5 missing (reinitialized)`. Success
+  signal: `loss_heatmap` should drop below the ~2.9 plateau within the first epoch (vs flat
+  from scratch). Smoke run validates before the full run.
+- **Restart:** Fresh run at iter 0 (this is a new campaign, not a resume).
+
+## 2026-06-24 — Harness bootstrap (docs only, no training change)
 - **Commit:** <fill on commit>
 - **Why:** Set up an autonomous, auditable, multi-day training campaign per user request.
 - **What:** Added `bevfusion_model/navsim_train/CLAUDE.md` (operating manual),

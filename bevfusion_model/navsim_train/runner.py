@@ -272,6 +272,53 @@ def run(config: dict):
     # Model
     model = BEVFusion(hyperparams)
     model.to(device)
+
+    # Warm-start from a pretrained checkpoint (distinct from resume_from).
+    # Warm-start: load compatible weights from an *external* checkpoint (e.g.
+    # the official 10-class nuScenes BEVFusion) into a fresh run that starts at
+    # iter 0 — class-dependent head tensors with a different shape are dropped
+    # and reinitialized. Resume: continue *this* run's own training, restoring
+    # model+optimizer+scaler+progress. Resume takes priority: a resumed run
+    # already carries trained weights, so warm-start is a no-op when resume_from
+    # is set. This must run on the unwrapped model (model is not yet DDP-wrapped).
+    if config.get("pretrained_from") and not config.get("resume_from"):
+        pretrained_path = Path(config["pretrained_from"])
+        if not pretrained_path.is_absolute():
+            pretrained_path = _REPO_ROOT / pretrained_path
+        # Load to CPU (same rationale as the resume block below: avoid pinning a
+        # second full copy of the weights on the GPU for the lifetime of run()).
+        checkpoint = torch.load(str(pretrained_path), map_location="cpu")
+        # Unwrap the inner state dict: official ckpts nest under "state_dict",
+        # ours under "model"; fall back to the dict itself.
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            src_state = checkpoint["state_dict"]
+        elif isinstance(checkpoint, dict) and "model" in checkpoint:
+            src_state = checkpoint["model"]
+        else:
+            src_state = checkpoint
+        # Keep only keys that exist in the model AND match shape; everything
+        # else (shape-mismatched heads, extras) is dropped and reinitialized.
+        model_state = model.state_dict()
+        filtered = {}
+        dropped = []
+        for k, v in src_state.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                filtered[k] = v
+            else:
+                dropped.append(k)
+        missing, unexpected = model.load_state_dict(filtered, strict=False)
+        if is_main_process():
+            print(
+                f"Warm-start from {pretrained_path}: loaded {len(filtered)} keys, "
+                f"dropped {len(dropped)} (shape-mismatch/extra), "
+                f"{len(missing)} missing (reinitialized)."
+            )
+            if dropped:
+                print(f"  dropped: {dropped}")
+        del checkpoint, src_state, filtered, model_state
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     if world_size > 1:
         # gradient_as_bucket_view: grads live inside the reducer buckets
         # instead of being duplicated — saves a full gradient copy per GPU.
