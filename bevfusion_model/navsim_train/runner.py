@@ -269,6 +269,19 @@ def run(config: dict):
         sampler=None,
     )
 
+    # Auto-resume: if no explicit resume_from is set but a `last.pth` already
+    # exists in the output dir, resume from it. This makes restarts (manual or
+    # via the @reboot autostart cron) continue the in-progress run instead of
+    # restarting from iter 0. A genuinely fresh campaign has no last.pth, so it
+    # falls through to warm-start. To force a fresh start, delete last.pth (and
+    # the iter_*.pth) before launching.
+    if not config.get("resume_from"):
+        _last = Path(config["output_dir"]) / "last.pth"
+        if _last.exists():
+            config["resume_from"] = str(_last)
+            if is_main_process():
+                print(f"Auto-resume: found {_last}, resuming from it (overrides warm-start).")
+
     # Model
     model = BEVFusion(hyperparams)
     model.to(device)
