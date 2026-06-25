@@ -6,6 +6,31 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
+## 2026-06-25 — DEFINITIVE heatmap diagnosis: not a floor, slow background descent. Revert 4×.
+- **Commit:** <this commit>
+- **Why:** The 4× heatmap weight (prev entry) did NOT break the plateau either (true term,
+  =logged/4, stayed ~2.85 through iter 600). Two failed fixes → stopped guessing and ran an
+  instrumented decomposition of the heatmap loss on real data.
+- **Measured findings (correct two earlier wrong assumptions):**
+  1. **NAVSIM is NOT sparse** — measured **~41 boxes/frame** (median 39.5, max 115), not the
+     ~1-2 an earlier sampling claimed. So avg_factor (=num positive peaks) is ~192 for B=4,
+     a LARGE divisor, not a tiny-divisor pathology.
+  2. **No structural floor.** Perfect-positive test: setting peaks→1.0 AND background→0 drives
+     loss → 0.0. The loss CAN descend; ~2.9 is not a cap.
+  3. **The loss is ~70% NEG (background) term** (4.43 of 6.29 / avg_factor), ~30% POS. The
+     model drives background to sigmoid≈0.09 and the descent STALLS there. loss→0.5 needs
+     background≈0.05; →0.1 needs ≈0.03 — a slow factor-of-2-3 across 162k cells/frame.
+  4. **Why both fixes failed:** bias-init only sets the *initial* background level; 4× weight
+     scales pos and neg *identically* so the pos/neg balance (the actual stalled term) is
+     unchanged. Neither addressed background suppression.
+- **What:** Reverted `loss_heatmap.loss_weight` 4.0 → 1.0 (4× was inert and risks
+  destabilizing other losses). Added a measured NOTE in the config.
+- **Conclusion:** The ~2.9 heatmap plateau is a SLOW-but-not-blocked background-suppression
+  descent, NOT a bug. It would improve with many more epochs, or descend faster with a
+  neg-term normalization change (normalize the neg term per-cell instead of dividing the
+  162k-cell sum by num_pos). This is a decision for the user, not an autonomous fix.
+- **Restart:** None yet — awaiting user decision on strategy.
+
 ## 2026-06-25 — Up-weight loss_heatmap 1.0→4.0 (break the confirmed plateau)
 - **Commit:** <this commit>
 - **Why:** The full run (stopped at ~1.4 epochs) confirmed conclusively via windowed means:

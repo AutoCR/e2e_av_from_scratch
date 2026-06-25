@@ -267,13 +267,14 @@ DETECTION_HEAD_TRAIN_CFG_5 = {
     "code_weights": [1.0]*8 + [0.2]*2,
     "pos_weight": -1,
     "loss_cls": {"gamma": 2.0, "alpha": 0.25, "loss_weight": 1.0},
-    # Heatmap up-weighted 1.0 -> 4.0: on NAVSIM the dense heatmap is dominated
-    # by background (~162k bg cells vs ~1-2 fg per frame, 4 of 5 classes nearly
-    # always empty). At weight 1.0 the loss is pinned at the ~2.95 "predict
-    # background" floor (confirmed: dead flat over 1.4 epochs). A single batch
-    # overfits heatmap to 0.17, so the head CAN learn it — it just needs more
-    # gradient share against the bbox/cls terms.
-    "loss_heatmap": {"loss_weight": 4.0},
+    # NOTE on the ~2.9 heatmap plateau (measured, see CHANGELOG 2026-06-25):
+    # it is NOT a floor and NOT data sparsity (NAVSIM has ~41 boxes/frame). The
+    # heatmap loss is ~70% NEG (background) term; the model drives background to
+    # sigmoid~0.09 and the descent stalls there (loss~0 needs background~0.03 —
+    # a slow factor-of-3 across 162k cells). A 4x global up-weight did NOT help
+    # (it scales pos and neg identically); reverted to 1.0. Real levers are more
+    # epochs or a neg-term normalization change — see CHANGELOG.
+    "loss_heatmap": {"loss_weight": 1.0},
     "loss_bbox": {"loss_weight": 0.25},
     "assigner": {
         "cls_cost": {"gamma": 2.0, "alpha": 0.25, "weight": 0.15},
