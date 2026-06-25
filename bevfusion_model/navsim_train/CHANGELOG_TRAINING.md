@@ -6,6 +6,23 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
+## 2026-06-25 — Up-weight loss_heatmap 1.0→4.0 (break the confirmed plateau)
+- **Commit:** <this commit>
+- **Why:** The full run (stopped at ~1.4 epochs) confirmed conclusively via windowed means:
+  `loss_heatmap` DEAD FLAT at ~2.95 over 4 windows (zero movement), `loss_bbox` descended
+  early then plateaued at ~10 (above the 8.5 target). Heatmap pinned at the "predict
+  background everywhere" floor. The single-batch overfit proved the head CAN reach 0.17, so
+  the gradient path works — the positive signal is just too weak vs background at weight 1.0
+  (NAVSIM: ~1-2 boxes/frame, 4/5 classes nearly always empty).
+- **What:** `bevfusion_hyperparams.py`: `loss_heatmap.loss_weight` 1.0 → 4.0. (loss_cls and
+  loss_bbox weights unchanged; assigner unchanged — IoU cost is active on CUDA.)
+- **Effect / how to verify:** Short validation experiment first (~400 iters): `loss_heatmap`
+  (now scaled ×4, so compare the UNSCALED component or expect raw ~4× higher initially) must
+  show the UNDERLYING heatmap term DESCENDING, not flat. If it breaks below the old plateau,
+  relaunch the full run. Stopped run's last.pth + iter_4728.pth removed so the new run
+  warm-starts fresh at iter 0.
+- **Restart:** Fresh warm-start run after validation passes.
+
 ## 2026-06-25 — Full 36-epoch run launched + @reboot cron + auto-resume
 - **Commit:** 96b38d8 (auto-resume) + this entry
 - **Why:** All structural blockers resolved (warm-start works incl. lidar permute; batch 3
