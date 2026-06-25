@@ -6,6 +6,27 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
+## 2026-06-25 — Full 36-epoch run launched + @reboot cron + auto-resume
+- **Commit:** 96b38d8 (auto-resume) + this entry
+- **Why:** All structural blockers resolved (warm-start works incl. lidar permute; batch 3
+  fixes OOM; heatmap focal-bias init added; bbox confirmed not-a-bug with IoU active on CUDA).
+  User approved launching the full run now and watching the first 1-2 epochs.
+- **What:**
+  - Launched the full run detached on GPUs 0-5 (6× DDP): `console_20260625_122432.log`.
+    Confirmed: warm-start 577 keys (21 permuted, 5 dropped); num_epochs=36,
+    iters_per_epoch=4728, max_iters=170208, start_iter=0; 6 GPUs busy ~17-19 GiB, no OOM.
+  - `runner.py`: auto-resume from `last.pth` if present (commit 96b38d8) — so manual restarts
+    and the reboot cron continue the run instead of restarting at iter 0.
+  - Installed `@reboot` cron on the remote calling `autostart_train.sh` (idempotent;
+    skips if already running). Reboot path: wait 60s → autostart → launch → auto-resume.
+- **Survivability now covered:** (A/B) detached launch survives this laptop/session dying;
+  (C) @reboot cron + auto-resume survives a server reboot; checkpoints every epoch (~1 h)
+  cap lost progress.
+- **Effect / how to verify:** Monitor per CLAUDE.md §2 (TB scalars). Success signals over the
+  first 1-2 epochs: `loss_heatmap` descends below the old ~2.9 plateau; `loss_bbox` descends
+  below ~8.5; grad_norm under clip; no NaN. If heatmap/bbox stay pinned, stop and reassess.
+- **Restart:** Fresh run at iter 0.
+
 ## 2026-06-25 — Investigation: bbox "non-overfit" is a diagnostic artifact, NOT a bug
 - **Commit:** <this commit> (docs only — no code change)
 - **Why:** A single-batch overfit test showed `loss_bbox` (specifically cx,cy) refusing to
