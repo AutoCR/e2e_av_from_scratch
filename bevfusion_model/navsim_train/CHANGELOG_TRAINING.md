@@ -6,6 +6,26 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
+## 2026-06-25 — Focal bias init on heatmap heads (break the ~2.9 plateau)
+- **Commit:** <this commit>
+- **Why:** Smoke run (with warm-start working) showed `loss_heatmap` stuck oscillating at
+  ~2.8-3.1 even at full lr — the SAME plateau as the prior from-scratch run, so init was
+  never the bottleneck. Quantitative analysis proved ~2.9 = "background fully suppressed,
+  but predicted confidence at true object centers stuck at sigmoid~0.04": the head fell into
+  the trivial "predict background everywhere" basin. Root cause: this port OMITTED the
+  standard focal negative-bias init on the heatmap output convs (official BEVFusion sets
+  bias=-2.19). Without it, the reinit head starts at sigmoid~0.5 everywhere, and the
+  161998-bg-vs-~2-fg gradient imbalance collapses it to predict ~0 and stay there. (NAVSIM
+  sparsity — ~1.3-1.9 boxes/frame, mostly `car` — makes this worse but is data-inherent.)
+- **What:** `detection_head.py`: added `_init_heatmap_bias(-2.19)` called in `__init__`,
+  setting the bias of the dense `heatmap_head[-1]` conv and each per-query
+  `prediction_heads[i].heatmap[-1]` conv to -2.19 (the layers feeding GaussianFocalLoss).
+- **Effect / how to verify:** Re-run smoke. `loss_heatmap` should now START lower (near the
+  bg prior instead of ~110) and DESCEND below ~2.5 instead of flooring at 2.9 — gradient
+  energy now goes into raising true peaks. If it still floors at 2.9, escalate to the
+  single-batch overfit test (can the head reach <0.5 on one batch?).
+- **Restart:** Smoke re-run (kill the running one first — it used the pre-fix code).
+
 ## 2026-06-25 — Fix smoke-run failures: DDP OOM + lidar warm-start layout
 - **Commit:** <this commit>
 - **Why:** First smoke run on the 6× RTX 3090 server surfaced two issues:

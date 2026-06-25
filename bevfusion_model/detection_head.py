@@ -350,6 +350,18 @@ class TransFusionHead(nn.Module):
             heads["heatmap"] = [num_classes, 2]
             self.prediction_heads.append(SeparateHead(hidden_channel, heads))
 
+        # Focal-style negative bias prior on the heatmap output convs. Without
+        # it the final heatmap layer starts at sigmoid~0.5 everywhere, so the
+        # background gradient (161998 bg vs ~2 fg pixels) collapses the head
+        # into "predict background everywhere" (loss floors at ~2.9 with peaks
+        # stuck at sigmoid~0.04). Initializing bias=-2.19 makes background the
+        # starting state so gradient energy goes into raising true peaks. This
+        # is the standard CenterPoint/TransFusion init that this port omitted.
+        # Applied to both the dense heatmap head and each per-query SeparateHead
+        # heatmap branch. (These layers are reinit on every run anyway: the
+        # 10-class checkpoint head is shape-dropped for the 5-class model.)
+        self._init_heatmap_bias(-2.19)
+
         self.init_bn_momentum()
 
         x_size = self.test_cfg.get("grid_size", [1440, 1440])[0] // self.test_cfg.get("out_size_factor", 8)
@@ -417,6 +429,21 @@ class TransFusionHead(nn.Module):
         for m in self.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 m.momentum = self.bn_momentum
+
+    def _init_heatmap_bias(self, bias_value):
+        """Set a focal negative-bias prior on every heatmap output conv.
+
+        Targets the final conv of the dense heatmap head and of each
+        per-query SeparateHead 'heatmap' branch (the layers that feed the
+        GaussianFocalLoss). Only those convs carry a bias; the BN-Relu convs
+        before them are bias-free, so they are skipped.
+        """
+        heatmap_convs = [self.heatmap_head[-1]]
+        for head in self.prediction_heads:
+            heatmap_convs.append(head.heatmap[-1])
+        for conv in heatmap_convs:
+            if getattr(conv, "bias", None) is not None:
+                nn.init.constant_(conv.bias, bias_value)
 
     def forward_single(self, inputs, metas):
         batch_size = inputs.shape[0]
