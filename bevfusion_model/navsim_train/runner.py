@@ -301,15 +301,52 @@ def run(config: dict):
         model_state = model.state_dict()
         filtered = {}
         dropped = []
+        permuted = []
+
+        def _maybe_permute_lidar_conv(key, src, dst_shape):
+            """Reconcile spconv weight layout for lidar backbone conv weights.
+
+            The official checkpoint stores sparse-conv weights as
+            [kD,kH,kW,in,out]; real spconv (spconv-cu120, the server path)
+            registers .weight as [out,kD,kH,kW,in]. Same numel, different
+            order, so a plain shape-equality filter drops them. Try a small set
+            of candidate 5-D permutes and accept the FIRST whose result matches
+            the model param shape EXACTLY. Self-validating: a wrong layout guess
+            simply yields no match and the key falls through to `dropped`, so
+            this can never corrupt a weight.
+            """
+            if not (
+                "encoders.lidar.backbone" in key
+                and key.endswith(".weight")
+                and src.dim() == 5
+                and src.numel() == int(torch.tensor(list(dst_shape)).prod())
+            ):
+                return None
+            # Most-likely first: ckpt [kkk,in,out] -> spconv-v2 [out,kkk,in].
+            for perm in ((4, 0, 1, 2, 3), (1, 2, 3, 4, 0), (4, 3, 0, 1, 2)):
+                cand = src.permute(*perm).contiguous()
+                if tuple(cand.shape) == tuple(dst_shape):
+                    return cand
+            return None
+
         for k, v in src_state.items():
-            if k in model_state and model_state[k].shape == v.shape:
+            if k not in model_state:
+                dropped.append(k)
+                continue
+            if model_state[k].shape == v.shape:
                 filtered[k] = v
+                continue
+            cand = _maybe_permute_lidar_conv(k, v, model_state[k].shape)
+            if cand is not None:
+                filtered[k] = cand
+                permuted.append(k)
             else:
                 dropped.append(k)
         missing, unexpected = model.load_state_dict(filtered, strict=False)
         if is_main_process():
             print(
-                f"Warm-start from {pretrained_path}: loaded {len(filtered)} keys, "
+                f"Warm-start from {pretrained_path}: loaded {len(filtered)} keys "
+                f"({len(permuted)} via spconv-layout permute), "
                 f"dropped {len(dropped)} (shape-mismatch/extra), "
                 f"{len(missing)} missing (reinitialized)."
             )
