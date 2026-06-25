@@ -6,6 +6,34 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
+## 2026-06-25 — Investigation: bbox "non-overfit" is a diagnostic artifact, NOT a bug
+- **Commit:** <this commit> (docs only — no code change)
+- **Why:** A single-batch overfit test showed `loss_bbox` (specifically cx,cy) refusing to
+  converge while all other dims overfit, which looked like a center encode/decode bug.
+- **What we found (two independent investigations, one static + one live-instrumented on
+  the remote, agreeing):**
+  - The center path is CORRECT vs upstream TransFusion: encode target and forward pred are
+    BOTH absolute feature-grid coords; query_pos [0.5,179.5] exactly matches encode targets
+    [2.8,177.6]; gradients are live (not detached); train/test out_size_factor+voxel+pc_range
+    all match. No encoding/scale/gradient bug.
+  - The real mechanism for the stuck cx,cy in the TEST: the Hungarian assignment FLIPS every
+    step (measured: matched proposal→GT set unstable at every logged step), so cx,cy chase a
+    moving target. Cause: the 3D-IoU assignment cost (the term that locks a match spatially)
+    is ~0 at init because predicted boxes are ~18 m off, AND it's disabled entirely on CPU /
+    when the CUDA IoU op is unavailable (`detection_assigner.py:206`). With 47 same-class
+    ("car") GTs, the remaining cls cost is degenerate → unstable matching.
+  - **KEY FACT checked on the remote: `IOU3D_CUDA_AVAILABLE = True` and `cuda = True`.** So in
+    real 6-GPU CUDA training the IoU cost IS active and stabilizes the assignment as boxes
+    improve — exactly like upstream. The non-overfit was an artifact of a degenerate
+    single-batch scenario with far-off init boxes, not the production path.
+- **Conclusion:** No bbox code fix needed. The center regression bootstraps slowly early
+  (IoU≈0 until boxes get close) but is not broken; with IoU active + the heatmap-bias fix
+  helping proposals land near GT, it should converge over real training.
+- **Effect / how to verify:** On the full run, watch `loss_bbox` descend past the old ~8.5
+  plateau over the first several epochs (not instantly). If it stays pinned, revisit the
+  assigner (e.g. add a BEV-center-distance fallback cost for the early IoU≈0 regime).
+- **Restart:** No restart from this entry (investigation only).
+
 ## 2026-06-25 — Focal bias init on heatmap heads (break the ~2.9 plateau)
 - **Commit:** <this commit>
 - **Why:** Smoke run (with warm-start working) showed `loss_heatmap` stuck oscillating at
