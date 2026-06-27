@@ -6,6 +6,27 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
+## 2026-06-27 — Eval: discovered corrupt BN stats in checkpoint + recalibration fix
+- **Commit:** <this commit>
+- **Why:** Evaluating iter_170208.pth produced ZERO detections (eval_detection_map: preds=0)
+  and NaN cls/bbox loss on every val batch — yet training loss was healthy throughout.
+- **Root cause (proven by probe):** the checkpoint has **NaN BatchNorm running_mean/running_var
+  in all 6 detection prediction-head branches** (`heads.object.prediction_heads.0.{center,
+  height,dim,rot,vel,heatmap}.0.bn`). All *parameters* are finite. In `train()` BN uses batch
+  stats (ignoring the corrupt buffers) → training loss looked fine the whole run. In `eval()`
+  the NaN buffers poison predictions → all scores NaN → all 200 proposals filtered → 0 boxes.
+  This is a SILENT failure that loss monitoring could never catch. Likely origin: fp16 BN-stat
+  divergence at some training step.
+- **What:** Added `bevfusion_model/recalibrate_bn.py` — a NO-gradient BN-recalibration script:
+  reset the non-finite BN running stats, set momentum=None (cumulative), put BN modules in
+  train-mode while the rest stays eval, run ~300 val forward passes (fp32, no backward) to
+  re-estimate valid running stats, save `iter_170208_bnfix.pth`. The eval scripts need no fix.
+- **Effect / how to verify:** After recalibration, re-run eval_detection_map.py / eval_loss.py
+  on the `_bnfix` checkpoint — should now produce nonzero detections and finite cls/bbox loss.
+- **Follow-up for training code:** add a NaN-check on BN buffers at checkpoint time, and
+  investigate the fp16 path (amp.py) as the divergence source.
+- **Restart:** No training restart — recalibration is forward-only.
+
 ## 2026-06-27 — Full 36-epoch run COMPLETED
 - **Commit:** <this commit> (docs only)
 - **Why:** The validated warm-start run reached iter 170208/170208 (36 epochs).
