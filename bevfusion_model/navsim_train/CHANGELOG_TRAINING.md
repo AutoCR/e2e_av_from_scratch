@@ -6,7 +6,25 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
-## 2026-06-27 — Eval: discovered corrupt BN stats in checkpoint + recalibration fix
+## 2026-06-27 — FINAL eval results (iter_170208_bnfix.pth, no training)
+- **Commit:** <this commit> (docs only)
+- **What was evaluated:** the BN-recalibrated checkpoint `iter_170208_bnfix.pth`, with
+  `eval_loss.py` (val loss) and `eval_detection_map.py` (3D detection mAP/NDS). PDM skipped
+  (planning metric — N/A for a detection-only model that outputs boxes, not a trajectory).
+- **Val loss (200 batches, all finite):** total 8.70 · cls 0.25 · bbox 5.41 · heatmap 3.03.
+- **Detection mAP/NDS (FULL val: 4000 samples, 797k preds, 72k GT, 35669 matched TPs):**
+  - Per-class AP (mean over 0.5/1/2/4m center-distance): car 0.242, pedestrian 0.067,
+    traffic_cone 0.042, barrier 0.001, bicycle 0.000.
+  - **mAP = 0.0705**; mATE 0.85 m, mASE 0.222, mAOE 0.448 rad;
+    **NDS (simplified, 3 TP metrics) = 0.2297**.
+  - (100-sample smoke was consistent: mAP 0.083, NDS 0.256 — full run is the reliable number.)
+- **Honest read:** the model genuinely detects **car** (AP 0.242, 0.85 m translation error)
+  but is near-zero on the rare classes (bicycle/barrier/cone), reflecting NAVSIM's severe
+  class imbalance. This is a MODEST detector — useful as a working baseline, not yet strong.
+- **Note on the metric:** NDS here is a documented simplification (mAP + ATE/ASE/AOE only;
+  AVE/AAE omitted, NAVSIM 5-class). Not directly comparable to official 10-class nuScenes NDS.
+- **Caveat:** these numbers required the BN-recalibration fix; the raw `iter_170208.pth`
+  evaluates to 0 mAP due to the NaN BN buffers. Use the `_bnfix` checkpoint for any inference.
 - **Commit:** <this commit>
 - **Why:** Evaluating iter_170208.pth produced ZERO detections (eval_detection_map: preds=0)
   and NaN cls/bbox loss on every val batch — yet training loss was healthy throughout.
