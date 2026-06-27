@@ -6,6 +6,24 @@ corresponds to a git commit on `feat_bevfusion`.
 
 <!-- New entries go directly below this line. -->
 
+## 2026-06-27 — Full 36-epoch run COMPLETED
+- **Commit:** <this commit> (docs only)
+- **Why:** The validated warm-start run reached iter 170208/170208 (36 epochs).
+- **Outcome:** Completed cleanly — 0 procs left, all GPUs freed, no crash/OOM, only 1
+  transient loss-NaN over the entire run (skipped by the runner) + 1 isolated grad inf.
+  Final smoothed training losses (last ~2 epochs, windowed means):
+  loss_total ≈ 9.1, loss_bbox ≈ 6.2, loss_heatmap ≈ 2.65, loss_cls ≈ 0.21, grad_norm ≈ 23.
+  (Per-iter values bounce ±; the run's session lows were bbox ~4.8-5.2, total ~7.5-8.2.)
+  vs. the failed from-scratch baseline: bbox went from a ~10 stall to ~6.2 (sub-target),
+  heatmap from a flat ~2.95 floor down to ~2.65, and cls to ~0.21.
+- **Best checkpoint:** `bevfusion_model/outputs/train_navsim/iter_170208.pth` (== last.pth,
+  the final/lowest-LR model). The from-scratch reference `iter_354600.pth` is retained for
+  comparison.
+- **Open item:** success was measured on TRAINING LOSS only — this port has no
+  mAP/NDS/PDM detection metric, and loss-eval is disabled (OOM). Judging real detection
+  quality needs that metric built (flagged repeatedly during monitoring).
+- **Restart:** None — run finished. Monitor loop stopped.
+
 ## 2026-06-25 — DEFINITIVE heatmap diagnosis: not a floor, slow background descent. Revert 4×.
 - **Commit:** <this commit>
 - **Why:** The 4× heatmap weight (prev entry) did NOT break the plateau either (true term,
