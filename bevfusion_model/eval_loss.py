@@ -96,12 +96,35 @@ def build_split_dataset(split_cfg, config, max_scenes):
 def run_loss_eval(raw_model, loader, device, scaler, max_batches):
     """Average detection-loss components over (a prefix of) an eval split.
 
+    NaN-safe averaging
+    ------------------
+    Some val frames have zero positive matches; for those the head's cls/bbox
+    losses divide by ``avg_factor = num_pos = 0`` and come back as NaN (the
+    heatmap loss uses a different normalization -- peak count floored at 1 -- so
+    it stays finite). A single NaN batch must NOT poison the running mean, so we
+    accumulate, PER COMPONENT, the sum and count of only the FINITE (non-nan,
+    non-inf) batch values. The reported average for a key is
+    ``finite_sum / finite_count`` (or NaN if no batch contributed a finite value
+    for that key).
+
+    ``loss_total`` is defined as the SUM OF THE PER-COMPONENT FINITE MEANS (i.e.
+    the sum of the individual component averages computed at the end), so it is
+    always finite as long as at least one component (e.g. heatmap) is finite.
+    It is intentionally NOT a per-batch sum, which would otherwise be NaN on any
+    empty-GT batch. ``loss_total`` therefore has no finite-count of its own; its
+    finite_count is reported as the max over the contributing components.
+
     Inline replica of ``runner._run_loss_eval`` with an added per-batch
-    ``empty_cache`` for OOM headroom. Returns (avg_dict, n_batches).
+    ``empty_cache`` for OOM headroom plus the NaN-safety above. Returns
+    ``(avg_dict, finite_counts, n_batches)`` where ``finite_counts[key]`` is how
+    many evaluated batches contributed a finite value for ``key``.
     """
+    import math
+
     was_training = raw_model.training
     raw_model.eval()
     sums: dict = {}
+    finite_counts: dict = {}
     count = 0
     for batch_index, raw_batch in enumerate(loader):
         if max_batches is not None and batch_index >= int(max_batches):
@@ -118,11 +141,14 @@ def run_loss_eval(raw_model, loader, device, scaler, max_batches):
                 torch.cuda.empty_cache()
             print(f"  [batch {batch_index}] skipped (CUDA OOM): {exc}")
             continue
-        total = sum(v for v in loss_dict.values() if torch.is_tensor(v))
-        sums["loss_total"] = sums.get("loss_total", 0.0) + float(total)
+        # Accumulate per-component finite sums/counts only (skip nan/inf).
         for key, value in loss_dict.items():
-            if torch.is_tensor(value):
-                sums[key] = sums.get(key, 0.0) + float(value)
+            if not torch.is_tensor(value):
+                continue
+            fval = float(value)
+            if math.isfinite(fval):
+                sums[key] = sums.get(key, 0.0) + fval
+                finite_counts[key] = finite_counts.get(key, 0) + 1
         count += 1
         del batch, img, loss_dict
         if device.type == "cuda":
@@ -130,8 +156,17 @@ def run_loss_eval(raw_model, loader, device, scaler, max_batches):
     if was_training:
         raw_model.train()
     if count == 0:
-        return {}, 0
-    return {key: value / count for key, value in sums.items()}, count
+        return {}, {}, 0
+    # Per-component finite mean (nan if no finite batch contributed).
+    avg = {
+        key: (sums[key] / finite_counts[key] if finite_counts.get(key) else float("nan"))
+        for key in sums
+    }
+    # loss_total = sum of the per-component finite means (always finite if at
+    # least one component is finite). Its finite_count = max component count.
+    avg["loss_total"] = sum(v for v in avg.values() if v == v)  # skip nan
+    finite_counts["loss_total"] = max(finite_counts.values()) if finite_counts else 0
+    return avg, finite_counts, count
 
 
 def main():
@@ -196,10 +231,10 @@ def main():
             sampler=None,
         )
         t0 = time.time()
-        avg, n_batches = run_loss_eval(model, loader, device, scaler, args.max_batches)
+        avg, finite_counts, n_batches = run_loss_eval(model, loader, device, scaler, args.max_batches)
         dt = time.time() - t0
         n_samples = n_batches * args.batch_size
-        results[split_name] = (avg, n_batches, n_samples, dt)
+        results[split_name] = (avg, finite_counts, n_batches, n_samples, dt)
         if not avg:
             print(f"  no batches evaluated for {split_name}")
         else:
@@ -219,7 +254,7 @@ def main():
     print(header)
     print("-" * len(header))
     for split_name in args.splits:
-        avg, n_batches, n_samples, _ = results[split_name]
+        avg, finite_counts, n_batches, n_samples, _ = results[split_name]
         if not avg:
             print(f"{split_name:>6} | {'--':>7} | {'--':>7} | {'(no batches)':>10}")
             continue
@@ -231,6 +266,22 @@ def main():
             f"{avg.get('loss_heatmap', float('nan')):>12.4f}"
         )
     print("=" * len(header))
+
+    # Per-component finite-batch counts: how many evaluated batches yielded a
+    # finite value for each component. A low finite_cls / finite_bbox count means
+    # many frames had zero positive matches (empty-GT), so those losses were NaN
+    # for those batches and were excluded from the mean above.
+    print("\nFinite-batch counts (finite / evaluated) per component:")
+    for split_name in args.splits:
+        avg, finite_counts, n_batches, _, _ = results[split_name]
+        if not avg:
+            print(f"  {split_name:>6}: (no batches)")
+            continue
+        parts = " ".join(
+            f"finite_{key.replace('loss_', '')}={finite_counts.get(key, 0)}/{n_batches}"
+            for key in ("loss_cls", "loss_bbox", "loss_heatmap")
+        )
+        print(f"  {split_name:>6}: {parts}")
 
 
 if __name__ == "__main__":
