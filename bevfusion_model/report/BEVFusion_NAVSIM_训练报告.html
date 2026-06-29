@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BEVFusion-on-NAVSIM 3D 检测训练全流程报告</title>
+<style>
+:root { --accent:#1e5aa0; --good:#148240; --warn:#be5a0a; }
+* { box-sizing:border-box; }
+body {
+  font-family:"Noto Sans CJK SC","Microsoft YaHei","PingFang SC",sans-serif;
+  color:#222; line-height:1.65; max-width:920px; margin:0 auto; padding:40px 32px 80px;
+  background:#fff;
+}
+h1 { color:var(--accent); font-size:30px; border-bottom:3px solid var(--accent);
+     padding-bottom:14px; margin-top:0; }
+h2 { color:var(--accent); font-size:22px; margin-top:38px;
+     border-left:5px solid var(--accent); padding-left:12px; }
+h3 { color:#2c5f8a; font-size:17px; margin-top:26px; }
+p, li { font-size:14.5px; }
+code { background:#f1f4f8; padding:1px 5px; border-radius:4px; font-size:90%;
+       font-family:"DejaVu Sans Mono",monospace; color:#b1442a; }
+table { border-collapse:collapse; width:100%; margin:16px 0; font-size:13.5px; }
+th, td { border:1px solid #d8dde4; padding:7px 10px; text-align:left; }
+th { background:var(--accent); color:#fff; font-weight:600; }
+tr:nth-child(even) td { background:#f6f8fb; }
+blockquote { border-left:4px solid #f0b050; background:#fff8ec; margin:14px 0;
+             padding:8px 16px; color:#7a5a10; border-radius:0 6px 6px 0; }
+strong { color:#1a1a1a; }
+hr { border:none; border-top:1px solid #e0e4ea; margin:32px 0; }
+.figure { text-align:center; margin:24px 0; padding:16px; background:#fbfcfe;
+          border:1px solid #e4e8ee; border-radius:8px; }
+.figcap { font-size:12.5px; color:#777; margin-top:8px; }
+.cover-meta { font-size:14px; color:#444; }
+ul, ol { padding-left:22px; }
+</style>
+</head>
+<body>
+<h1 id="bevfusion-on-navsim-3d">BEVFusion-on-NAVSIM 3D 检测训练全流程报告</h1>
+<blockquote>
+<p>模型：BEVFusion（相机 + LiDAR 多模态 BEV 融合 3D 检测）
+数据集：NAVSIM / OpenScene（5 类检测：car / barrier / bicycle / pedestrian / traffic_cone）
+训练硬件：远程服务器 6 × NVIDIA RTX 3090（24 GB），6 卡 DDP
+报告日期：2026-06-27</p>
+</blockquote>
+<hr>
+<h2 id="1-executive-summary">1. 摘要（Executive Summary）</h2>
+<p>本次工作的目标是：在前一次「从零训练（from-scratch）收敛极差」的基础上，定位问题、修复并完成一次健康的 BEVFusion 检测训练，最终用训练好的权重计算检测指标（mAP / NDS）与验证损失。</p>
+<p>核心结论：</p>
+<ul>
+<li><strong>诊断出旧训练失败的根因</strong>：缺少预训练权重热启动（warm-start）、学习率过低、训练轮数过多、并且检测头缺少 focal 负偏置初始化。</li>
+<li><strong>完成修复并重新训练</strong>：热启动官方 10 类 nuScenes 权重 + focal 偏置初始化 + 学习率 2e-4 + 36 epoch 余弦退火，全程零失败跑完 170208 iter（36 epoch）。</li>
+<li><strong>关键损失从「卡死」变为「持续下降」</strong>：<code>loss_bbox</code> 从旧的约 10 卡死降到约 5.4（验证集），<code>loss_heatmap</code> 从约 2.95 的平台缓慢降到约 2.6。</li>
+<li><strong>评估阶段又发现一个隐蔽的致命缺陷</strong>：最终权重的检测头 BatchNorm running 统计量为 NaN，导致 <code>eval()</code> 模式下 <strong>零检测</strong>——但因为训练用的是 batch 统计量，训练损失全程「看起来健康」，监控无法发现。通过无梯度的 <strong>BN 重标定（recalibration）</strong> 修复后得到可用权重。</li>
+<li><strong>最终评估（全量 4000 验证样本）</strong>：<strong>mAP = 0.0705</strong>，<strong>NDS（简化版）= 0.2297</strong>；其中 car 类 AP = 0.242（可用），稀有类（bicycle/barrier/cone）接近 0，反映 NAVSIM 严重的类别不均衡。</li>
+<li><strong>PDM 未计算</strong>：PDM 是规划（planning）指标，评估的是自车轨迹；BEVFusion 是纯检测模型，只输出 3D 框，不产生轨迹，因此 PDM 不适用。</li>
+</ul>
+<hr>
+<h2 id="2">2. 背景与问题定位</h2>
+<h3 id="21-from-scratch">2.1 旧训练（from-scratch）的失败现象</h3>
+<p>前一次训练为「从零随机初始化、lr=1e-4、100 epoch」，跑满 36→100 epoch 后损失几乎不下降：</p>
+<table>
+<thead>
+<tr>
+<th>损失项</th>
+<th>旧训练表现</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>loss_heatmap</code></td>
+<td>全程平台在 <strong>≈2.95</strong>，100 epoch 几乎不动</td>
+<td>模型几乎没学会定位目标</td>
+</tr>
+<tr>
+<td><code>loss_bbox</code></td>
+<td>从 ≈14 缓慢爬到 ≈8.5 后卡死，约 epoch 30 即停滞</td>
+<td>框回归基本没收敛</td>
+</tr>
+<tr>
+<td><code>loss_cls</code></td>
+<td>≈0.23</td>
+<td>分类项尚可</td>
+</tr>
+</tbody>
+</table>
+<p>通过对 TensorBoard 标量的分解分析，确认问题<strong>不是数据量</strong>（训练集 85109 个样本，规模充足），而是<strong>训练配方（recipe）</strong>。</p>
+<h3 id="22">2.2 根因清单</h3>
+<ol>
+<li><strong>没有热启动</strong>：BEVFusion 几乎从不「完全从零」训练。相机分支（SwinTransformer）与 LiDAR 稀疏卷积编码器都期望预训练初始化。</li>
+<li><strong>学习率过低</strong>：从零训练用 1e-4，是官方检测配方（2e-4，且配合预训练初始化）的一半。</li>
+<li><strong>训练过长</strong>：100 epoch 的余弦退火使后 70 个 epoch 在接近 0 的学习率上空转。</li>
+<li><strong>检测头缺少 focal 偏置初始化</strong>（评估前才补查到）：官方 BEVFusion 给 heatmap 输出卷积设了 <code>bias = -2.19</code>，本移植版漏了——导致重初始化的头一开始在每个位置都预测 sigmoid≈0.5，被海量背景梯度推向「处处预测背景」并卡死。</li>
+</ol>
+<hr>
+<h2 id="3">3. 优化与修复（按时间顺序）</h2>
+<p>整个过程遵循「先验证、再投入算力」的纪律：每个改动先用短跑（smoke run）验证，再决定是否提交全量训练；每个改动都记录进 <code>CHANGELOG_TRAINING.md</code> 并提交 git。</p>
+<h3 id="31-warm-start">3.1 热启动路径（warm-start）</h3>
+<p>新增 <code>pretrained_from</code> 配置项：在建模时加载官方 10 类 nuScenes BEVFusion 权重，<strong>按形状过滤</strong>只丢弃与 5 类 NAVSIM 头不匹配的张量，从 iter 0 开始训练。</p>
+<p>关键技术难点：</p>
+<ul>
+<li><strong>6→8 相机差异不是障碍</strong>：BEVFusion 把相机数 N 折叠进 batch 维（<code>img.view(B*N, C, H, W)</code>），N 不出现在任何权重形状里，因此 nuScenes 的 6 相机权重可直接用于 NAVSIM 的 8 相机。</li>
+<li><strong>LiDAR 稀疏卷积权重布局不匹配</strong>：官方 checkpoint 以 <code>[kD,kH,kW,in,out]</code> 存储，而 spconv-cu120 的 <code>.weight</code> 是 <code>[out,kD,kH,kW,in]</code>。新增<strong>自校验的 permute</strong>：对 lidar 卷积权重尝试候选 permute，仅当 permute 后形状精确匹配才加载，否则丢弃——即使猜错布局也绝不会污染权重。</li>
+</ul>
+<p>最终热启动加载 <strong>577 个 key（其中 21 个经 permute 重对齐）</strong>，仅丢弃 5 个与类别相关的检测头输出层。</p>
+<h3 id="32">3.2 训练配方修正</h3>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>旧值</th>
+<th>新值</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>峰值学习率 lr</td>
+<td>1e-4</td>
+<td><strong>2e-4</strong></td>
+<td>对齐官方检测配方</td>
+</tr>
+<tr>
+<td>训练轮数 num_epochs</td>
+<td>100</td>
+<td><strong>36</strong></td>
+<td>旧训练 epoch 30 即停滞，缩短避免空转</td>
+</tr>
+<tr>
+<td>每卡 batch</td>
+<td>4</td>
+<td><strong>3</strong></td>
+<td>batch 4 在 6 卡 DDP 下反传时 OOM；batch 3 留约 3 GiB 余量</td>
+</tr>
+</tbody>
+</table>
+<h3 id="33-focal-bug">3.3 检测头 focal 偏置初始化（关键 bug 修复）</h3>
+<p>诊断量化证明：<code>loss_heatmap</code> 卡在 ≈2.9 不是慢收敛，而是头塌缩进了「处处预测背景」的最优盆地（峰值置信度卡在 sigmoid≈0.04）。修复方法是给 heatmap 输出卷积加 <strong>focal 负偏置 <code>bias=-2.19</code></strong>（标准 CenterPoint/TransFusion 技巧），使「预测背景」成为初始状态，梯度能量转而用于抬升真实峰值。</p>
+<h3 id="34-bug">3.4 被排除的「伪 bug」</h3>
+<p>评估前的诊断中，单 batch 过拟合测试一度显示 bbox 中心回归（cx,cy）无法收敛，疑似 bug。但两路独立调查（静态分析 + 远程实测插桩）一致确认：</p>
+<ul>
+<li>中心回归路径与官方 TransFusion <strong>一致，没有编码/坐标/梯度 bug</strong>。</li>
+<li>单 batch 不收敛是因为 <strong>匈牙利匹配在每步翻转</strong>（IoU 代价在初期≈0，加上同类目标过多导致匹配退化）；</li>
+<li><strong>关键事实</strong>：远程 <code>IOU3D_CUDA_AVAILABLE = True</code>，真实 CUDA 训练中 IoU 代价是激活的，匹配稳定——所以这是诊断条件造成的假象，<strong>生产路径无 bug</strong>，无需改代码。</li>
+</ul>
+<h3 id="35">3.5 训练存活性保障（无人值守）</h3>
+<p>为支撑「本地电脑/会话关闭、服务器重启」三种失效场景下训练不中断：</p>
+<ul>
+<li><strong>脱离会话启动</strong>（<code>setsid nohup</code>）：训练归属远程 <code>pnc</code> 用户，本机或会话关闭都不影响。</li>
+<li><strong>服务器重启自恢复</strong>：<code>@reboot</code> cron + 幂等 <code>autostart_train.sh</code> + runner 的 <code>last.pth</code> 自动续训逻辑。</li>
+<li><strong>每 epoch 保存 checkpoint</strong>（约 1 小时），崩溃/重启最多损失约 1 epoch。</li>
+</ul>
+<hr>
+<h2 id="4">4. 训练过程与损失曲线</h2>
+<p>最终训练于 6 卡 RTX 3090 上跑满：</p>
+<ul>
+<li>全局 batch = 18（6 卡 × 3），每 epoch 4728 iter，共 <strong>36 epoch = 170208 iter</strong>。</li>
+<li>全程约 25 小时，零崩溃 / 零 OOM；整个 170208 iter 中仅出现 <strong>1 次瞬时 loss-NaN</strong>（iter 23，被 runner 跳过）和 <strong>1 次孤立 grad-inf</strong>（iter 127350），均被自动吸收，无影响。</li>
+<li>采用约每 30 分钟一次的自动监控 tick（约 80 次），实时检查存活、损失曲线、磁盘、并按规则自主纠错。</li>
+</ul>
+<div class="figure">
+<svg viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto;font-family:sans-serif;">
+<rect x="0" y="0" width="760" height="380" fill="#ffffff"/>
+<line x1="60" y1="335.0" x2="610" y2="335.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="338.0" font-size="11" fill="#888" text-anchor="end">0</text>
+<line x1="60" y1="300.0" x2="610" y2="300.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="303.0" font-size="11" fill="#888" text-anchor="end">2</text>
+<line x1="60" y1="265.0" x2="610" y2="265.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="268.0" font-size="11" fill="#888" text-anchor="end">4</text>
+<line x1="60" y1="230.0" x2="610" y2="230.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="233.0" font-size="11" fill="#888" text-anchor="end">6</text>
+<line x1="60" y1="195.0" x2="610" y2="195.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="198.0" font-size="11" fill="#888" text-anchor="end">8</text>
+<line x1="60" y1="160.0" x2="610" y2="160.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="163.0" font-size="11" fill="#888" text-anchor="end">10</text>
+<line x1="60" y1="125.0" x2="610" y2="125.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="128.0" font-size="11" fill="#888" text-anchor="end">12</text>
+<line x1="60" y1="90.0" x2="610" y2="90.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="93.0" font-size="11" fill="#888" text-anchor="end">14</text>
+<line x1="60" y1="55.0" x2="610" y2="55.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="58.0" font-size="11" fill="#888" text-anchor="end">16</text>
+<line x1="60" y1="20.0" x2="610" y2="20.0" stroke="#e6e9ee" stroke-width="1"/>
+<text x="52" y="23.0" font-size="11" fill="#888" text-anchor="end">18</text>
+<text x="60.0" y="353.0" font-size="11" fill="#888" text-anchor="middle">0</text>
+<text x="155.9" y="353.0" font-size="11" fill="#888" text-anchor="middle">30</text>
+<text x="251.9" y="353.0" font-size="11" fill="#888" text-anchor="middle">60</text>
+<text x="347.8" y="353.0" font-size="11" fill="#888" text-anchor="middle">90</text>
+<text x="443.7" y="353.0" font-size="11" fill="#888" text-anchor="middle">120</text>
+<text x="539.7" y="353.0" font-size="11" fill="#888" text-anchor="middle">150</text>
+<text x="635.6" y="353.0" font-size="11" fill="#888" text-anchor="middle">180</text>
+<text x="335.0" y="374" font-size="12" fill="#555" text-anchor="middle">训练 iter（千）</text>
+<text x="16" y="177.5" font-size="12" fill="#555" text-anchor="middle" transform="rotate(-90 16 177.5)">损失值</text>
+<line x1="60" y1="20" x2="60" y2="335" stroke="#999" stroke-width="1.2"/>
+<line x1="60" y1="335" x2="610" y2="335" stroke="#999" stroke-width="1.2"/>
+<line x1="60" y1="160.0" x2="610" y2="160.0" stroke="#d44" stroke-width="1.3" stroke-dasharray="6 4"/>
+<path d="M 63.2 35.7 L 98.4 118.0 L 175.1 139.0 L 258.3 162.5 L 347.8 171.7 L 411.7 175.4 L 482.1 181.3 L 539.7 182.6 L 578.0 184.1 L 603.6 195.0" fill="none" stroke="#1e5aa0" stroke-width="2.4"/>
+<circle cx="63.2" cy="35.7" r="2.6" fill="#1e5aa0"/>
+<circle cx="98.4" cy="118.0" r="2.6" fill="#1e5aa0"/>
+<circle cx="175.1" cy="139.0" r="2.6" fill="#1e5aa0"/>
+<circle cx="258.3" cy="162.5" r="2.6" fill="#1e5aa0"/>
+<circle cx="347.8" cy="171.7" r="2.6" fill="#1e5aa0"/>
+<circle cx="411.7" cy="175.4" r="2.6" fill="#1e5aa0"/>
+<circle cx="482.1" cy="181.3" r="2.6" fill="#1e5aa0"/>
+<circle cx="539.7" cy="182.6" r="2.6" fill="#1e5aa0"/>
+<circle cx="578.0" cy="184.1" r="2.6" fill="#1e5aa0"/>
+<circle cx="603.6" cy="195.0" r="2.6" fill="#1e5aa0"/>
+<line x1="624" y1="26" x2="646" y2="26" stroke="#1e5aa0" stroke-width="3"/>
+<text x="652" y="30" font-size="12" fill="#333">loss_total</text>
+<path d="M 63.2 91.7 L 98.4 172.2 L 175.1 193.2 L 258.3 214.6 L 347.8 222.7 L 411.7 226.0 L 482.1 231.4 L 539.7 233.5 L 578.0 234.4 L 603.6 240.5" fill="none" stroke="#be5a0a" stroke-width="2.4"/>
+<circle cx="63.2" cy="91.7" r="2.6" fill="#be5a0a"/>
+<circle cx="98.4" cy="172.2" r="2.6" fill="#be5a0a"/>
+<circle cx="175.1" cy="193.2" r="2.6" fill="#be5a0a"/>
+<circle cx="258.3" cy="214.6" r="2.6" fill="#be5a0a"/>
+<circle cx="347.8" cy="222.7" r="2.6" fill="#be5a0a"/>
+<circle cx="411.7" cy="226.0" r="2.6" fill="#be5a0a"/>
+<circle cx="482.1" cy="231.4" r="2.6" fill="#be5a0a"/>
+<circle cx="539.7" cy="233.5" r="2.6" fill="#be5a0a"/>
+<circle cx="578.0" cy="234.4" r="2.6" fill="#be5a0a"/>
+<circle cx="603.6" cy="240.5" r="2.6" fill="#be5a0a"/>
+<line x1="624" y1="48" x2="646" y2="48" stroke="#be5a0a" stroke-width="3"/>
+<text x="652" y="52" font-size="12" fill="#333">loss_bbox</text>
+<path d="M 63.2 283.7 L 98.4 282.5 L 175.1 286.2 L 258.3 286.9 L 347.8 287.8 L 411.7 288.1 L 482.1 288.8 L 539.7 287.8 L 578.0 288.6 L 603.6 289.5" fill="none" stroke="#148240" stroke-width="2.4"/>
+<circle cx="63.2" cy="283.7" r="2.6" fill="#148240"/>
+<circle cx="98.4" cy="282.5" r="2.6" fill="#148240"/>
+<circle cx="175.1" cy="286.2" r="2.6" fill="#148240"/>
+<circle cx="258.3" cy="286.9" r="2.6" fill="#148240"/>
+<circle cx="347.8" cy="287.8" r="2.6" fill="#148240"/>
+<circle cx="411.7" cy="288.1" r="2.6" fill="#148240"/>
+<circle cx="482.1" cy="288.8" r="2.6" fill="#148240"/>
+<circle cx="539.7" cy="287.8" r="2.6" fill="#148240"/>
+<circle cx="578.0" cy="288.6" r="2.6" fill="#148240"/>
+<circle cx="603.6" cy="289.5" r="2.6" fill="#148240"/>
+<line x1="624" y1="70" x2="646" y2="70" stroke="#148240" stroke-width="3"/>
+<text x="652" y="74" font-size="12" fill="#333">loss_heatmap</text>
+<path d="M 63.2 330.1 L 98.4 331.3 L 175.1 331.1 L 258.3 331.1 L 347.8 331.3 L 411.7 331.3 L 482.1 331.1 L 539.7 331.1 L 578.0 331.3 L 603.6 331.3" fill="none" stroke="#8e44ad" stroke-width="2.4"/>
+<circle cx="63.2" cy="330.1" r="2.6" fill="#8e44ad"/>
+<circle cx="98.4" cy="331.3" r="2.6" fill="#8e44ad"/>
+<circle cx="175.1" cy="331.1" r="2.6" fill="#8e44ad"/>
+<circle cx="258.3" cy="331.1" r="2.6" fill="#8e44ad"/>
+<circle cx="347.8" cy="331.3" r="2.6" fill="#8e44ad"/>
+<circle cx="411.7" cy="331.3" r="2.6" fill="#8e44ad"/>
+<circle cx="482.1" cy="331.1" r="2.6" fill="#8e44ad"/>
+<circle cx="539.7" cy="331.1" r="2.6" fill="#8e44ad"/>
+<circle cx="578.0" cy="331.3" r="2.6" fill="#8e44ad"/>
+<circle cx="603.6" cy="331.3" r="2.6" fill="#8e44ad"/>
+<line x1="624" y1="92" x2="646" y2="92" stroke="#8e44ad" stroke-width="3"/>
+<text x="652" y="96" font-size="12" fill="#333">loss_cls</text>
+<line x1="624" y1="114" x2="646" y2="114" stroke="#d44" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="652" y="118" font-size="11" fill="#333">旧训练停滞≈10</text>
+</svg>
+<div class="figcap">图 1：训练损失下降曲线（窗口均值）。loss_bbox 在 epoch ~2.5 突破旧训练停滞的 ≈10（红色虚线），随后随余弦学习率持续缓降。</div>
+</div>
+
+<h3 id="41">4.1 训练损失轨迹（窗口均值）</h3>
+<p>下表为整个训练过程中各损失项的窗口均值（每 ~2000 iter 一段，节选关键节点）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">iter</th>
+<th style="text-align: right;">epoch</th>
+<th style="text-align: right;">loss_total</th>
+<th style="text-align: right;">loss_bbox</th>
+<th style="text-align: right;">loss_heatmap</th>
+<th style="text-align: right;">loss_cls</th>
+<th style="text-align: right;">grad_norm</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1000</td>
+<td style="text-align: right;">0.2</td>
+<td style="text-align: right;">17.1</td>
+<td style="text-align: right;">13.9</td>
+<td style="text-align: right;">2.93</td>
+<td style="text-align: right;">0.28</td>
+<td style="text-align: right;">23</td>
+</tr>
+<tr>
+<td style="text-align: right;">12000</td>
+<td style="text-align: right;">2.5</td>
+<td style="text-align: right;">12.4</td>
+<td style="text-align: right;">9.3</td>
+<td style="text-align: right;">3.00</td>
+<td style="text-align: right;">0.21</td>
+<td style="text-align: right;">32</td>
+</tr>
+<tr>
+<td style="text-align: right;">36000</td>
+<td style="text-align: right;">7.6</td>
+<td style="text-align: right;">11.2</td>
+<td style="text-align: right;">8.1</td>
+<td style="text-align: right;">2.79</td>
+<td style="text-align: right;">0.22</td>
+<td style="text-align: right;">22</td>
+</tr>
+<tr>
+<td style="text-align: right;">62000</td>
+<td style="text-align: right;">13.1</td>
+<td style="text-align: right;">9.86</td>
+<td style="text-align: right;">6.88</td>
+<td style="text-align: right;">2.75</td>
+<td style="text-align: right;">0.22</td>
+<td style="text-align: right;">17</td>
+</tr>
+<tr>
+<td style="text-align: right;">90000</td>
+<td style="text-align: right;">19.0</td>
+<td style="text-align: right;">9.33</td>
+<td style="text-align: right;">6.42</td>
+<td style="text-align: right;">2.70</td>
+<td style="text-align: right;">0.21</td>
+<td style="text-align: right;">22</td>
+</tr>
+<tr>
+<td style="text-align: right;">110000</td>
+<td style="text-align: right;">23.3</td>
+<td style="text-align: right;">9.12</td>
+<td style="text-align: right;">6.23</td>
+<td style="text-align: right;">2.68</td>
+<td style="text-align: right;">0.21</td>
+<td style="text-align: right;">18</td>
+</tr>
+<tr>
+<td style="text-align: right;">132000</td>
+<td style="text-align: right;">27.9</td>
+<td style="text-align: right;">8.78</td>
+<td style="text-align: right;">5.92</td>
+<td style="text-align: right;">2.64</td>
+<td style="text-align: right;">0.22</td>
+<td style="text-align: right;">22</td>
+</tr>
+<tr>
+<td style="text-align: right;">150000</td>
+<td style="text-align: right;">31.7</td>
+<td style="text-align: right;">8.71</td>
+<td style="text-align: right;">5.80</td>
+<td style="text-align: right;">2.70</td>
+<td style="text-align: right;">0.22</td>
+<td style="text-align: right;">22</td>
+</tr>
+<tr>
+<td style="text-align: right;">162000</td>
+<td style="text-align: right;">34.3</td>
+<td style="text-align: right;">8.62</td>
+<td style="text-align: right;">5.75</td>
+<td style="text-align: right;">2.65</td>
+<td style="text-align: right;">0.21</td>
+<td style="text-align: right;">21</td>
+</tr>
+<tr>
+<td style="text-align: right;">170200</td>
+<td style="text-align: right;">36.0</td>
+<td style="text-align: right;">≈8.0</td>
+<td style="text-align: right;">≈5.0–6.0</td>
+<td style="text-align: right;">≈2.6</td>
+<td style="text-align: right;">≈0.21</td>
+<td style="text-align: right;">≈23</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>说明：单 iter 数值有 ±0.3~0.5 的噪声波动；表中为窗口均值。<code>loss_bbox</code> 在 epoch ~2.5 突破旧训练卡死的 ≈10，随后持续缓降；后段随余弦学习率衰减进一步降至约 5.8。</p>
+</blockquote>
+<h3 id="42">4.2 关键里程碑</h3>
+<ul>
+<li><strong>epoch ~2.5</strong>：<code>loss_bbox</code> 突破旧训练停滞的 ≈10（这是 from-scratch 一直卡住的位置），证明配方修复生效。</li>
+<li><strong>epoch ~13</strong>：<code>loss_bbox</code> 跌破 7，<code>loss_total</code> 跌破 10。</li>
+<li><strong>epoch ~28</strong>：<code>loss_bbox</code> 跌破 6。</li>
+<li><strong>全程</strong>：<code>loss_heatmap</code> 从 ≈2.95 缓慢降到 ≈2.6——验证了「背景抑制是慢但不是被堵死」的诊断（实测证明：若把峰值预测设为 1 且背景置零，heatmap 损失可降到 0，说明它不是硬下限）。</li>
+</ul>
+<hr>
+<h2 id="5">5. 评估（无训练流程）</h2>
+<h3 id="51">5.1 评估范围与可行性</h3>
+<p>用户要求用训练权重计算 eval-loss、mAP/NDS、PDM。经代码梳理：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>状态</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>验证集损失</td>
+<td>代码已有（<code>_try_loss_eval</code>），原因 OOM 被禁用</td>
+<td>写独立脚本单卡 + 小 batch 运行</td>
+</tr>
+<tr>
+<td>mAP / NDS</td>
+<td>仓库无实现，但 GT 与推理路径都在</td>
+<td>新写一个纯 torch/numpy 的 3D 检测评估器</td>
+</tr>
+<tr>
+<td>PDM</td>
+<td><strong>不适用</strong></td>
+<td>PDM 评估自车轨迹，检测模型不产生轨迹，跳过</td>
+</tr>
+</tbody>
+</table>
+<h3 id="52-batchnorm-nan">5.2 评估中发现并修复的致命缺陷：检测头 BatchNorm 统计量为 NaN</h3>
+<p>首次评估返回 <strong>零检测</strong>。插桩诊断定位到：最终权重 <code>iter_170208.pth</code> 的 <strong>6 个检测预测头分支的 BatchNorm running_mean / running_var 全为 NaN</strong>（共 12 个缓冲区），而所有模型<strong>参数</strong>都是有限值。</p>
+<ul>
+<li><strong>为何训练全程没暴露</strong>：<code>train()</code> 模式下 BN 用当前 batch 统计量，忽略损坏的 running 缓冲区——所以训练损失一直健康，这是<strong>纯损失监控无法发现的隐性失效</strong>。</li>
+<li><strong>为何 <code>eval()</code> 零检测</strong>：<code>eval()</code> 用损坏的 NaN running 统计量 → 预测全 NaN → 200 个 proposal 全被 score / 范围过滤丢弃 → 0 框。</li>
+<li><strong>根因</strong>：很可能是 fp16 训练中某步 BN 统计量发散为 NaN（损失因 batch 统计量回退而仍有限）。</li>
+</ul>
+<p><strong>修复：BN 重标定（无梯度）</strong>——加载权重后，重置非有限的 BN running 统计量、设 <code>momentum=None</code>（累积平均），把 BN 模块切到 train 模式、其余保持 eval，在验证集上跑 <strong>300 次纯前向（无反传）</strong> 重新估计统计量，保存为 <code>iter_170208_bnfix.pth</code>。重标定后 <strong>6 个 NaN 模块 → 0</strong>，模型恢复正常输出检测框。</p>
+<blockquote>
+<p><strong>重要提示</strong>：原始 <code>iter_170208.pth</code> 评估为 0 mAP，后续任何推理/评估都必须使用 <code>iter_170208_bnfix.pth</code>。</p>
+</blockquote>
+<h3 id="53-200-batch">5.3 验证集损失（200 batch，修复后全部有限）</h3>
+<table>
+<thead>
+<tr>
+<th>损失项</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>loss_total</td>
+<td>8.70</td>
+</tr>
+<tr>
+<td>loss_cls</td>
+<td>0.25</td>
+</tr>
+<tr>
+<td>loss_bbox</td>
+<td>5.41</td>
+</tr>
+<tr>
+<td>loss_heatmap</td>
+<td>3.03</td>
+</tr>
+</tbody>
+</table>
+<p>（与训练损失一致；验证 bbox 略高于训练 bbox，符合预期。）</p>
+<h3 id="54-map-nds4000-797k-72k-gt35669-tp">5.4 检测 mAP / NDS（全量验证集：4000 样本，797k 预测，72k GT，35669 个匹配 TP）</h3>
+<p>评估采用 <strong>nuScenes 中心距离匹配约定</strong>（BEV 中心距离阈值 0.5 / 1 / 2 / 4 米），每类 AP = 4 阈值均值，mAP = 5 类均值。</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th style="text-align: right;">AP@0.5m</th>
+<th style="text-align: right;">AP@1m</th>
+<th style="text-align: right;">AP@2m</th>
+<th style="text-align: right;">AP@4m</th>
+<th style="text-align: right;"><strong>类别 AP</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>car</td>
+<td style="text-align: right;">0.116</td>
+<td style="text-align: right;">0.177</td>
+<td style="text-align: right;">0.263</td>
+<td style="text-align: right;">0.412</td>
+<td style="text-align: right;"><strong>0.242</strong></td>
+</tr>
+<tr>
+<td>pedestrian</td>
+<td style="text-align: right;">0.001</td>
+<td style="text-align: right;">0.022</td>
+<td style="text-align: right;">0.078</td>
+<td style="text-align: right;">0.169</td>
+<td style="text-align: right;"><strong>0.067</strong></td>
+</tr>
+<tr>
+<td>traffic_cone</td>
+<td style="text-align: right;">0.000</td>
+<td style="text-align: right;">0.001</td>
+<td style="text-align: right;">0.039</td>
+<td style="text-align: right;">0.128</td>
+<td style="text-align: right;"><strong>0.042</strong></td>
+</tr>
+<tr>
+<td>barrier</td>
+<td style="text-align: right;">0.000</td>
+<td style="text-align: right;">0.000</td>
+<td style="text-align: right;">0.000</td>
+<td style="text-align: right;">0.004</td>
+<td style="text-align: right;"><strong>0.001</strong></td>
+</tr>
+<tr>
+<td>bicycle</td>
+<td style="text-align: right;">0.000</td>
+<td style="text-align: right;">0.000</td>
+<td style="text-align: right;">0.000</td>
+<td style="text-align: right;">0.000</td>
+<td style="text-align: right;"><strong>0.000</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>汇总指标：</strong></p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>数值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>mAP</strong></td>
+<td><strong>0.0705</strong></td>
+<td>5 类平均精度</td>
+</tr>
+<tr>
+<td>mATE</td>
+<td>0.845 m</td>
+<td>平均平移误差（越小越好）</td>
+</tr>
+<tr>
+<td>mASE</td>
+<td>0.222</td>
+<td>平均尺度误差（1 − 对齐 3D IoU）</td>
+</tr>
+<tr>
+<td>mAOE</td>
+<td>0.448 rad</td>
+<td>平均朝向误差</td>
+</tr>
+<tr>
+<td><strong>NDS（简化版，3 TP 指标）</strong></td>
+<td><strong>0.2297</strong></td>
+<td>mAP + ATE/ASE/AOE 的综合</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>NDS 简化说明</strong>：本评估的 NDS 仅含 mAP + ATE/ASE/AOE 三项 TP 误差，<strong>省略了 AVE/AAE（速度/属性）</strong>（NAVSIM 5 类、无速度属性评估）。这是对官方 10 类 nuScenes NDS（5 项 TP 指标）的明确简化，<strong>不可直接与官方 nuScenes NDS 横向比较</strong>。</p>
+</blockquote>
+<h3 id="55">5.5 评估结果的客观解读</h3>
+<ul>
+<li><strong>模型确实学会了检测</strong>：car 类 AP=0.242、平移误差 0.85 米，是一个可用的结果；全量评估有 35669 个真正例匹配。</li>
+<li><strong>稀有类接近 0</strong>：bicycle / barrier / traffic_cone 的 AP 极低，反映 NAVSIM 数据严重的类别不均衡（实测一帧平均约 41 个框，但绝大多数是 car，4/5 类通道几乎总是空的）。</li>
+<li><strong>定位为「中等水平的基线检测器」</strong>：可用，但尚不强；提升空间主要在稀有类与整体精度。</li>
+</ul>
+<hr>
+<h2 id="6">6. 交付物清单</h2>
+<p>所有改动已提交到 git 分支 <code>feat_bevfusion</code>，每个改动均有 <code>CHANGELOG_TRAINING.md</code> 审计记录。</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bevfusion_model/configs/bevfusion_hyperparams.py</code></td>
+<td>训练配方（lr 2e-4、36 epoch、batch 3、<code>pretrained_from</code>、heatmap_weight 1.0）</td>
+</tr>
+<tr>
+<td><code>bevfusion_model/navsim_train/runner.py</code></td>
+<td>热启动加载（含 lidar spconv permute）、<code>last.pth</code> 自动续训</td>
+</tr>
+<tr>
+<td><code>bevfusion_model/detection_head.py</code></td>
+<td>heatmap 头 focal 偏置初始化（<code>_init_heatmap_bias(-2.19)</code>）</td>
+</tr>
+<tr>
+<td><code>bevfusion_model/navsim_train/autostart_train.sh</code></td>
+<td>幂等 <code>@reboot</code> 自启动脚本</td>
+</tr>
+<tr>
+<td><code>bevfusion_model/eval_loss.py</code></td>
+<td>独立验证/测试损失评估（单卡、OOM 鲁棒、nan 安全）</td>
+</tr>
+<tr>
+<td><code>bevfusion_model/eval_detection_map.py</code></td>
+<td>3D 检测 mAP / NDS 评估器（纯 torch/numpy，nuScenes 约定）</td>
+</tr>
+<tr>
+<td><code>bevfusion_model/recalibrate_bn.py</code></td>
+<td>BN 重标定脚本（无梯度，修复 NaN BN 统计量）</td>
+</tr>
+<tr>
+<td><code>iter_170208.pth</code>（远程）</td>
+<td>训练最终权重（<strong>含 NaN BN 缺陷，评估为 0</strong>）</td>
+</tr>
+<tr>
+<td><code>iter_170208_bnfix.pth</code>（远程）</td>
+<td><strong>BN 重标定后的可用权重，所有推理/评估请用此文件</strong></td>
+</tr>
+<tr>
+<td><code>bevfusion_model/navsim_train/CLAUDE.md</code> / <code>TRAINING_PLAN.md</code> / <code>CHANGELOG_TRAINING.md</code></td>
+<td>操作手册、计划、完整审计日志</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="7">7. 结论与后续建议</h2>
+<h3 id="71">7.1 结论</h3>
+<p>本次工作完成了从「诊断旧训练失败」到「修复配方与代码缺陷」「跑完一次健康的 36 epoch 训练」「定位并修复隐性 BN-NaN 缺陷」「给出可信检测指标」的完整闭环。最终模型是一个<strong>可用但中等水平的多模态 3D 检测基线</strong>：car 检测良好（AP 0.242），整体 mAP 0.0705 / NDS（简化）0.2297，瓶颈在稀有类与类别不均衡。</p>
+<h3 id="72">7.2 后续建议（按优先级）</h3>
+<ol>
+<li><strong>训练侧加 BN-NaN 守护</strong>：在保存 checkpoint 时检查 BN 缓冲区是否含 NaN，并排查 fp16 路径（<code>amp.py</code>）作为 NaN 来源——否则未来 checkpoint 会重复这一隐性失效。</li>
+<li><strong>缓解类别不均衡</strong>：对稀有类做过采样 / 类别加权 / 复制-粘贴增广，提升 bicycle/barrier/cone 的 AP。</li>
+<li><strong>若要 PDM</strong>：需在检测之上构建规划模块（框 → 轨迹），是一个独立的工程，而非「再算一个指标」。</li>
+<li><strong>指标完善</strong>：如需与官方对齐，可补齐 NDS 的 AVE/AAE 项（需速度/属性 GT）。</li>
+</ol>
+<hr>
+<p><em>报告生成：基于完整训练日志、TensorBoard 标量、评估输出与 git 提交记录。</em></p>
+</body>
+</html>
